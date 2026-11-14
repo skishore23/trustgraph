@@ -2,7 +2,9 @@
 
 Connect the calling agent to a running TrustGraph workspace. The caller delegates
 a protected task; TrustGraph owns the fresh generation and publication boundary.
-The MCP server is a local stdio adapter to the same HTTP API used by the live UI.
+The default MCP server is a local stdio adapter to the same HTTP API used by the live UI.
+For the authenticated HTTP adapter and hosted-agent setup, see the
+[8090 demo integration](8090-demo.md).
 See the [architecture sequence](architecture.md#from-task-to-publication) for
 the full generation, review and publication flow.
 
@@ -124,9 +126,9 @@ just because MCP is connected. To govern arbitrary existing agent runs, their
 context and tool executions would need broker integration too.
 
 Keep GitHub publication credentials in the gateway. A caller with independent
-write credentials can bypass this local boundary. Remote agents need a reachable,
-authenticated deployment or an on-host integration; this loopback adapter does
-not create remote connectivity.
+write credentials can bypass this local boundary. Remote agents can use the
+separate authenticated HTTP adapter described in the [8090 demo integration](8090-demo.md);
+the stdio adapter itself remains local.
 
 Submit work/repair once. If a transport reply is lost, inspect workspace/status
 before resubmitting: task intake has no idempotency-key contract. The adapter

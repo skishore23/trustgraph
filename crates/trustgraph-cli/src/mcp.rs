@@ -1,4 +1,4 @@
-//! Restricted stdio MCP adapter for the live governance gateway.
+//! Restricted stdio and authenticated HTTP MCP adapters for the live gateway.
 use rmcp::{ErrorData, RoleServer, ServerHandler, model::*, service::RequestContext};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -237,8 +237,7 @@ impl ServerHandler for Gateway {
         Ok(result.into())
     }
 }
-pub async fn stdio_bridge(url: &str, token_file: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    use rmcp::{ServiceExt, transport::stdio};
+fn gateway(url: &str, token_file: &Path) -> Result<Gateway, Box<dyn std::error::Error>> {
     let base = local_endpoint(url)?
         .as_str()
         .trim_end_matches('/')
@@ -251,14 +250,101 @@ pub async fn stdio_bridge(url: &str, token_file: &Path) -> Result<(), Box<dyn st
         .connect_timeout(Duration::from_secs(3))
         .timeout(Duration::from_secs(30))
         .build()?;
-    Gateway {
+    Ok(Gateway {
         base,
         token,
         client,
-    }
-    .serve(stdio())
-    .await?
-    .waiting()
-    .await?;
+    })
+}
+
+pub async fn stdio_bridge(url: &str, token_file: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    use rmcp::{ServiceExt, transport::stdio};
+    gateway(url, token_file)?
+        .serve(stdio())
+        .await?
+        .waiting()
+        .await?;
     Ok(())
+}
+
+/// Expose only the agent adapter, never the operator HTTP router.
+pub fn http_router(
+    url: &str,
+    token_file: &Path,
+    access_token_file: &Path,
+    public_url: Option<&str>,
+) -> Result<axum::Router, Box<dyn std::error::Error>> {
+    use axum::{
+        extract::{Request, State},
+        http::{StatusCode, header},
+        middleware::{self, Next},
+        response::{IntoResponse, Response},
+    };
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    };
+    use std::sync::Arc;
+
+    let gateway = gateway(url, token_file)?;
+    let access_token = read_token(access_token_file)?;
+    if access_token == gateway.token {
+        return Err("remote access and local agent capabilities must differ".into());
+    }
+    let mut config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .with_max_request_body_bytes(65_536)
+        .enforce_origin_validation();
+    if let Some(value) = public_url {
+        let public = mcp_http::Url::parse(value)?;
+        if public.scheme() != "https"
+            || public.host_str().is_none()
+            || !public.username().is_empty()
+            || public.password().is_some()
+            || public.path() != "/"
+            || public.query().is_some()
+            || public.fragment().is_some()
+        {
+            return Err("public URL must be an HTTPS origin without credentials or a path".into());
+        }
+        config.allowed_hosts.push(public.authority().to_owned());
+    }
+    let service = StreamableHttpService::new(
+        move || Ok(gateway.clone()),
+        Arc::new(LocalSessionManager::default()),
+        config,
+    );
+    async fn authenticate(
+        State(expected): State<Arc<String>>,
+        request: Request,
+        next: Next,
+    ) -> Response {
+        let supplied = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .map(|v| v.as_bytes());
+        // Compare every byte of the fixed-length capability, without early mismatch exits.
+        let valid = supplied.is_some_and(|value| {
+            value.len() == expected.len()
+                && value
+                    .iter()
+                    .zip(expected.as_bytes())
+                    .fold(0u8, |a, (b, c)| a | (b ^ c))
+                    == 0
+        });
+        if !valid {
+            return (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, "Bearer")],
+            )
+                .into_response();
+        }
+        next.run(request).await
+    }
+    Ok(axum::Router::new()
+        .route_service("/mcp", service)
+        .layer(middleware::from_fn_with_state(
+            Arc::new(format!("Bearer {access_token}")),
+            authenticate,
+        )))
 }

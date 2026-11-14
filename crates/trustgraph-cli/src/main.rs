@@ -89,6 +89,21 @@ enum Command {
         #[arg(long, default_value = ".trustgraph-live/state/agent-token")]
         token_file: PathBuf,
     },
+    /// Serve the restricted agent tools over authenticated HTTP for a hosted agent.
+    McpHttp {
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        url: String,
+        #[arg(long, default_value = ".trustgraph-live/state/agent-token")]
+        token_file: PathBuf,
+        /// Separate private 64-character hex capability for the remote MCP client.
+        #[arg(long)]
+        access_token_file: PathBuf,
+        /// HTTPS origin of the tunnel; only this host and loopback hosts are accepted.
+        #[arg(long)]
+        public_url: Option<String>,
+        #[arg(long, default_value_t = 8082)]
+        port: u16,
+    },
 }
 #[derive(Clone, Copy, ValueEnum)]
 enum Case {
@@ -395,6 +410,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         Command::Mcp { url, token_file } => {
             trustgraph_cli::mcp::stdio_bridge(&url, &token_file).await?;
+        }
+        Command::McpHttp {
+            url,
+            token_file,
+            access_token_file,
+            public_url,
+            port,
+        } => {
+            let app = trustgraph_cli::mcp::http_router(
+                &url,
+                &token_file,
+                &access_token_file,
+                public_url.as_deref(),
+            )?;
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+            println!("TrustGraph agent MCP: http://127.0.0.1:{port}/mcp");
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = tokio::signal::ctrl_c().await;
+                })
+                .await?;
         }
     }
     Ok(())

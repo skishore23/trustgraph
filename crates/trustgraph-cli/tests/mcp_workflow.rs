@@ -62,6 +62,191 @@ fn capability(dir: &std::path::Path) -> std::path::PathBuf {
     }
     file
 }
+
+#[tokio::test]
+async fn hosted_agent_authentication_and_tools_stay_separate_from_operator() {
+    let dir = tempfile::tempdir().unwrap();
+    let token = capability(dir.path());
+    let remote_dir = tempfile::tempdir().unwrap();
+    let remote_token = capability(remote_dir.path());
+    let remote_secret = "b".repeat(64);
+    std::fs::write(&remote_token, &remote_secret).unwrap();
+    let calls = Calls::default();
+    let backend = Router::new()
+        .route("/api/work", get(workspace).post(mutation))
+        .route("/api/work/{id}/repair", post(repair))
+        .route("/api/simulate", post(simulate))
+        .with_state(calls.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let backend = tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
+    assert!(trustgraph_cli::mcp::http_router(&base, &token, &token, None).is_err());
+    for public in [
+        "http://demo.example",
+        "https://demo.example/mcp",
+        "https://user@demo.example",
+        "https://demo.example/?secret=x",
+    ] {
+        assert!(
+            trustgraph_cli::mcp::http_router(&base, &token, &remote_token, Some(public)).is_err()
+        );
+    }
+    let app = trustgraph_cli::mcp::http_router(
+        &base,
+        &token,
+        &remote_token,
+        Some("https://demo.example"),
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let initialize = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"hosted-demo","version":"1"}}});
+    for credential in [None, Some(TOKEN), Some("wrong")] {
+        let mut request = client
+            .post(&endpoint)
+            .header("Accept", "application/json, text/event-stream")
+            .json(&initialize);
+        if let Some(value) = credential {
+            request = request.bearer_auth(value);
+        }
+        let reply = request.send().await.unwrap();
+        assert_eq!(reply.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(reply.headers()["www-authenticate"], "Bearer");
+    }
+    for (header, value) in [("Origin", "https://evil.example"), ("Host", "evil.example")] {
+        let reply = client
+            .post(&endpoint)
+            .bearer_auth(&remote_secret)
+            .header("Accept", "application/json, text/event-stream")
+            .header(header, value)
+            .json(&initialize)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reply.status(), reqwest::StatusCode::FORBIDDEN);
+    }
+    let init: Value = client
+        .post(&endpoint)
+        .bearer_auth(&remote_secret)
+        .header("Accept", "application/json, text/event-stream")
+        .header("Host", "demo.example")
+        .json(&initialize)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(init["result"]["serverInfo"]["name"], "trustgraph");
+    async fn rpc(
+        client: &reqwest::Client,
+        url: &str,
+        secret: &str,
+        method: &str,
+        params: Value,
+    ) -> Value {
+        client
+            .post(url)
+            .bearer_auth(secret)
+            .header("Accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", "2025-03-26")
+            .json(&json!({"jsonrpc":"2.0","id":2,"method":method,"params":params}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+    let listed = rpc(&client, &endpoint, &remote_secret, "tools/list", json!({})).await;
+    let names: Vec<_> = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "trustgraph_workspace",
+            "trustgraph_submit_work",
+            "trustgraph_status",
+            "trustgraph_repair",
+            "trustgraph_simulate"
+        ]
+    );
+    let read = rpc(
+        &client,
+        &endpoint,
+        &remote_secret,
+        "tools/call",
+        json!({"name":"trustgraph_workspace","arguments":{}}),
+    )
+    .await;
+    assert_eq!(
+        read["result"]["structuredContent"]["jobs"][0]["status"],
+        "blocked"
+    );
+    let submit = rpc(&client, &endpoint, &remote_secret, "tools/call", json!({"name":"trustgraph_submit_work","arguments":{"goal":"admitted task","include_risk":true}})).await;
+    assert_eq!(
+        submit["result"]["structuredContent"]["review_url"],
+        format!("{base}/agent/job-2")
+    );
+    let status = rpc(
+        &client,
+        &endpoint,
+        &remote_secret,
+        "tools/call",
+        json!({"name":"trustgraph_status","arguments":{"id":"job-1"}}),
+    )
+    .await;
+    assert_eq!(status["result"]["structuredContent"]["status"], "blocked");
+    let repair = rpc(
+        &client,
+        &endpoint,
+        &remote_secret,
+        "tools/call",
+        json!({"name":"trustgraph_repair","arguments":{"id":"job-1"}}),
+    )
+    .await;
+    assert_eq!(repair["result"]["structuredContent"]["id"], "job-3");
+    let simulation = rpc(&client, &endpoint, &remote_secret, "tools/call", json!({"name":"trustgraph_simulate","arguments":{"paths":["src/lib.rs"],"tests_passed":true,"lineage_complete":true,"approval":"missing"}})).await;
+    assert_eq!(
+        simulation["result"]["structuredContent"]["policy_activated"],
+        false
+    );
+    let denied = rpc(
+        &client,
+        &endpoint,
+        &remote_secret,
+        "tools/call",
+        json!({"name":"trustgraph_publish","arguments":{"id":"job-1"}}),
+    )
+    .await;
+    assert!(denied.get("error").is_some());
+    for path in ["/", "/api/work", "/api/approve", "/agent/job-1"] {
+        assert_eq!(
+            client
+                .get(endpoint.replace("/mcp", path))
+                .bearer_auth(&remote_secret)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::NOT_FOUND
+        );
+    }
+    assert_eq!(calls.lock().unwrap().len(), 3);
+    server.abort();
+    backend.abort();
+}
+
 #[tokio::test]
 async fn coding_agent_uses_live_api_over_real_stdio_without_human_authority() {
     let dir = tempfile::tempdir().unwrap();
