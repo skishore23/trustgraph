@@ -39,7 +39,7 @@ cargo run --locked -p trustgraph-cli -- policy-check examples/bank-policy.yaml
 cargo run --locked -p trustgraph-cli -- serve
 ```
 
-Open [the bank walkthrough](http://127.0.0.1:8080/#/demo). Click **Reset demo**
+Open [the bank walkthrough](http://127.0.0.1:8080/#/demo). Click **Reset**
 for the rehearsable three-chapter story. Preview as **Ravi** (internal ID `arun`)
 for restricted work, then **Maya** for the approval chapter. The walkthrough uses
 a fixed fictional policy and separate in-memory history; it never mutates the
@@ -55,7 +55,7 @@ Keep the audience and omit unshareable evidence, or keep the evidence and restri
 the audience. A passing selection can **Prepare patch for review**. The broker
 records the actual inputs and content, then requires a human to **Approve & release**
 the exact version and destination. Reviews, Deliveries and Sources support this
-workflow. Typed Agent plans and bounded Verification remain under Advanced.
+workflow. Agent plans and bounded verification remain available through the CLI and API.
 
 The **Verification** page explores the bounded model and can show a deliberate
 approval-reuse fault with a shortest counterexample. This changes the model only,
@@ -82,7 +82,7 @@ cargo run --locked -p trustgraph-cli -- serve --data "$demo_directory"
 
 TrustGraph now serves real MCP through the official Rust SDK. Keep the app running,
 then add [the local configuration](examples/mcp.local.json) to your client's MCP
-settings, or download the configuration from **Connect your agent** in the app.
+settings, or download the configuration from **Connect agent** in the app.
 The stdio command connects to the same running workspace; it does not start a
 second journal owner. Agents can inspect, simulate, propose, analyze, repair,
 prepare and read status. Approval stays in the reviewer app.
