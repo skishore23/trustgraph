@@ -1,0 +1,9 @@
+{
+  "key": "wo-2-github-issue",
+  "title": "Demo: accept zero-value payment authorizations",
+  "body": "Fictional demo task. Accept zero and positive payment amounts, reject negative amounts, and add a regression test for zero. This proposal creates an issue only; it does not change code.",
+  "work_order": {
+    "project_id": "replace-with-your-8090-project-id",
+    "id": "WO-2"
+  }
+}

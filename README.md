@@ -40,6 +40,10 @@ for Mermaid component, sequence, evidence-flow and recovery diagrams.
 
 ## Run the live integration
 
+For a native 8090 agent proposing a GitHub issue through human approval and
+Composio, see the [issue-action demo](docs/8090-issue-actions.md). It has a preview
+mode and does not use a patch generator.
+
 The live gateway uses authenticated Codex, HydraDB and GitHub integrations,
 macOS for isolated Rust checks, and a dedicated private personal repository.
 Follow [live setup](docs/development.md#start-the-live-workspace) to configure

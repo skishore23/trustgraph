@@ -10,7 +10,8 @@ workspace = true
 name = "trustgraph"
 path = "src/main.rs"
 [dependencies]
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
+uuid = { version = "1", features = ["v4"] }
 trustgraph-live = { path = "../trustgraph-live" }
 trustgraph-core = { path = "../trustgraph-core" }
 trustgraph-runtime = { path = "../trustgraph-runtime" }
