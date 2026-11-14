@@ -43,6 +43,8 @@ skills first. Follow the Work Orders Writing Rules before changing its status.
    issue URL. If the result is unknown, stop and ask the operator to inspect
    GitHub/Composio; do not submit a new key to force a retry.
 
-The gateway fixes the repository, connected account, tool slug and tool version.
+The gateway fixes the repository, connected account and tool slug. It binds a
+Connect MCP input schema hash or a project API dated tool version, depending on
+the configured Composio credential. Connect does not pin provider implementation versions.
 The agent cannot select a different tool or destination. This skill guides the
 workflow; the gateway enforces approval and controls the publishing credential.

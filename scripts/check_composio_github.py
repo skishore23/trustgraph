@@ -9,6 +9,7 @@ import stat
 import sys
 import urllib.request
 from trustgraph_actions import NoRedirect
+from composio_connect import preflight
 
 
 def private_key(path):
@@ -23,18 +24,28 @@ def private_key(path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--account", required=True, help="Composio connected GitHub account ID")
+    parser.add_argument("--account", help="Connected GitHub account ID; Connect can select a sole active account")
     parser.add_argument("--repository", required=True, help="GitHub owner/repository")
     parser.add_argument("--directory", type=Path, default=Path(".trustgraph-live/issue-actions-live"))
     parser.add_argument("--output", type=Path, default=Path("trustgraph-actions-live.local.json"))
     args = parser.parse_args()
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", args.account):
+    if args.account is not None and not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", args.account):
         raise ValueError("Invalid connected account ID")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repository):
         raise ValueError("Use an explicit owner/repository")
     key = os.environ.get("COMPOSIO_API_KEY") or private_key(args.directory / "composio-key")
     if not key or len(key) > 512 or any(not 33 <= ord(c) <= 126 for c in key):
         raise ValueError("Invalid Composio key")
+    if key.startswith("ck_"):
+        binding = preflight(key, args.repository, args.account)
+        config = {"directory": str(args.directory.resolve()), "github_repository": args.repository,
+                  "mode": "live", **binding, "agent_public_url": None}
+        write_config(args.output, config)
+        print(f"Connect GitHub account verified for {args.repository}. Input schema SHA-256: {binding['tool_schema_hash']}")
+        print("No issue was created. Live configuration: " + str(args.output.resolve()))
+        return
+    if not args.account:
+        raise ValueError("Project API keys need --account; Connect consumer keys can discover the account")
     opener = urllib.request.build_opener(NoRedirect)
 
     def get(path):
@@ -59,12 +70,16 @@ def main():
     config = {"directory": str(args.directory.resolve()), "github_repository": args.repository,
               "mode": "live", "connected_account_id": args.account, "user_id": account.get("user_id"),
               "tool_version": version, "agent_public_url": None}
-    fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    write_config(args.output, config)
+    print(f"Read-only checks passed. Pinned issue tool {version}. Configuration: {args.output.resolve()}")
+    print("No issue was created. Start the gateway with --config pointing at this file when ready.")
+
+
+def write_config(path, config):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as output:
         json.dump(config, output, indent=2)
         output.write("\n")
-    print(f"Read-only checks passed. Pinned issue tool {version}. Configuration: {args.output.resolve()}")
-    print("No issue was created. Start the gateway with --config pointing at this file when ready.")
 
 
 if __name__ == "__main__":

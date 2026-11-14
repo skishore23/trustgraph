@@ -1,4 +1,5 @@
 //! Exact-action approval for native 8090 proposals. No generation or inferred source lineage.
+mod connect;
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path as RoutePath, State},
@@ -36,6 +37,19 @@ pub enum Mode {
     Live,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Transport {
+    #[default]
+    ProjectApi,
+    ConnectMcp,
+}
+impl Transport {
+    fn is_project(&self) -> bool {
+        *self == Self::ProjectApi
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -48,6 +62,10 @@ pub struct Config {
     pub user_id: Option<String>,
     #[serde(default)]
     pub tool_version: Option<String>,
+    #[serde(default)]
+    pub composio_transport: Transport,
+    #[serde(default)]
+    pub tool_schema_hash: Option<String>,
     #[serde(default)]
     pub agent_public_url: Option<String>,
 }
@@ -67,12 +85,28 @@ impl Config {
             return Err(invalid("configure one explicit owner/repository"));
         }
         if self.mode == Mode::Live {
-            let version = self.tool_version.as_deref().unwrap_or("");
             if self
                 .connected_account_id
                 .as_deref()
                 .is_none_or(str::is_empty)
-                || version.len() != 11
+            {
+                return Err(invalid("live mode needs a connected account"));
+            }
+            let version = self.tool_version.as_deref().unwrap_or("");
+            if self.composio_transport == Transport::ConnectMcp {
+                let hash = self.tool_schema_hash.as_deref().unwrap_or("");
+                if self.tool_version.is_some()
+                    || self.user_id.is_some()
+                    || hash.len() != 64
+                    || !hash
+                        .bytes()
+                        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+                {
+                    return Err(invalid(
+                        "Connect MCP needs a pinned input schema SHA-256; project user/version fields must be absent",
+                    ));
+                }
+            } else if version.len() != 11
                 || version.as_bytes()[8] != b'_'
                 || !version
                     .bytes()
@@ -90,14 +124,17 @@ impl Config {
         Ok(())
     }
     fn scope(&self) -> digest::Digest {
-        digest::structured(
-            "exact-issue-action-policy",
-            &json!({
-                "mode":self.mode,"repository":self.github_repository,"tool":TOOL,
-                "account":self.connected_account_id,"user_id":self.user_id,"version":self.tool_version,
-                "boundary":"submitted action only; native agent context is not captured",
-            }),
-        )
+        let mut policy = json!({
+            "mode":self.mode,"repository":self.github_repository,"tool":TOOL,
+            "account":self.connected_account_id,"user_id":self.user_id,"version":self.tool_version,
+            "boundary":"submitted action only; native agent context is not captured",
+        });
+        // Preserve the existing preview/project policy encoding.
+        if self.composio_transport == Transport::ConnectMcp {
+            policy["transport"] = json!(self.composio_transport);
+            policy["input_schema_sha256"] = json!(self.tool_schema_hash);
+        }
+        digest::structured("exact-issue-action-policy", &policy)
     }
     fn destination(&self) -> String {
         format!(
@@ -131,6 +168,10 @@ struct Envelope {
     connected_account_id: Option<String>,
     user_id: Option<String>,
     version: Option<String>,
+    #[serde(default, skip_serializing_if = "Transport::is_project")]
+    transport: Transport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    input_schema_sha256: Option<String>,
     proposal: Proposal,
 }
 impl Envelope {
@@ -160,6 +201,8 @@ impl Envelope {
             connected_account_id: config.connected_account_id.clone(),
             user_id: config.user_id.clone(),
             version: config.tool_version.clone(),
+            transport: config.composio_transport.clone(),
+            input_schema_sha256: config.tool_schema_hash.clone(),
             proposal,
         })
     }
@@ -200,9 +243,13 @@ impl IssuePublisher {
         let receipts = config.directory.join("receipts");
         private_directory(&receipts)?;
         Ok(Self {
+            endpoint: if config.composio_transport == Transport::ConnectMcp {
+                connect::ENDPOINT.into()
+            } else {
+                COMPOSIO.into()
+            },
             config,
             api_key,
-            endpoint: COMPOSIO.into(),
             receipts,
         })
     }
@@ -257,23 +304,25 @@ impl IssuePublisher {
         let Ok(reply) = serde_json::from_slice::<Value>(&bytes) else {
             return Ok(None);
         };
-        if reply["successful"] != true {
-            return Ok(None);
-        }
-        if reply["data"]["title"].as_str() != Some(envelope.proposal.title.as_str())
-            || reply["data"]["body"].as_str().unwrap_or("") != envelope.proposal.body
-        {
-            return Ok(None);
-        }
-        let Some(number) = reply["data"]["number"].as_u64().filter(|n| *n > 0) else {
-            return Ok(None);
-        };
-        let url = format!("https://github.com/{}/issues/{number}", envelope.repository);
-        if reply["data"]["html_url"].as_str() != Some(url.as_str()) {
-            return Ok(None);
-        }
-        Ok(Some(url))
+        Ok(issue_url(&reply, envelope))
     }
+}
+
+fn issue_url(reply: &Value, envelope: &Envelope) -> Option<String> {
+    if reply["successful"] != true {
+        return None;
+    }
+    if reply["data"]["title"].as_str() != Some(envelope.proposal.title.as_str())
+        || reply["data"]["body"].as_str().unwrap_or("") != envelope.proposal.body
+    {
+        return None;
+    }
+    let number = reply["data"]["number"].as_u64().filter(|n| *n > 0)?;
+    let url = format!("https://github.com/{}/issues/{number}", envelope.repository);
+    if reply["data"]["html_url"].as_str() != Some(url.as_str()) {
+        return None;
+    }
+    Some(url)
 }
 impl Publisher for IssuePublisher {
     fn simulated(&self) -> bool {
@@ -306,7 +355,15 @@ impl Publisher for IssuePublisher {
         let provider_id = if self.config.mode == Mode::Preview {
             format!("preview:{}", payload.operation)
         } else {
-            let Some(url) = self.execute(&envelope)? else {
+            let result = if self.config.composio_transport == Transport::ConnectMcp {
+                match connect::execute(self, &envelope) {
+                    Ok(result) => result,
+                    Err(()) => return Ok((Outcome::Rejected, None)),
+                }
+            } else {
+                self.execute(&envelope)?
+            };
+            let Some(url) = result else {
                 return Ok((Outcome::Unknown, None));
             };
             url
@@ -800,6 +857,26 @@ fn routers(shared: Shared) -> (Router, Router) {
         .with_state(shared);
     (owner, agent)
 }
+/// Check the configured consumer credential, pinned account and schema without a write.
+pub fn check(path: &Path) -> Result<()> {
+    let config: Config =
+        serde_json::from_slice(&fs::read(path).map_err(storage)?).map_err(storage)?;
+    config.validate()?;
+    if config.mode != Mode::Live || config.composio_transport != Transport::ConnectMcp {
+        return Err(invalid(
+            "--check requires a live Connect MCP config; use the Python preflight for a project key",
+        ));
+    }
+    let publisher = IssuePublisher::new(config)?;
+    connect::check(&publisher).map_err(|()| {
+        invalid("Connect account or input schema check failed; no issue was created")
+    })?;
+    println!(
+        "Connect credential, active GitHub account and pinned input schema verified. No issue was created."
+    );
+    Ok(())
+}
+
 pub async fn serve(
     path: &Path,
     port: u16,
@@ -845,15 +922,27 @@ mod tests {
     const AGENT: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     fn configured(directory: &Path, endpoint: &str) -> Shared {
-        let config = Config {
+        configured_transport(directory, endpoint, None)
+    }
+    fn configured_transport(directory: &Path, endpoint: &str, schema: Option<&str>) -> Shared {
+        let mut config = Config {
             directory: directory.into(),
             github_repository: "example/demo".into(),
             mode: Mode::Live,
             connected_account_id: Some("ca_test".into()),
             user_id: Some("demo-user".into()),
             tool_version: Some("20261101_00".into()),
+            composio_transport: Transport::ProjectApi,
+            tool_schema_hash: None,
             agent_public_url: None,
         };
+        if let Some(hash) = schema {
+            config.composio_transport = Transport::ConnectMcp;
+            config.tool_schema_hash = Some(hash.into());
+            config.tool_version = None;
+            config.user_id = None;
+        }
+        config.validate().unwrap();
         let receipts = directory.join("receipts");
         private_directory(&receipts).unwrap();
         let publisher = IssuePublisher {
@@ -927,6 +1016,157 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (url, calls, handle)
+    }
+
+    async fn connect_provider(
+        schema: Value,
+        active: bool,
+        ambiguous: bool,
+        sse: bool,
+    ) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+        let calls = Arc::new(Mutex::new(vec![]));
+        let record = calls.clone();
+        let app = Router::new().route("/mcp", post(move |headers: HeaderMap, Json(body): Json<Value>| {
+            let record = record.clone(); let schema = schema.clone();
+            async move {
+                assert_eq!(headers["x-consumer-api-key"], "test-key");
+                assert!(!headers.contains_key("x-api-key"));
+                assert_eq!(headers["mcp-protocol-version"], "2025-03-26");
+                if body["method"] != "initialize" {
+                    assert_eq!(headers["mcp-session-id"], "transport-session");
+                }
+                if body["method"] == "notifications/initialized" {
+                    return StatusCode::ACCEPTED.into_response();
+                }
+                let result = if body["method"] == "initialize" {
+                    json!({"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"mock","version":"1"}})
+                } else {
+                    let args = &body["params"]["arguments"];
+                    let data = match body["params"]["name"].as_str().unwrap() {
+                        "COMPOSIO_SEARCH_TOOLS" => json!({"session":{"id":"workflow-session"},"toolkit_connection_statuses":[{
+                            "toolkit":"github","has_active_connection":active,
+                            "accounts":[{"id":"ca_test","status":if active {"ACTIVE"} else {"EXPIRED"}}]}]}),
+                        "COMPOSIO_GET_TOOL_SCHEMAS" => {
+                            assert_eq!(args["session_id"], "workflow-session");
+                            assert_eq!(args["tool_slugs"], json!([TOOL]));
+                            json!({"tool_schemas":{TOOL:{"input_schema":schema}}})
+                        },
+                        "COMPOSIO_MULTI_EXECUTE_TOOL" => {
+                            record.lock().unwrap().push(args.clone());
+                            assert_eq!(args["session_id"], "workflow-session");
+                            assert_eq!(args["tools"].as_array().unwrap().len(),1);
+                            assert_eq!(args["tools"][0]["account"],"ca_test");
+                            assert_eq!(args["tools"][0]["tool_slug"],TOOL);
+                            let data = if ambiguous { json!({}) } else {
+                                json!({"number":42,"html_url":"https://github.com/example/demo/issues/42",
+                                    "title":args["tools"][0]["arguments"]["title"],"body":args["tools"][0]["arguments"]["body"]})
+                            };
+                            json!({"results":[{"tool_slug":TOOL,"response":{"successful":true,"data":data}}]})
+                        },
+                        other => panic!("unexpected MCP tool {other}"),
+                    };
+                    json!({"content":[{"type":"text","text":json!({"successful":true,"data":data}).to_string()}]})
+                };
+                let reply = json!({"jsonrpc":"2.0","id":body["id"],"result":result});
+                let mut response = if sse {
+                    ([(header::CONTENT_TYPE,"text/event-stream")],format!(": keepalive\n\ndata: {reply}\n\n")).into_response()
+                } else { Json(reply).into_response() };
+                response.headers_mut().insert("Mcp-Session-Id", "transport-session".parse().unwrap());
+                response
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (url, calls, handle)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connect_mcp_pins_schema_account_and_exact_arguments_and_never_resends() {
+        let schema = json!({"type":"object","required":["owner","repo","title"],
+            "properties":{"owner":{"type":"string"},"repo":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"}}});
+        let hash = digest::content(&serde_json::to_vec(&schema).unwrap()).0;
+        // Success over JSON and SSE; preflight failures cannot invoke the writer;
+        // an ambiguous writer response stays unknown across retries and restart.
+        for (active, matches, ambiguous, sse, state, writes) in [
+            (true, true, false, false, "PUBLISHED", 1),
+            (true, true, false, true, "PUBLISHED", 1),
+            (true, false, false, false, "FAILED_CONFIRMED", 0),
+            (false, true, false, false, "FAILED_CONFIRMED", 0),
+            (true, true, true, true, "OUTCOME_UNKNOWN", 1),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let (url, calls, server) =
+                connect_provider(schema.clone(), active, ambiguous, sse).await;
+            let pin = if matches {
+                hash.clone()
+            } else {
+                "0".repeat(64)
+            };
+            let shared = configured_transport(directory.path(), &url, Some(&pin));
+            let (owner, agent) = routers(shared.clone());
+            let first = request(&agent, AGENT, "POST", "/api/actions", proposal())
+                .await
+                .1;
+            assert_eq!(first["action"]["transport"], "connect_mcp");
+            assert_eq!(first["action"]["input_schema_sha256"], pin);
+            assert!(calls.lock().unwrap().is_empty());
+            assert_eq!(
+                request(
+                    &owner,
+                    OWNER,
+                    "POST",
+                    "/api/actions/wo-2-issue/execute",
+                    binding(&first)
+                )
+                .await
+                .0,
+                StatusCode::UNAUTHORIZED
+            );
+            request(
+                &owner,
+                OWNER,
+                "POST",
+                "/api/actions/wo-2-issue/approve",
+                binding(&first),
+            )
+            .await;
+            for _ in 0..2 {
+                let result = request(
+                    &owner,
+                    OWNER,
+                    "POST",
+                    "/api/actions/wo-2-issue/execute",
+                    binding(&first),
+                )
+                .await;
+                assert_eq!(result.1["operation"]["state"], state, "{result:?}");
+            }
+            assert_eq!(calls.lock().unwrap().len(), writes);
+            if writes == 1 {
+                assert_eq!(
+                    calls.lock().unwrap()[0]["tools"][0]["arguments"],
+                    json!({"owner":"example","repo":"demo","title":proposal()["title"],"body":proposal()["body"]})
+                );
+            }
+            drop(owner);
+            drop(agent);
+            drop(shared);
+            let (owner, _) = routers(configured_transport(directory.path(), &url, Some(&pin)));
+            let result = request(
+                &owner,
+                OWNER,
+                "POST",
+                "/api/actions/wo-2-issue/execute",
+                binding(&first),
+            )
+            .await;
+            assert_eq!(result.1["operation"]["state"], state);
+            assert_eq!(calls.lock().unwrap().len(), writes);
+            server.abort();
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1228,6 +1468,8 @@ mod tests {
             connected_account_id: None,
             user_id: None,
             tool_version: None,
+            composio_transport: Transport::ProjectApi,
+            tool_schema_hash: None,
             agent_public_url: None,
         };
         let original = config.scope();

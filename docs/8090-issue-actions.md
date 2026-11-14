@@ -1,7 +1,7 @@
 # 8090 → TrustGraph → GitHub issue
 
 8090's native agent proposes a GitHub issue. TrustGraph requires human approval
-of its exact title, body, repository, connected account and pinned tool version.
+of its exact title, body, repository, connected account and tool binding.
 Composio creates the approved issue. This path starts no Codex process and
 generates no patch.
 
@@ -75,7 +75,7 @@ tools when this gateway is the enforced publication path.
 ## Live Composio execution
 
 Use a Composio GitHub connected account with access to the demo repository.
-Keep the project API key in the gateway's `COMPOSIO_API_KEY` environment, or in
+Keep the Composio key in the gateway's `COMPOSIO_API_KEY` environment, or in
 an owner-only `composio-key` file in the live state directory. Never put it in a
 prompt, work order, skill or committed file.
 
@@ -83,18 +83,35 @@ prompt, work order, skill or committed file.
 mkdir -m 700 -p .trustgraph-live/issue-actions-live
 # Save composio-key here with owner-only permissions (chmod 600).
 python3 scripts/check_composio_github.py \
-  --account YOUR_CONNECTED_ACCOUNT_ID --repository your-account/demo-repository
+  --repository your-account/demo-repository
+./target/debug/trustgraph actions --config trustgraph-actions-live.local.json --check
 ./target/debug/trustgraph actions --config trustgraph-actions-live.local.json
 ```
 
-The read-only preflight checks the account and tool schema, then writes a local
-configuration pinned to the returned dated version. It creates no issue. Stop
+The read-only preflight selects the correct credential scope:
+
+- **Connect consumer key (`ck_`)**: uses `x-consumer-api-key` with
+  [Connect MCP](https://docs.composio.dev/docs/composio-connect). It discovers a
+  sole active GitHub account (or accepts `--account`), verifies repository access
+  and issues enabled, and pins the issue input schema's SHA-256 in the local
+  config. `--check` verifies that same account and schema through the Rust
+  gateway without creating an issue. Connect exposes no dated tool version;
+  this is a schema binding, not a provider implementation-version pin.
+- **Project key (`ak_`)**: uses `x-api-key` with the project API, needs an explicit
+  `--account`, and pins the returned dated tool version. Use the Python preflight
+  for this route; `--check` is specific to Connect MCP. Consumer and project
+  accounts have [separate scopes](https://docs.composio.dev/kb/guide/consumer-project-boundaries-and-auth-selection).
+
+The preflight writes an owner-only local configuration and creates no issue. Stop
 the preview server before starting live mode on the same ports. Live mode uses
 a separate state directory and capabilities; preview approvals cannot carry over.
 
-The adapter uses only `GITHUB_CREATE_AN_ISSUE` with structured arguments through
-Composio's [execute API](https://docs.composio.dev/reference/api-reference/tools/postToolsExecuteByToolSlug).
-There is no arbitrary tool, proxy, natural-language execution, redirect or
+The write adapter uses only `GITHUB_CREATE_AN_ISSUE` with structured arguments.
+Connect runs fixed discovery and schema checks immediately before passing the
+approved arguments and pinned account to `COMPOSIO_MULTI_EXECUTE_TOOL`. A failed
+preflight is confirmed as no write attempted. The project route uses Composio's
+[execute API](https://docs.composio.dev/reference/api-reference/tools/postToolsExecuteByToolSlug).
+There is no arbitrary tool, proxy, natural-language write execution, redirect or
 automatic mutation retry. A successful live receipt requires the expected
 GitHub issue URL in the response. Unclear responses remain `OUTCOME_UNKNOWN`;
 inspect GitHub and provider logs before taking further action.
@@ -113,6 +130,7 @@ python3 -m unittest discover -s scripts -p 'test_*.py' -v
 ```
 
 Mock-provider tests cover the exact approved payload, agent/owner separation,
-revisions, stale/expired approvals, restart recovery and ambiguous outcomes.
+revisions, stale/expired approvals, restart recovery, Connect JSON/SSE transport,
+schema/account mismatch rejection and ambiguous outcomes.
 A real Composio/GitHub connection still requires the read-only preflight and a
 human-approved live issue creation.

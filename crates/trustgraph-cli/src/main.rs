@@ -26,6 +26,9 @@ enum Command {
         port: u16,
         #[arg(long, default_value_t = 8085)]
         agent_port: u16,
+        /// Verify Connect MCP credentials, account and schema without starting or writing an issue.
+        #[arg(long)]
+        check: bool,
     },
     /// Open the guided, deterministic company-governance demo. No sign-in or external effects.
     Story {
@@ -150,8 +153,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
             config,
             port,
             agent_port,
+            check,
         } => {
-            trustgraph_cli::actions::serve(&config, port, agent_port).await?;
+            if check {
+                tokio::task::spawn_blocking(move || trustgraph_cli::actions::check(&config))
+                    .await??;
+            } else {
+                trustgraph_cli::actions::serve(&config, port, agent_port).await?;
+            }
         }
         Command::Story { port } => {
             let app = trustgraph_cli::story::router()?;

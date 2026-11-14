@@ -5,5 +5,7 @@
   "connected_account_id": null,
   "user_id": null,
   "tool_version": null,
+  "composio_transport": "project_api",
+  "tool_schema_hash": null,
   "agent_public_url": null
 }
