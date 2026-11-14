@@ -60,7 +60,7 @@ what was approved and what happened. It supports reconstruction and inspection.
 It is not the authorization evaluator.
 
 The durable local journal is the runtime’s operation log. It persists state and
-dispatch intent **before** an GitHub change. Stable operation keys let retries
+dispatch intent **before** a GitHub change. Stable operation keys let retries
 refer to an existing operation. If a publisher response is lost, the runtime
 reconciles the outcome instead of blindly sending again. These concerns are
 separate from querying provenance in HydraDB. Replacing the journal would

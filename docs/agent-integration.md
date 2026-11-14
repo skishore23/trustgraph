@@ -92,7 +92,7 @@ The CLI resolves the default token path from ignored `trustgraph.local.json`:
   --case examples/payment-change.json --policy examples/payment-policy.json --json
 ```
 
-Example simulation tool arguments, with no proposed supplied:
+Example simulation tool arguments, with no proposed policy supplied:
 
 ```json
 {
@@ -106,7 +106,7 @@ Example simulation tool arguments, with no proposed supplied:
 }
 ```
 
-Add `policy` with the full [live policy](policy.md) object to test a proposed.
+Add `policy` with the full [live policy](policy.md) object to test a proposed policy.
 These are hypothetical assumptions; this call does not run tests or code.
 
 ## What the connection guarantees
@@ -119,10 +119,9 @@ just because MCP is connected. To govern arbitrary existing agent runs, their
 context and tool executions would need broker integration too.
 
 Keep GitHub publication credentials in the gateway. A caller with independent
-write credentials can bypass this local boundary. A hosted 8090 worker also needs
-a reachable, authenticated deployment or an on-host integration; this loopback
-adapter does not create remote connectivity. No 8090-native connector or Composio
-adapter is implemented here.
+write credentials can bypass this local boundary. Remote agents need a reachable,
+authenticated deployment or an on-host integration; this loopback adapter does
+not create remote connectivity.
 
 Submit work/repair once. If a transport reply is lost, inspect workspace/status
 before resubmitting: task intake has no idempotency-key contract. The adapter

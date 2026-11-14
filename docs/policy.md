@@ -30,10 +30,10 @@ remaining groups/sources/destinations and required rules. Rust resolves group
 membership into concrete principal sets. Unknown names, unsupported schema or
 attempts to exceed configured source/destination authority are rejected.
 
-In the UI, edit a proposed, test it against the current policy and only then
-activate it. Proposed policies can change source readers and approval lifetime. Changes
-to a source boundary require source-owner authority; approval is not an exception
-to that boundary.
+In the UI, edit a proposed policy, test it against the current policy and only
+then activate it. Proposed policies can change source readers and approval
+lifetime. Changes to a source boundary require source-owner authority; approval
+is not an exception to that boundary.
 
 ## Live coding workspace: JSON
 
@@ -70,9 +70,10 @@ checks file scope and actual-run test requirements.
   --policy examples/payment-policy.json --expect blocked
 ```
 
-The example assumes approval age 20 minutes. The proposed shortens its lifetime
-to 15 minutes, so the proposed blocks. The active result depends on the workspace’s
-current policy; restore its 30-minute lifetime for the matching allowed baseline.
+The example assumes approval age 20 minutes. The proposed policy shortens its
+lifetime to 15 minutes, so it blocks publication. The active result depends on
+the workspace’s current policy; restore its 30-minute lifetime for the matching
+allowed baseline.
 
 Live scenario fields: `paths`, `tests_passed`, `lineage_complete`, `approval`,
 `approval_age_minutes`, `include_risk`, `audience`, and optional full `policy`.

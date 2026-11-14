@@ -1,4 +1,4 @@
-# Presentation walkthrough
+# Demo walkthrough
 
 Start with `cargo run --locked -p trustgraph-cli -- story` and open
 [localhost:9081](http://127.0.0.1:9081/). No sign-in is needed. Keep work item
@@ -35,7 +35,8 @@ for real generation, tests, Hydra evidence and a GitHub draft PR. Its human
 operator capability protects actual publication; it is not needed for this
 presentation flow.
 
-The [three-minute film](../media/trustgraph-architecture.mp4)
-([captions](../media/trustgraph-architecture.srt)) explains the problem,
-architecture, coding-agent connection, YAML, manifests, reader-set intersection,
-conflict tracing, approval binding, simulation and durable publication.
+The [technical explainer](../media/trustgraph-technical-explainer.mp4)
+([captions](../media/trustgraph-technical-explainer.srt)) covers controlled inputs,
+HydraDB evidence, inherited access, exact approval and durable publication. The
+[story explainer](../media/trustgraph-explainer.mp4)
+([captions](../media/trustgraph-explainer.srt)) introduces the dashboard example.
