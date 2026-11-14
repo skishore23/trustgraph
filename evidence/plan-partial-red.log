@@ -1,0 +1,23 @@
+   Compiling trustgraph-core v0.1.0 (/Users/kishore/TrustGraph/crates/trustgraph-core)
+   Compiling trustgraph-runtime v0.1.0 (/Users/kishore/TrustGraph/crates/trustgraph-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.28s
+     Running tests/plan_runs.rs (target/debug/deps/plan_runs-60ada05e8a7e0c36)
+
+running 1 test
+test every_prepare_commit_boundary_resumes_once_and_partial_outputs_cannot_bypass_review ... FAILED
+
+failures:
+
+---- every_prepare_commit_boundary_resumes_once_and_partial_outputs_cannot_bypass_review stdout ----
+
+thread 'every_prepare_commit_boundary_resumes_once_and_partial_outputs_cannot_bypass_review' (59975846) panicked at crates/trustgraph-runtime/tests/plan_runs.rs:234:17:
+partial output escaped at BeforeCommit/2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    every_prepare_commit_boundary_resumes_once_and_partial_outputs_cannot_bypass_review
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p trustgraph-runtime --test plan_runs`

@@ -1,0 +1,44 @@
+{
+  "goal": "Post this week’s launch update",
+  "id": "weekly-launch-update",
+  "steps": [
+    {
+      "id": "read-roadmap",
+      "operation": "read",
+      "source": "roadmap"
+    },
+    {
+      "id": "read-prompt",
+      "operation": "read",
+      "source": "task-prompt"
+    },
+    {
+      "id": "read-launch-plan",
+      "operation": "read",
+      "source": "launch-plan"
+    },
+    {
+      "id": "generate",
+      "inputs": [
+        "read-roadmap",
+        "read-prompt",
+        "read-launch-plan"
+      ],
+      "operation": "generate",
+      "provider": "local_fixture"
+    },
+    {
+      "artifact": "generate",
+      "audience": "company",
+      "id": "approve",
+      "operation": "approve"
+    },
+    {
+      "approval": "approve",
+      "artifact": "generate",
+      "audience": "company",
+      "id": "publish",
+      "operation": "publish"
+    }
+  ]
+}

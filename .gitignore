@@ -1,0 +1,10 @@
+/target/
+/.trustgraph/
+/.trustgraph-consulting/
+/.env
+*.tmp
+
+/.trustgraph-bank/
+/.env.*
+
+.DS_Store

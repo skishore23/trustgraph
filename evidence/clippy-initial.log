@@ -1,0 +1,2 @@
+error: 'cargo-clippy' is not installed for the toolchain 'stable-aarch64-apple-darwin'.
+help: run `rustup component add clippy` to install it

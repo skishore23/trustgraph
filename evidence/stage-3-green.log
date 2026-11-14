@@ -1,0 +1,24 @@
+   Compiling trustgraph-sim v0.1.0 (/Users/kishore/TrustGraph/crates/trustgraph-sim)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.24s
+     Running unittests src/lib.rs (target/debug/deps/trustgraph_sim-0b7faccc5f53172b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/scenarios.rs (target/debug/deps/scenarios-a3f8183c3a1c89a3)
+
+running 4 tests
+test expired_approval_and_changed_audience_or_policy_cannot_publish ... ok
+test full_demo_contains_permission_block_stale_approval_and_one_exact_publication ... ok
+test crash_and_provider_recovery_observe_original_operation_only ... ok
+test seeded_races_cover_both_orders_without_unauthorized_publication ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.08s
+
+   Doc-tests trustgraph_sim
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

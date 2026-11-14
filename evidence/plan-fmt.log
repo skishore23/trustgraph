@@ -1,0 +1,39 @@
+Diff in /Users/kishore/TrustGraph/crates/trustgraph-runtime/tests/plan_runs.rs:253:
+                     .values()
+                     .find(|a| a.id.0.starts_with("plan-run-"))
+                     .cloned()
+-                {
+-                    let intent = Intent {
+-                        artifact: a.id,
+-                        audience: "product".into(),
+-                        requester: "maya".into(),
+-                    };
+-                    let ctx = verify(&recovered.state().evidence, &intent, 2)
+-                        .context()
+-                        .unwrap()
+-                        .digest();
+-                    assert!(
+-                        recovered
+-                            .approve(&"maya".into(), &intent, &ctx, "partial-bypass", 2)
+-                            .is_err(),
+-                        "partial output escaped at {fault:?}/{boundary}"
+-                    );
++            {
++                let intent = Intent {
++                    artifact: a.id,
++                    audience: "product".into(),
++                    requester: "maya".into(),
++                };
++                let ctx = verify(&recovered.state().evidence, &intent, 2)
++                    .context()
++                    .unwrap()
++                    .digest();
++                assert!(
++                    recovered
++                        .approve(&"maya".into(), &intent, &ctx, "partial-bypass", 2)
++                        .is_err(),
++                    "partial output escaped at {fault:?}/{boundary}"
++                );
+             }
+             recovered
+                 .prepare_plan(

@@ -1,0 +1,181 @@
+ Downloading crates ...
+  Downloaded smallvec v1.16.5
+  Downloaded fs2 v0.4.3
+  Downloaded reqwest v0.12.28
+  Downloaded rustls-pki-types v1.16.0
+  Downloaded rustls-webpki v0.103.17
+  Downloaded mio v1.2.5
+  Downloaded cc v1.11.2
+  Downloaded webpki-roots v1.0.12
+  Downloaded tokio v1.54.1
+   Compiling stable_deref_trait v1.2.1
+   Compiling bytes v1.12.1
+   Compiling pin-project-lite v0.2.17
+   Compiling find-msvc-tools v0.1.15
+   Compiling futures-core v0.3.34
+   Compiling shlex v2.0.1
+   Compiling smallvec v1.16.5
+   Compiling writeable v0.6.4
+   Compiling utf_types v1.0.0
+   Compiling litemap v0.8.3
+   Compiling once_cell v1.21.4
+   Compiling syn v3.0.10
+   Compiling errno v0.3.15
+   Compiling socket2 v0.6.5
+   Compiling mio v1.2.5
+   Compiling icu_normalizer_data v2.4.0
+   Compiling cc v1.11.2
+   Compiling utf8_iter v1.1.0
+   Compiling signal-hook-registry v1.4.8
+   Compiling icu_properties_data v2.4.0
+   Compiling zeroize v1.9.1
+   Compiling percent-encoding v2.3.2
+   Compiling getrandom v0.2.17
+   Compiling untrusted v0.9.0
+   Compiling slab v0.4.12
+   Compiling httparse v1.10.1
+   Compiling futures-task v0.3.34
+   Compiling rustls v0.23.46
+   Compiling rustls-pki-types v1.16.0
+   Compiling try-lock v0.2.5
+   Compiling tower-service v0.3.3
+   Compiling http v1.5.0
+   Compiling futures-util v0.3.34
+   Compiling want v0.3.2
+   Compiling form_urlencoded v1.2.2
+   Compiling tracing-core v0.1.36
+   Compiling subtle v2.6.1
+   Compiling atomic-waker v1.1.2
+   Compiling futures-channel v0.3.34
+   Compiling sync_wrapper v1.0.2
+   Compiling tower-layer v0.3.3
+   Compiling ipnet v2.12.2
+   Compiling base64 v0.23.1
+   Compiling webpki-roots v1.0.12
+   Compiling ryu v1.0.23
+   Compiling tracing v0.1.44
+   Compiling getrandom v0.4.3
+   Compiling base64 v0.22.1
+   Compiling log v0.4.35
+   Compiling http-body v1.1.0
+   Compiling rustix v1.1.6
+   Compiling http-body-util v0.1.5
+   Compiling fs2 v0.4.3
+   Compiling ring v0.17.14
+   Compiling synstructure v0.14.0
+   Compiling tempfile v3.27.0
+   Compiling zerofrom-derive v0.1.8
+   Compiling yoke-derive v0.8.4
+   Compiling zerovec-derive v0.11.7
+   Compiling displaydoc v0.2.7
+   Compiling tokio-macros v2.7.2
+   Compiling serde_derive v1.0.229
+   Compiling thiserror-impl v2.0.21
+   Compiling tokio v1.54.1
+   Compiling zerofrom v0.1.8
+   Compiling thiserror v2.0.21
+   Compiling yoke v0.8.4
+   Compiling serde v1.0.229
+   Compiling zerovec v0.11.9
+   Compiling zerotrie v0.2.5
+   Compiling serde_urlencoded v0.7.1
+   Compiling trustgraph-core v0.1.0 (/Users/kishore/TrustGraph/crates/trustgraph-core)
+   Compiling rustls-webpki v0.103.17
+   Compiling tinystr v0.8.5
+   Compiling potential_utf v0.1.6
+   Compiling icu_collections v2.4.0
+   Compiling icu_locale_core v2.4.0
+   Compiling hyper v1.12.0
+   Compiling tower v0.5.3
+   Compiling icu_provider v2.4.0
+   Compiling hyper-util v0.1.21
+   Compiling icu_normalizer v2.4.0
+   Compiling icu_properties v2.4.0
+   Compiling idna_adapter v1.2.2
+   Compiling idna v1.1.0
+   Compiling url v2.5.8
+   Compiling tower-http v0.6.11
+   Compiling tokio-rustls v0.26.6
+   Compiling hyper-rustls v0.27.10
+   Compiling reqwest v0.12.28
+   Compiling trustgraph-runtime v0.1.0 (/Users/kishore/TrustGraph/crates/trustgraph-runtime)
+warning: unused import: `*`
+ --> crates/trustgraph-runtime/src/journal.rs:1:23
+  |
+1 | use crate::{model::*, *};
+  |                       ^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `trustgraph-runtime` (lib) generated 1 warning (run `cargo fix --lib -p trustgraph-runtime` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.74s
+     Running tests/workflow.rs (target/debug/deps/workflow-1c622fb43e2fd028)
+
+running 9 tests
+test timeout_after_acceptance_reconciles_same_operation_without_resending ... FAILED
+test agent_cannot_approve_or_change_acl_and_sales_cannot_read_private_draft ... FAILED
+test idempotency_keys_cannot_change_payload_and_never_dispatch_twice ... FAILED
+test demo_uses_exact_approved_bytes_and_refuses_changed_draft ... FAILED
+test uncertain_journal_write_poisons_coordinator_until_recovery ... FAILED
+test timeout_without_acceptance_stays_unknown_and_is_not_retried ... FAILED
+test verification_is_repeated_after_acl_change_before_dispatch ... FAILED
+test durable_state_and_provider_ledger_survive_real_disk_reopen ... FAILED
+test torn_or_modified_journal_never_allows_new_publication ... ok
+
+failures:
+
+---- timeout_after_acceptance_reconciles_same_operation_without_resending stdout ----
+
+thread 'timeout_after_acceptance_reconciles_same_operation_without_resending' (59777447) panicked at crates/trustgraph-runtime/tests/workflow.rs:7:57:
+called `Result::unwrap()` on an `Err` value: Invalid("not implemented")
+
+---- agent_cannot_approve_or_change_acl_and_sales_cannot_read_private_draft stdout ----
+
+thread 'agent_cannot_approve_or_change_acl_and_sales_cannot_read_private_draft' (59777443) panicked at crates/trustgraph-runtime/tests/workflow.rs:7:57:
+called `Result::unwrap()` on an `Err` value: Invalid("not implemented")
+
+---- idempotency_keys_cannot_change_payload_and_never_dispatch_twice stdout ----
+
+thread 'idempotency_keys_cannot_change_payload_and_never_dispatch_twice' (59777446) panicked at crates/trustgraph-runtime/tests/workflow.rs:7:57:
+called `Result::unwrap()` on an `Err` value: Invalid("not implemented")
+
+---- demo_uses_exact_approved_bytes_and_refuses_changed_draft stdout ----
+
+thread 'demo_uses_exact_approved_bytes_and_refuses_changed_draft' (59777444) panicked at crates/trustgraph-runtime/tests/workflow.rs:18:76:
+called `Result::unwrap()` on an `Err` value: Invalid("not implemented")
+
+---- uncertain_journal_write_poisons_coordinator_until_recovery stdout ----
+
+thread 'uncertain_journal_write_poisons_coordinator_until_recovery' (59777450) panicked at crates/trustgraph-runtime/tests/workflow.rs:7:57:
+called `Result::unwrap()` on an `Err` value: Invalid("not implemented")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- timeout_without_acceptance_stays_unknown_and_is_not_retried stdout ----
+
+thread 'timeout_without_acceptance_stays_unknown_and_is_not_retried' (59777448) panicked at crates/trustgraph-runtime/tests/workflow.rs:7:57:
+called `Result::unwrap()` on an `Err` value: Invalid("not implemented")
+
+---- verification_is_repeated_after_acl_change_before_dispatch stdout ----
+
+thread 'verification_is_repeated_after_acl_change_before_dispatch' (59777451) panicked at crates/trustgraph-runtime/tests/workflow.rs:7:57:
+called `Result::unwrap()` on an `Err` value: Invalid("not implemented")
+
+---- durable_state_and_provider_ledger_survive_real_disk_reopen stdout ----
+
+thread 'durable_state_and_provider_ledger_survive_real_disk_reopen' (59777445) panicked at crates/trustgraph-runtime/tests/workflow.rs:7:57:
+called `Result::unwrap()` on an `Err` value: Invalid("not implemented")
+
+
+failures:
+    agent_cannot_approve_or_change_acl_and_sales_cannot_read_private_draft
+    demo_uses_exact_approved_bytes_and_refuses_changed_draft
+    durable_state_and_provider_ledger_survive_real_disk_reopen
+    idempotency_keys_cannot_change_payload_and_never_dispatch_twice
+    timeout_after_acceptance_reconciles_same_operation_without_resending
+    timeout_without_acceptance_stays_unknown_and_is_not_retried
+    uncertain_journal_write_poisons_coordinator_until_recovery
+    verification_is_repeated_after_acl_change_before_dispatch
+
+test result: FAILED. 1 passed; 8 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `-p trustgraph-runtime --test workflow`

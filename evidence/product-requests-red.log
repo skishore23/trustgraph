@@ -1,0 +1,37 @@
+   Compiling trustgraph-core v0.1.0 (/Users/kishore/TrustGraph/crates/trustgraph-core)
+   Compiling trustgraph-runtime v0.1.0 (/Users/kishore/TrustGraph/crates/trustgraph-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.01s
+     Running tests/submissions.rs (target/debug/deps/submissions-3e7f5c8d5092136b)
+
+running 3 tests
+test release_is_fenced_idempotent_and_agent_cannot_approve ... FAILED
+test returning_work_records_feedback_revokes_old_approval_and_requires_agent_revision ... FAILED
+test agent_intake_is_persistent_idempotent_and_scoped_to_reviewers ... FAILED
+
+failures:
+
+---- release_is_fenced_idempotent_and_agent_cannot_approve stdout ----
+
+thread 'release_is_fenced_idempotent_and_agent_cannot_approve' (59857424) panicked at crates/trustgraph-runtime/tests/submissions.rs:6:200:
+called `Result::unwrap()` on an `Err` value: Invalid("request intake not implemented")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- returning_work_records_feedback_revokes_old_approval_and_requires_agent_revision stdout ----
+
+thread 'returning_work_records_feedback_revokes_old_approval_and_requires_agent_revision' (59857425) panicked at crates/trustgraph-runtime/tests/submissions.rs:6:200:
+called `Result::unwrap()` on an `Err` value: Invalid("request intake not implemented")
+
+---- agent_intake_is_persistent_idempotent_and_scoped_to_reviewers stdout ----
+
+thread 'agent_intake_is_persistent_idempotent_and_scoped_to_reviewers' (59857423) panicked at crates/trustgraph-runtime/tests/submissions.rs:6:200:
+called `Result::unwrap()` on an `Err` value: Invalid("request intake not implemented")
+
+
+failures:
+    agent_intake_is_persistent_idempotent_and_scoped_to_reviewers
+    release_is_fenced_idempotent_and_agent_cannot_approve
+    returning_work_records_feedback_revokes_old_approval_and_requires_agent_revision
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p trustgraph-runtime --test submissions`

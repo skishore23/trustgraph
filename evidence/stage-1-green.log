@@ -1,0 +1,21 @@
+   Compiling trustgraph-core v0.1.0 (/Users/kishore/TrustGraph/crates/trustgraph-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.90s
+     Running tests/governance.rs (target/debug/deps/governance-5965916438d62bd6)
+
+running 13 tests
+test exact_bytes_and_structured_domains_have_distinct_hashes ... ok
+test broad_audience_is_blocked_by_transitive_private_source ... ok
+test unauthorized_actor_gets_no_restricted_metadata ... ok
+test human_approval_cannot_override_source_permissions ... ok
+test repeated_input_occurrences_are_valid_but_duplicate_occurrence_identity_is_not ... ok
+test public_rewrite_with_private_previous_draft_stays_restricted ... ok
+test unknown_audiences_and_cross_workspace_recipients_block ... ok
+test missing_or_untrusted_provenance_blocks ... ok
+test safe_generation_waits_for_human_approval_then_becomes_ready ... ok
+test schema_equations_cycles_and_tampered_bytes_fail_closed ... ok
+test editing_one_byte_creates_a_different_binding ... ok
+test every_publication_binding_field_matters ... ok
+test revoked_expired_future_or_ineligible_approval_never_authorizes ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

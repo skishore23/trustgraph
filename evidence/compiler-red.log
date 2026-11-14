@@ -1,0 +1,50 @@
+   Compiling trustgraph-core v0.1.0 (/Users/kishore/TrustGraph/crates/trustgraph-core)
+   Compiling trustgraph-runtime v0.1.0 (/Users/kishore/TrustGraph/crates/trustgraph-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.49s
+     Running tests/compiler.rs (target/debug/deps/compiler-a9263e41d3cd9122)
+
+running 4 tests
+test approval_is_an_obligation_after_generation_and_must_match_publication ... FAILED
+test compiler_names_a_concrete_unauthorized_recipient_and_dependency_path ... FAILED
+test both_repairs_recompile_without_changing_acl_or_claiming_equal_content ... FAILED
+test bad_references_missing_prompt_and_private_metadata_fail_closed ... FAILED
+
+failures:
+
+---- approval_is_an_obligation_after_generation_and_must_match_publication stdout ----
+
+thread 'approval_is_an_obligation_after_generation_and_must_match_publication' (59922806) panicked at crates/trustgraph-runtime/tests/compiler.rs:19:128:
+assertion failed: report.ready_to_generate
+
+---- compiler_names_a_concrete_unauthorized_recipient_and_dependency_path stdout ----
+
+thread 'compiler_names_a_concrete_unauthorized_recipient_and_dependency_path' (59922809) panicked at crates/trustgraph-runtime/tests/compiler.rs:8:36:
+assertion `left == right` failed
+  left: InvalidShape
+ right: AudienceConflict
+
+---- both_repairs_recompile_without_changing_acl_or_claiming_equal_content stdout ----
+
+thread 'both_repairs_recompile_without_changing_acl_or_claiming_equal_content' (59922808) panicked at crates/trustgraph-runtime/tests/compiler.rs:13:5:
+assertion `left == right` failed
+  left: 0
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- bad_references_missing_prompt_and_private_metadata_fail_closed stdout ----
+
+thread 'bad_references_missing_prompt_and_private_metadata_fail_closed' (59922807) panicked at crates/trustgraph-runtime/tests/compiler.rs:26:63:
+assertion `left == right` failed
+  left: InvalidShape
+ right: CallerUnauthorized
+
+
+failures:
+    approval_is_an_obligation_after_generation_and_must_match_publication
+    bad_references_missing_prompt_and_private_metadata_fail_closed
+    both_repairs_recompile_without_changing_acl_or_claiming_equal_content
+    compiler_names_a_concrete_unauthorized_recipient_and_dependency_path
+
+test result: FAILED. 0 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p trustgraph-runtime --test compiler`

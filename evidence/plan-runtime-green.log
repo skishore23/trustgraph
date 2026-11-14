@@ -1,0 +1,12 @@
+   Compiling trustgraph-core v0.1.0 (/Users/kishore/TrustGraph/crates/trustgraph-core)
+   Compiling trustgraph-runtime v0.1.0 (/Users/kishore/TrustGraph/crates/trustgraph-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.47s
+     Running tests/plan_runs.rs (target/debug/deps/plan_runs-60ada05e8a7e0c36)
+
+running 3 tests
+test run_reservation_recovers_without_duplicate_generation_or_review ... ok
+test a_review_cannot_substitute_the_plan_output_or_publish_after_acl_drift ... ok
+test unsafe_plan_has_no_generation_effect_and_repairs_prepare_a_real_review ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+

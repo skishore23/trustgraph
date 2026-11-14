@@ -1,0 +1,669 @@
+{
+  "passed": true,
+  "scope": "Deterministic bank fixture; local generation; no GitHub or model calls. Stale checks exercise the actual verifier; no claim of financial/code correctness.",
+  "cases": [
+    {
+      "id": "allowed",
+      "expected": "permission pass; human approval required",
+      "observed": "permission pass; human approval required",
+      "passed": true,
+      "details": {
+        "conflict": null,
+        "obligations": [
+          {
+            "artifact": "patch",
+            "audience": "engineering-repo",
+            "description": "After generation, a human must approve the actual bytes and exact destination. This step is not approval in advance.",
+            "step": "review"
+          }
+        ],
+        "plan_digest": "e37fdae5a7b92726e03c24ad8e21a68cceef5b587dd6c4952ece6d0b02ef35db",
+        "ready_to_generate": true,
+        "snapshot_digest": "a7b058e140646376e92b309d29c186c3b60d084ab4004616848e4fe9c51ac52c",
+        "steps": [
+          {
+            "effect": "Read a recorded source revision",
+            "id": "read-engineering-requirements",
+            "inputs": [],
+            "operation": "read",
+            "readers": [
+              "agent",
+              "arun",
+              "maya",
+              "sam"
+            ],
+            "sources": [
+              "engineering-requirements"
+            ]
+          },
+          {
+            "effect": "Read a recorded source revision",
+            "id": "read-approved-specification",
+            "inputs": [],
+            "operation": "read",
+            "readers": [
+              "agent",
+              "arun",
+              "maya",
+              "sam"
+            ],
+            "sources": [
+              "approved-specification"
+            ]
+          },
+          {
+            "effect": "Read a recorded source revision",
+            "id": "read-task-prompt",
+            "inputs": [],
+            "operation": "read",
+            "readers": [
+              "agent",
+              "arun",
+              "maya",
+              "sam"
+            ],
+            "sources": [
+              "task-prompt"
+            ]
+          },
+          {
+            "effect": "Create a fresh local fixture context; no external provider transfer",
+            "id": "patch",
+            "inputs": [
+              "read-engineering-requirements",
+              "read-approved-specification",
+              "read-task-prompt"
+            ],
+            "operation": "generate",
+            "readers": [
+              "agent",
+              "arun",
+              "maya",
+              "sam"
+            ],
+            "sources": [
+              "approved-specification",
+              "engineering-requirements",
+              "task-prompt"
+            ]
+          },
+          {
+            "effect": "Pause for authenticated human approval of actual content",
+            "id": "review",
+            "inputs": [
+              "patch"
+            ],
+            "operation": "approve",
+            "readers": [
+              "agent",
+              "arun",
+              "maya",
+              "sam"
+            ],
+            "sources": [
+              "approved-specification",
+              "engineering-requirements",
+              "task-prompt"
+            ]
+          },
+          {
+            "effect": "Recheck current evidence and dispatch only the approved bytes",
+            "id": "publish",
+            "inputs": [
+              "patch",
+              "review"
+            ],
+            "operation": "publish",
+            "readers": [
+              "agent",
+              "arun",
+              "maya",
+              "sam"
+            ],
+            "sources": [
+              "approved-specification",
+              "engineering-requirements",
+              "task-prompt"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "restricted-source",
+      "expected": "blocked by Risk-only source",
+      "observed": "blocked by Risk-only source",
+      "passed": true,
+      "details": {
+        "conflict": {
+          "code": "AUDIENCE_CONFLICT",
+          "message": "A destination recipient cannot read a source that the generated artifact depends on.",
+          "path": [
+            "read-risk-investigation",
+            "patch",
+            "publish"
+          ],
+          "recipient": "maya",
+          "source": "risk-investigation",
+          "step": "publish"
+        },
+        "obligations": [
+          {
+            "artifact": "patch",
+            "audience": "engineering-repo",
+            "description": "After generation, a human must approve the actual bytes and exact destination. This step is not approval in advance.",
+            "step": "review"
+          }
+        ],
+        "plan_digest": "b26b535ad59bfd9ef06b396754938996483760ae0e95b205d6f04be8f6459935",
+        "ready_to_generate": false,
+        "snapshot_digest": "a7b058e140646376e92b309d29c186c3b60d084ab4004616848e4fe9c51ac52c",
+        "steps": [
+          {
+            "effect": "Read a recorded source revision",
+            "id": "read-engineering-requirements",
+            "inputs": [],
+            "operation": "read",
+            "readers": [
+              "agent",
+              "arun",
+              "maya",
+              "sam"
+            ],
+            "sources": [
+              "engineering-requirements"
+            ]
+          },
+          {
+            "effect": "Read a recorded source revision",
+            "id": "read-approved-specification",
+            "inputs": [],
+            "operation": "read",
+            "readers": [
+              "agent",
+              "arun",
+              "maya",
+              "sam"
+            ],
+            "sources": [
+              "approved-specification"
+            ]
+          },
+          {
+            "effect": "Read a recorded source revision",
+            "id": "read-task-prompt",
+            "inputs": [],
+            "operation": "read",
+            "readers": [
+              "agent",
+              "arun",
+              "maya",
+              "sam"
+            ],
+            "sources": [
+              "task-prompt"
+            ]
+          },
+          {
+            "effect": "Read a recorded source revision",
+            "id": "read-risk-investigation",
+            "inputs": [],
+            "operation": "read",
+            "readers": [
+              "agent",
+              "arun"
+            ],
+            "sources": [
+              "risk-investigation"
+            ]
+          },
+          {
+            "effect": "Create a fresh local fixture context; no external provider transfer",
+            "id": "patch",
+            "inputs": [
+              "read-engineering-requirements",
+              "read-approved-specification",
+              "read-task-prompt",
+              "read-risk-investigation"
+            ],
+            "operation": "generate",
+            "readers": [
+              "agent",
+              "arun"
+            ],
+            "sources": [
+              "approved-specification",
+              "engineering-requirements",
+              "risk-investigation",
+              "task-prompt"
+            ]
+          },
+          {
+            "effect": "Pause for authenticated human approval of actual content",
+            "id": "review",
+            "inputs": [
+              "patch"
+            ],
+            "operation": "approve",
+            "readers": [
+              "agent",
+              "arun"
+            ],
+            "sources": [
+              "approved-specification",
+              "engineering-requirements",
+              "risk-investigation",
+              "task-prompt"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "fresh-context-repair",
+      "expected": "recompiled using authorized sources",
+      "observed": "recompiled using authorized sources",
+      "passed": true,
+      "details": [
+        {
+          "explanation": "Keep the proposed inputs and change the destination. No source permission is widened.",
+          "kind": "narrow_audience",
+          "plan": {
+            "goal": "Implement and test the reconciliation change; prepare a draft PR",
+            "id": "repair-36412eba4e19",
+            "steps": [
+              {
+                "id": "read-engineering-requirements",
+                "operation": "read",
+                "source": "engineering-requirements"
+              },
+              {
+                "id": "read-approved-specification",
+                "operation": "read",
+                "source": "approved-specification"
+              },
+              {
+                "id": "read-task-prompt",
+                "operation": "read",
+                "source": "task-prompt"
+              },
+              {
+                "id": "read-risk-investigation",
+                "operation": "read",
+                "source": "risk-investigation"
+              },
+              {
+                "id": "patch",
+                "inputs": [
+                  "read-engineering-requirements",
+                  "read-approved-specification",
+                  "read-task-prompt",
+                  "read-risk-investigation"
+                ],
+                "operation": "generate",
+                "provider": "local_fixture"
+              },
+              {
+                "artifact": "patch",
+                "audience": "risk-room",
+                "id": "review",
+                "operation": "approve"
+              },
+              {
+                "approval": "review",
+                "artifact": "patch",
+                "audience": "risk-room",
+                "id": "publish",
+                "operation": "publish"
+              }
+            ]
+          },
+          "report": {
+            "conflict": null,
+            "obligations": [
+              {
+                "artifact": "patch",
+                "audience": "risk-room",
+                "description": "After generation, a human must approve the actual bytes and exact destination. This step is not approval in advance.",
+                "step": "review"
+              }
+            ],
+            "plan_digest": "aca3385db625837a0063cc2daefe03d307a2527d0d82eec2d937764fd3b525c0",
+            "ready_to_generate": true,
+            "snapshot_digest": "a7b058e140646376e92b309d29c186c3b60d084ab4004616848e4fe9c51ac52c",
+            "steps": [
+              {
+                "effect": "Read a recorded source revision",
+                "id": "read-engineering-requirements",
+                "inputs": [],
+                "operation": "read",
+                "readers": [
+                  "agent",
+                  "arun",
+                  "maya",
+                  "sam"
+                ],
+                "sources": [
+                  "engineering-requirements"
+                ]
+              },
+              {
+                "effect": "Read a recorded source revision",
+                "id": "read-approved-specification",
+                "inputs": [],
+                "operation": "read",
+                "readers": [
+                  "agent",
+                  "arun",
+                  "maya",
+                  "sam"
+                ],
+                "sources": [
+                  "approved-specification"
+                ]
+              },
+              {
+                "effect": "Read a recorded source revision",
+                "id": "read-task-prompt",
+                "inputs": [],
+                "operation": "read",
+                "readers": [
+                  "agent",
+                  "arun",
+                  "maya",
+                  "sam"
+                ],
+                "sources": [
+                  "task-prompt"
+                ]
+              },
+              {
+                "effect": "Read a recorded source revision",
+                "id": "read-risk-investigation",
+                "inputs": [],
+                "operation": "read",
+                "readers": [
+                  "agent",
+                  "arun"
+                ],
+                "sources": [
+                  "risk-investigation"
+                ]
+              },
+              {
+                "effect": "Create a fresh local fixture context; no external provider transfer",
+                "id": "patch",
+                "inputs": [
+                  "read-engineering-requirements",
+                  "read-approved-specification",
+                  "read-task-prompt",
+                  "read-risk-investigation"
+                ],
+                "operation": "generate",
+                "readers": [
+                  "agent",
+                  "arun"
+                ],
+                "sources": [
+                  "approved-specification",
+                  "engineering-requirements",
+                  "risk-investigation",
+                  "task-prompt"
+                ]
+              },
+              {
+                "effect": "Pause for authenticated human approval of actual content",
+                "id": "review",
+                "inputs": [
+                  "patch"
+                ],
+                "operation": "approve",
+                "readers": [
+                  "agent",
+                  "arun"
+                ],
+                "sources": [
+                  "approved-specification",
+                  "engineering-requirements",
+                  "risk-investigation",
+                  "task-prompt"
+                ]
+              },
+              {
+                "effect": "Recheck current evidence and dispatch only the approved bytes",
+                "id": "publish",
+                "inputs": [
+                  "patch",
+                  "review"
+                ],
+                "operation": "publish",
+                "readers": [
+                  "agent",
+                  "arun"
+                ],
+                "sources": [
+                  "approved-specification",
+                  "engineering-requirements",
+                  "risk-investigation",
+                  "task-prompt"
+                ]
+              }
+            ]
+          },
+          "title": "Send to a permitted audience"
+        },
+        {
+          "explanation": "Start a new context using only permitted inputs. The result may contain different information; the old draft is not reused.",
+          "kind": "fresh_context",
+          "plan": {
+            "goal": "Implement and test the reconciliation change; prepare a draft PR",
+            "id": "fresh-3b464a44a836",
+            "steps": [
+              {
+                "id": "read-engineering-requirements",
+                "operation": "read",
+                "source": "engineering-requirements"
+              },
+              {
+                "id": "read-approved-specification",
+                "operation": "read",
+                "source": "approved-specification"
+              },
+              {
+                "id": "read-task-prompt",
+                "operation": "read",
+                "source": "task-prompt"
+              },
+              {
+                "id": "patch",
+                "inputs": [
+                  "read-engineering-requirements",
+                  "read-approved-specification",
+                  "read-task-prompt"
+                ],
+                "operation": "generate",
+                "provider": "local_fixture"
+              },
+              {
+                "artifact": "patch",
+                "audience": "engineering-repo",
+                "id": "review",
+                "operation": "approve"
+              },
+              {
+                "approval": "review",
+                "artifact": "patch",
+                "audience": "engineering-repo",
+                "id": "publish",
+                "operation": "publish"
+              }
+            ]
+          },
+          "report": {
+            "conflict": null,
+            "obligations": [
+              {
+                "artifact": "patch",
+                "audience": "engineering-repo",
+                "description": "After generation, a human must approve the actual bytes and exact destination. This step is not approval in advance.",
+                "step": "review"
+              }
+            ],
+            "plan_digest": "fce1c9601ed2a46f288cbc70700921a2173174a38dd09f49e09ef25cfe8121c3",
+            "ready_to_generate": true,
+            "snapshot_digest": "a7b058e140646376e92b309d29c186c3b60d084ab4004616848e4fe9c51ac52c",
+            "steps": [
+              {
+                "effect": "Read a recorded source revision",
+                "id": "read-engineering-requirements",
+                "inputs": [],
+                "operation": "read",
+                "readers": [
+                  "agent",
+                  "arun",
+                  "maya",
+                  "sam"
+                ],
+                "sources": [
+                  "engineering-requirements"
+                ]
+              },
+              {
+                "effect": "Read a recorded source revision",
+                "id": "read-approved-specification",
+                "inputs": [],
+                "operation": "read",
+                "readers": [
+                  "agent",
+                  "arun",
+                  "maya",
+                  "sam"
+                ],
+                "sources": [
+                  "approved-specification"
+                ]
+              },
+              {
+                "effect": "Read a recorded source revision",
+                "id": "read-task-prompt",
+                "inputs": [],
+                "operation": "read",
+                "readers": [
+                  "agent",
+                  "arun",
+                  "maya",
+                  "sam"
+                ],
+                "sources": [
+                  "task-prompt"
+                ]
+              },
+              {
+                "effect": "Create a fresh local fixture context; no external provider transfer",
+                "id": "patch",
+                "inputs": [
+                  "read-engineering-requirements",
+                  "read-approved-specification",
+                  "read-task-prompt"
+                ],
+                "operation": "generate",
+                "readers": [
+                  "agent",
+                  "arun",
+                  "maya",
+                  "sam"
+                ],
+                "sources": [
+                  "approved-specification",
+                  "engineering-requirements",
+                  "task-prompt"
+                ]
+              },
+              {
+                "effect": "Pause for authenticated human approval of actual content",
+                "id": "review",
+                "inputs": [
+                  "patch"
+                ],
+                "operation": "approve",
+                "readers": [
+                  "agent",
+                  "arun",
+                  "maya",
+                  "sam"
+                ],
+                "sources": [
+                  "approved-specification",
+                  "engineering-requirements",
+                  "task-prompt"
+                ]
+              },
+              {
+                "effect": "Recheck current evidence and dispatch only the approved bytes",
+                "id": "publish",
+                "inputs": [
+                  "patch",
+                  "review"
+                ],
+                "operation": "publish",
+                "readers": [
+                  "agent",
+                  "arun",
+                  "maya",
+                  "sam"
+                ],
+                "sources": [
+                  "approved-specification",
+                  "engineering-requirements",
+                  "task-prompt"
+                ]
+              }
+            ]
+          },
+          "title": "Generate a fresh audience-safe draft"
+        }
+      ]
+    },
+    {
+      "id": "stale-approval",
+      "expected": "changed patch AND destination blocked",
+      "observed": "changed patch AND destination blocked",
+      "passed": true,
+      "details": {
+        "changed_destination": {
+          "status": "BLOCKED",
+          "violations": [
+            {
+              "code": "STALE_APPROVAL",
+              "witness": null
+            }
+          ]
+        },
+        "changed_patch": {
+          "status": "BLOCKED",
+          "violations": [
+            {
+              "code": "STALE_APPROVAL",
+              "witness": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "unknown-provenance",
+      "expected": "missing transformation blocked",
+      "observed": "missing transformation blocked",
+      "passed": true,
+      "details": {
+        "status": "BLOCKED",
+        "violations": [
+          {
+            "code": "INCOMPLETE_LINEAGE",
+            "witness": null
+          }
+        ]
+      }
+    }
+  ]
+}

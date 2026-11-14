@@ -1,0 +1,18 @@
+{
+  "model": "trustgraph-finite-1",
+  "rule": "production",
+  "max_depth": 6,
+  "states": 103,
+  "transitions": 624,
+  "publications": 6,
+  "passed": true,
+  "complete_within_bounds": true,
+  "properties": [
+    "No unauthorized recipient",
+    "Exact artifact and destination approval",
+    "Missing lineage fails closed",
+    "Restricted inputs cannot widen readership"
+  ],
+  "counterexample": null,
+  "scope": "3 human readers plus the agent, 2 document source sets plus the recorded prompt, 2 audiences, 2 immutable versions per source set, one approval, complete/missing lineage, one terminal publication. Time is fixed; external providers, databases, threads, expiry and network behavior are outside this model."
+}

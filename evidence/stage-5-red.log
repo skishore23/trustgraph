@@ -1,0 +1,30 @@
+   Compiling trustgraph-core v0.1.0 (/Users/kishore/TrustGraph/crates/trustgraph-core)
+   Compiling trustgraph-runtime v0.1.0 (/Users/kishore/TrustGraph/crates/trustgraph-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.18s
+     Running tests/hydra_protocol.rs (target/debug/deps/hydra_protocol-3604b9bf76391c4f)
+
+running 2 tests
+test null_optional_row_is_not_an_identity_and_malformed_envelopes_fail ... FAILED
+test consuming_cursor_keeps_full_request_and_accepts_constant_handle ... FAILED
+
+failures:
+
+---- null_optional_row_is_not_an_identity_and_malformed_envelopes_fail stdout ----
+
+thread 'null_optional_row_is_not_an_identity_and_malformed_envelopes_fail' (59791828) panicked at crates/trustgraph-runtime/tests/hydra_protocol.rs:43:69:
+called `Result::unwrap()` on an `Err` value: Storage("transport not implemented")
+
+---- consuming_cursor_keeps_full_request_and_accepts_constant_handle stdout ----
+
+thread 'consuming_cursor_keeps_full_request_and_accepts_constant_handle' (59791827) panicked at crates/trustgraph-runtime/tests/hydra_protocol.rs:32:138:
+called `Result::unwrap()` on an `Err` value: Storage("transport not implemented")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    consuming_cursor_keeps_full_request_and_accepts_constant_handle
+    null_optional_row_is_not_an_identity_and_malformed_envelopes_fail
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p trustgraph-runtime --test hydra_protocol`

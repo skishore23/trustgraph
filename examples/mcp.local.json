@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "trustgraph": {
+      "command": "/Users/kishore/TrustGraph/target/debug/trustgraph",
+      "args": [
+        "mcp",
+        "--url", "http://127.0.0.1:8080/mcp",
+        "--token-file", "/Users/kishore/TrustGraph/.trustgraph-bank/mcp-token"
+      ]
+    }
+  }
+}
