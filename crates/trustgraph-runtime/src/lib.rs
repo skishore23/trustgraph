@@ -8,7 +8,7 @@ pub mod plans;
 pub mod policy;
 pub mod projection;
 pub mod publisher;
-pub mod showcase;
+pub mod story;
 pub mod submissions;
 pub use engine::Coordinator;
 pub use model::*;

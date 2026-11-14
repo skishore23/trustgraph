@@ -1,4 +1,0 @@
-   Compiling trustgraph-runtime v0.1.0 (/Users/kishore/TrustGraph/crates/trustgraph-runtime)
-   Compiling trustgraph-sim v0.1.0 (/Users/kishore/TrustGraph/crates/trustgraph-sim)
-   Compiling trustgraph-cli v0.1.0 (/Users/kishore/TrustGraph/crates/trustgraph-cli)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.82s

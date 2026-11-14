@@ -1,8 +1,0 @@
-node_modules/
-outputs/
-reference/
-assets/
-*.log
-audio/
-qc/*.png
-timeline.json

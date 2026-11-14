@@ -4,7 +4,6 @@ use std::{
     path::{Path, PathBuf},
 };
 use trustgraph_core::bundle::{self, Bundle};
-use trustgraph_runtime::{hydra::HydraClient, projection};
 use trustgraph_sim::{Scenario, Trace};
 
 #[derive(Parser)]
@@ -19,7 +18,12 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
-    /// Compare a proposed change against active and candidate policies without activating either.
+    /// Open the guided, deterministic company-governance demo. No sign-in or external effects.
+    Story {
+        #[arg(long, default_value_t = 9081)]
+        port: u16,
+    },
+    /// Test a change against the current and proposed policies without applying changes.
     PolicySimulate {
         #[arg(long)]
         case: PathBuf,
@@ -56,8 +60,6 @@ enum Command {
     },
     /// Compile a typed plan against the synthetic Northstar source snapshot.
     CompilePlan { file: Option<PathBuf> },
-    /// Validate a small bank policy and run five isolated authorization cases.
-    PolicyCheck { file: PathBuf },
     /// Explore all reachable states in the declared finite authorization model.
     CheckModel {
         #[arg(long, default_value_t = 6)]
@@ -66,13 +68,6 @@ enum Command {
         broken_rule: bool,
         #[arg(long)]
         output: Option<PathBuf>,
-    },
-    /// Run both policy failures and the successful controlled publication.
-    Demo {
-        #[arg(long)]
-        export: Option<PathBuf>,
-        #[arg(long)]
-        json: bool,
     },
     /// Test the shared runtime under reproducible virtual schedules and faults.
     Simulate {
@@ -87,41 +82,13 @@ enum Command {
     },
     /// Replay saved historical evidence or a saved simulation campaign.
     Replay { file: PathBuf },
-    /// Serve a synthetic review desk on loopback. No real publication occurs.
-    Serve {
-        #[arg(long)]
-        data: Option<PathBuf>,
-        #[arg(long, value_enum, default_value = "bank")]
-        scenario: AppScenario,
-        #[arg(long, default_value_t = 8080)]
-        port: u16,
-    },
     /// Serve MCP over stdio by connecting to the running local TrustGraph app.
     Mcp {
-        #[arg(long, default_value = "http://127.0.0.1:8080/mcp")]
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
         url: String,
-        #[arg(long, default_value = ".trustgraph-bank/mcp-token")]
+        #[arg(long, default_value = ".trustgraph-live/state/agent-token")]
         token_file: PathBuf,
     },
-    /// Write and validate an evidence graph in an explicitly owned Hydra ID range.
-    HydraRoundtrip {
-        #[arg(long)]
-        bundle: PathBuf,
-        #[arg(long, default_value = "http://127.0.0.1:8443")]
-        url: String,
-        #[arg(long, default_value = "default")]
-        graph: String,
-        #[arg(long, default_value = "cell-0")]
-        cell: String,
-        #[arg(long)]
-        base_id: u64,
-    },
-}
-#[derive(Clone, Copy, ValueEnum)]
-enum AppScenario {
-    Bank,
-    Consulting,
-    Northstar,
 }
 #[derive(Clone, Copy, ValueEnum)]
 enum Case {
@@ -155,6 +122,12 @@ fn save(path: &Path, value: &impl serde::Serialize) -> Result<(), Box<dyn Error>
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     match Cli::parse().command {
+        Command::Story { port } => {
+            let app = trustgraph_cli::story::router()?;
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+            println!("TrustGraph guided demo: http://127.0.0.1:{port}");
+            axum::serve(listener, app).await?;
+        }
         Command::PolicySimulate {
             case,
             policy,
@@ -164,16 +137,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             json,
             expect,
         } => {
-            let parsed = reqwest::Url::parse(&url)?;
-            if parsed.scheme() != "http"
-                || !matches!(parsed.host_str(), Some("127.0.0.1" | "localhost"))
-                || !parsed.username().is_empty()
-                || parsed.password().is_some()
-                || parsed.query().is_some()
-                || parsed.fragment().is_some()
-            {
-                return Err("agent API must be a local HTTP URL".into());
-            }
+            trustgraph_cli::mcp::local_endpoint(&url)?;
             let mut request: serde_json::Value = serde_json::from_slice(&std::fs::read(case)?)?;
             if !request.is_object() {
                 return Err("simulation case must be a JSON object".into());
@@ -181,20 +145,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             if let Some(policy) = policy {
                 request["policy"] = serde_json::from_slice(&std::fs::read(policy)?)?;
             }
-            let token_file = if token_file == Path::new(".trustgraph-live/state/agent-token") {
-                std::fs::read("trustgraph.local.json")
-                    .ok()
-                    .and_then(|bytes| {
-                        serde_json::from_slice::<trustgraph_live::Config>(&bytes).ok()
-                    })
-                    .map(|config| config.directory.join("agent-token"))
-                    .unwrap_or(token_file)
-            } else {
-                token_file
-            };
-            let token = std::fs::read_to_string(token_file)?;
+            let token =
+                trustgraph_cli::mcp::read_token(&trustgraph_cli::mcp::token_path(&token_file))?;
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(60))
+                .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?;
             let response = client
@@ -222,12 +177,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
                 println!(
-                    "Active policy: {} → {}\nCandidate policy: {} → {}",
-                    result["active_policy"]["name"].as_str().unwrap_or("active"),
+                    "Current policy: {} → {}\nProposed policy: {} → {}",
+                    result["active_policy"]["name"]
+                        .as_str()
+                        .unwrap_or("current"),
                     result["baseline"]["status"].as_str().unwrap_or("unknown"),
                     result["candidate_policy"]["name"]
                         .as_str()
-                        .unwrap_or("candidate"),
+                        .unwrap_or("proposed"),
                     result["status"].as_str().unwrap_or("unknown")
                 );
                 if let Some(reason) = result["counterexample"]["explanation"].as_str() {
@@ -250,30 +207,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             url,
             token_file,
         } => {
-            let parsed = reqwest::Url::parse(&url)?;
-            if parsed.scheme() != "http"
-                || !matches!(parsed.host_str(), Some("127.0.0.1" | "localhost"))
-                || !parsed.username().is_empty()
-                || parsed.password().is_some()
-                || parsed.query().is_some()
-                || parsed.fragment().is_some()
-            {
-                return Err("agent API must be a local HTTP URL".into());
-            }
-            let token_file = if token_file == Path::new(".trustgraph-live/state/agent-token") {
-                std::fs::read("trustgraph.local.json")
-                    .ok()
-                    .and_then(|bytes| {
-                        serde_json::from_slice::<trustgraph_live::Config>(&bytes).ok()
-                    })
-                    .map(|config| config.directory.join("agent-token"))
-                    .unwrap_or(token_file)
-            } else {
-                token_file
-            };
-            let token = std::fs::read_to_string(token_file)?;
+            trustgraph_cli::mcp::local_endpoint(&url)?;
+            let token =
+                trustgraph_cli::mcp::read_token(&trustgraph_cli::mcp::token_path(&token_file))?;
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
+                .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?;
             let response = client
@@ -359,25 +298,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             );
             axum::serve(listener, app).await?;
         }
-        Command::PolicyCheck { file } => {
-            let yaml = std::fs::read_to_string(file)?;
-            let mut w = trustgraph_runtime::Coordinator::open_with_evidence(
-                trustgraph_runtime::journal::MemoryJournal::default(),
-                trustgraph_runtime::publisher::LocalPublisher::default(),
-                trustgraph_runtime::fixtures::bank(),
-            )?;
-            let version = w.propose_policy(&"agent".into(), &yaml, 0)?;
-            let report = trustgraph_runtime::policy::test_policy(
-                &w.state().evidence,
-                &version.spec,
-                &w.state().source_authority,
-                &w.state().destination_authority,
-            )?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
-            if !report.passed {
-                return Err("policy did not satisfy the five bank cases".into());
-            }
-        }
         Command::CompilePlan { file } => {
             let plan = match file {
                 Some(file) => serde_json::from_slice(&std::fs::read(file)?)?,
@@ -414,30 +334,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             println!("{}", serde_json::to_string_pretty(&report)?);
             if !report.passed {
                 return Err("a counterexample was found within the declared model bounds".into());
-            }
-        }
-        Command::Demo { export, json } => {
-            let (trace, bundles) = trustgraph_sim::run_with_bundles(7, Scenario::Demo)?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&trace)?);
-            } else {
-                println!("TrustGraph — synthetic local demonstration");
-                for step in &trace.steps {
-                    println!(
-                        "t={:<4} {:<48} {}",
-                        step.at,
-                        format!("{:?}", step.action),
-                        serde_json::to_string(&step.outcome)?
-                    );
-                }
-                println!(
-                    "{} controlled publication; no external messages sent.",
-                    trace.publications
-                );
-            }
-            if let Some(path) = export {
-                save(&path, bundles.last().ok_or("no publication bundle")?)?;
-                println!("Evidence exported to {}", path.display());
             }
         }
         Command::Simulate {
@@ -499,63 +395,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         Command::Mcp { url, token_file } => {
             trustgraph_cli::mcp::stdio_bridge(&url, &token_file).await?;
-        }
-        Command::Serve {
-            data,
-            port,
-            scenario,
-        } => {
-            let data = data.unwrap_or_else(|| {
-                PathBuf::from(match scenario {
-                    AppScenario::Bank => ".trustgraph-bank",
-                    AppScenario::Consulting => ".trustgraph-consulting",
-                    AppScenario::Northstar => ".trustgraph",
-                })
-            });
-            let app = match scenario {
-                AppScenario::Bank => trustgraph_cli::api::bank_router(&data)?,
-                AppScenario::Consulting => trustgraph_cli::api::consulting_router(&data)?,
-                AppScenario::Northstar => trustgraph_cli::api::router(&data)?,
-            };
-            let listener =
-                tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
-            println!("TrustGraph review desk: http://{}", listener.local_addr()?);
-            println!(
-                "Synthetic identities and publishing only. Journal: {}",
-                data.display()
-            );
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async {
-                    let _ = tokio::signal::ctrl_c().await;
-                })
-                .await?;
-        }
-        Command::HydraRoundtrip {
-            bundle,
-            url,
-            graph,
-            cell,
-            base_id,
-        } => {
-            let bundle: Bundle = serde_json::from_slice(&std::fs::read(bundle)?)?;
-            let token = std::env::var("TRUSTGRAPH_HYDRA_TOKEN")
-                .map_err(|_| "set TRUSTGRAPH_HYDRA_TOKEN for your development server")?;
-            let expected = projection::build(&bundle, base_id)?;
-            let namespace =
-                std::env::var("TRUSTGRAPH_HYDRA_NAMESPACE").unwrap_or_else(|_| "default".into());
-            let mut hydra =
-                HydraClient::new(&url, &graph, &cell, &token)?.with_namespace(&namespace)?;
-            hydra.project(&expected).await?;
-            let loaded = hydra.load_bundle(&bundle.digest, base_id).await?;
-            if loaded != bundle {
-                return Err("Hydra readback reconstructed a different bundle".into());
-            }
-            println!(
-                "Hydra roundtrip passed: {} immutable records, {} typed references; completion marker {}.",
-                expected.nodes.len(),
-                expected.edges.len(),
-                expected.marker.id
-            );
         }
     }
     Ok(())

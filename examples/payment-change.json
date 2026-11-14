@@ -1,9 +1,9 @@
 {
-  "paths": [
-    "src/lib.rs",
-    "README.md"
-  ],
+  "paths": ["src/lib.rs"],
   "tests_passed": true,
   "lineage_complete": true,
-  "approval": "valid"
+  "approval": "valid",
+  "approval_age_minutes": 20,
+  "include_risk": false,
+  "audience": "engineering"
 }

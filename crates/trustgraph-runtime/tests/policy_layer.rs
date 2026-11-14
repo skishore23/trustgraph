@@ -1,5 +1,5 @@
 use trustgraph_runtime::{journal::MemoryJournal, policy::*, publisher::LocalPublisher, *};
-const YAML: &str = include_str!("../../../examples/bank-policy.yaml");
+const YAML: &str = include_str!("fixtures/bank-policy.yaml");
 
 #[test]
 fn policy_versions_are_explicit_atomic_and_cannot_expand_source_authority() {

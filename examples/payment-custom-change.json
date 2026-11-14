@@ -1,9 +1,0 @@
-{
-  "paths": [
-    "payments/reconcile.rs",
-    "tests/reconcile.rs"
-  ],
-  "tests_passed": true,
-  "lineage_complete": true,
-  "approval": "valid"
-}
