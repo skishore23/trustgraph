@@ -1,5 +1,8 @@
 # TrustGraph
 
+[**Try the public demo →**](https://trustgraph-demo.vercel.app)
+No sign-in required. Fictional data and simulated releases, using the Rust policy engine.
+
 TrustGraph controls how AI-generated work is shared. It records the inputs an
 agent uses, carries their access restrictions into the result, and requires
 human approval for the exact version and destination being published.
@@ -24,6 +27,8 @@ releases locally. See the [demo walkthrough](docs/demo.md).
 
 The same fictional story can be hosted on Vercel with the Rust policy engine.
 See [public demo deployment](docs/vercel.md) for setup and visitor-state behavior.
+Agents can also connect to the [public demo MCP endpoint](https://trustgraph-demo.vercel.app/mcp)
+for fictional workspace inspection and policy simulation, with no API key required.
 
 ## Architecture
 

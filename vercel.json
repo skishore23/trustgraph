@@ -4,8 +4,10 @@
   "buildCommand": "node scripts/build_demo.cjs",
   "outputDirectory": "public",
   "functions": {
-    "api/demo.rs": { "maxDuration": 15 }
+    "api/demo.rs": { "maxDuration": 15 },
+    "api/mcp.rs": { "maxDuration": 15 }
   },
+  "rewrites": [{ "source": "/mcp", "destination": "/api/mcp" }],
   "headers": [
     {
       "source": "/(.*)",

@@ -1,6 +1,8 @@
 //! Public, stateless demo. Every request replays a bounded fictional story through
 //! the real Rust engine. Client history is demo input, never authorization for a
 //! live publisher. No credentials, durable state, or external writes are used.
+pub mod mcp;
+
 use axum::{
     Json, Router,
     extract::DefaultBodyLimit,

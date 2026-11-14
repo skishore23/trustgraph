@@ -15,6 +15,10 @@ path = "hosted/lib.rs"
 name = "demo"
 path = "api/demo.rs"
 
+[[bin]]
+name = "mcp"
+path = "api/mcp.rs"
+
 [dependencies]
 axum.workspace = true
 serde.workspace = true
@@ -23,6 +27,7 @@ tokio.workspace = true
 tower = { version = "0.5", features = ["util"] }
 trustgraph-runtime = { path = "crates/trustgraph-runtime" }
 vercel_runtime = { version = "2.4", features = ["axum"] }
+rmcp = { version = "=3.10.0", default-features = false, features = ["server", "transport-streamable-http-server"] }
 
 [workspace]
 members = ["crates/*"]
