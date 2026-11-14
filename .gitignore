@@ -1,12 +1,20 @@
+# Build output and local runtime state
 /target/
-/.trustgraph/
-/.trustgraph-consulting/
-/.env
-*.tmp
+/.trustgraph*/
+/trustgraph.local.json
+/trustgraph-actions*.local.json
 
-/.trustgraph-bank/
+# Credentials
+/.env
 /.env.*
 
+# Generated files and editor leftovers
+node_modules/
+__pycache__/
+*.pyc
+*.log
+*.tmp
+*.swp
+*.swo
+*~
 .DS_Store
-/.trustgraph-live/
-/trustgraph.local.json

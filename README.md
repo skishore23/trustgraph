@@ -1,118 +1,103 @@
 # TrustGraph
 
-One coding agent can help two departments without making everything it learns
-available to both. TrustGraph is a Rust policy and publication gateway that
-captures generation inputs, follows their permissions, binds human approval to
-an exact change and gates a real GitHub draft pull request.
+TrustGraph controls how AI-generated work is shared. It records the inputs an
+agent uses, carries their access restrictions into the result, and requires
+human approval for the exact version and destination being published.
 
-## The working case
+For example, a dashboard built from private HR salary data inherits that data's
+access restrictions. Sharing a version with Engineering requires a fresh run
+using separately shared planning data, followed by review of the exact output.
+Passing tests or approving restricted work cannot grant source access.
 
-A bank is modernizing payment reconciliation. Engineering owns implementation
-requirements. Fraud & Risk owns a confidential investigation. The same coding
-agent may help both, but Engineering cannot read the investigation.
+## Try the guided demo
 
-1. Generate a patch using both sources. Actual tests may pass, but publication
-   to Engineering is blocked by the Risk-only dependency.
-2. Start a fresh generation from Engineering requirements and an approved Risk
-   specification. The restricted patch is not reused.
-3. Approve the exact new patch. Revise its actual bytes and rerun tests: the old
-   approval no longer matches.
-4. Approve again. The gate reads connected evidence from HydraDB, rechecks Rust
-   authorization and creates a real branch and draft PR in the private workbench.
-
-The bank documents are controlled test material; Codex, HydraDB, executed Rust
-checks and the GitHub publisher are live. The configured department audiences
-are an explicit model, not an import of enterprise IAM. The local operator is a
-Risk-authorized reviewer/source owner. Composio is not configured; the qualified
-publisher currently uses authenticated GitHub API calls through `gh`.
-
-## Run
-
-Requirements: Rust, signed-in `hydradb`, `codex` and `gh` CLIs, and macOS
-`sandbox-exec` for the isolated Rust checks. Configure `trustgraph.local.json`
-using [the setup guide](docs/live-workspace.md), then:
+Requires Rust 1.90 or newer. Run commands from the repository root:
 
 ```sh
-cargo run --locked -p trustgraph-cli -- start
+cargo run --locked -p trustgraph-cli -- story
 ```
 
-Open the private `operator.html` launch file printed at startup once to sign in.
-The app is at [localhost:8080](http://127.0.0.1:8080/), with **Workspace**,
-**Policy** and **Simulator**. Appearance is fixed ASCII; no theme or demo route
-is needed. Old theme/demo URLs normalize to the app root.
-
-Try the same controlled agent intake from Codex or a terminal:
-
-```sh
-cargo run --locked -p trustgraph-cli -- run --include-risk \
-  --goal "$(cat examples/bankcase/work-order.txt)"
-```
-
-A blocked exit is expected with Risk context. Use **Generate from approved
-inputs** in the app for a new isolated run. The agent credential cannot activate
-policies, approve, publish, or introduce an unadmitted work order as public input.
-An operator can admit a new task by submitting it in Workspace.
-
-## Policy experiments
-
-Policies are the rules and parameters. The Simulator tests them across cases;
-it does not publish code. Edit source readers, approval lifetime, required tests
-or file scope. Compare a candidate with the active policy, or **Run all scenarios**.
-
-```sh
-python3 scripts/bank-policy-rehearsal.py
-cargo run --locked -p trustgraph-cli -- policy-simulate \
-  --case examples/bankcase/risk-to-engineering.json \
-  --policy examples/bankcase/policy-source-grant.json --expect allowed
-```
-
-The 16-case rehearsal covers department sharing, changed patch/audience/policy,
-missing and expired approval, unknown lineage, failed tests, source grants,
-shorter lifetimes and custom file scopes. It records evidence in HydraDB without
-changing active policy, saved jobs or GitHub. Supported structured policy fields
-are explicit; arbitrary English rules are rejected. Source inheritance, complete
-lineage and exact approval binding are system guarantees.
+Open [localhost:9081](http://127.0.0.1:9081/) and follow **Company → Policy →
+Simulator → Enforce → Revision**. The demo uses fictional data, a fixed clock
+and in-memory state. It needs no sign-in or external services and records
+releases locally. See the [demo walkthrough](docs/demo.md).
 
 ## Architecture
 
-```text
-CODING AGENT -- HTTP / CLI --> PLAN + INPUT MANIFEST
-                                      |
-                         RUST POLICY / LINEAGE / APPROVAL
-                              |                 |
-                          SIMULATOR           RUNTIME
-                        counterexample          |
-                                         PUBLICATION GATE
-                                                |
-                                         BRANCH + DRAFT PR
+TrustGraph combines three responsibilities:
 
-HYDRADB: sources -> permissions -> captured generation -> patch -> approval -> outcome
-```
+1. **Capture inputs.** The live gateway starts a fresh Codex run and records its
+   supplied sources, instructions, output and actual Rust test results.
+2. **Check access and approval.** Rust follows the recorded dependencies,
+   intersects source reader sets and verifies human approval of the exact output,
+   destination and policy context.
+3. **Control publication.** The coordinator rechecks evidence, journals the
+   attempt and sends the checked files through the GitHub publisher.
 
-HydraDB is a required evidence store and readback dependency. Rust evaluates
-permissions and exact bindings; a durable runtime journal tracks publication
-attempts. GitHub credentials remain in the gateway, outside the generated code's
-execution sandbox. This controls the brokered workflow; it cannot constrain an
-external agent that independently holds GitHub credentials or unseen context.
+HydraDB stores connected evidence. A durable local journal tracks runtime state
+and publication outcomes. Read the [architecture guide](docs/architecture.md)
+for Mermaid component, sequence, evidence-flow and recovery diagrams.
 
-[Five-minute walkthrough](docs/hackathon-walkthrough.md) ·
-[Live setup and limits](docs/live-workspace.md) ·
-[Film and production sources](media/trustgraph-film/README.md)
+## Run the live integration
 
-Earlier offline fixtures remain available through `serve`, the bounded state
-checker through `check-model`, and the fixture MCP bridge through `mcp`. These
-are separate development paths. The live coding-agent integration currently
-uses HTTP/CLI; a live MCP transport and Composio adapter remain future work.
+For a native 8090 agent proposing a GitHub issue through human approval and
+Composio, see the [issue-action demo](docs/8090-issue-actions.md). It has a preview
+mode and does not use a patch generator.
+For a short presentation with publication grant/revoke controls, follow the
+[live issue demo runbook](docs/one-hour-issue-demo.md).
 
-## Verification
+The live gateway uses authenticated Codex, HydraDB and GitHub integrations,
+macOS for isolated Rust checks, and a dedicated private personal repository.
+Follow [live setup](docs/development.md#start-the-live-workspace) to configure
+[trustgraph.example.json](trustgraph.example.json), then run:
 
 ```sh
-cargo test --workspace --locked
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo fmt --all --check
+cargo build --locked -p trustgraph-cli
+./target/debug/trustgraph start
 ```
 
-The local suite passes 85 tests, with one standalone-Hydra contract test requiring
-an explicitly configured external fixture. The separate live rehearsal qualifies
-the hosted Hydra path. [Current qualification](docs/live-qualification.md) records
-the real agent, stale-approval check and actual draft PR.
+Open the private operator launch file printed at startup. The operator reviews
+and approves the exact change before creating a **draft pull request**.
+See [agent integration](docs/agent-integration.md) for MCP and HTTP clients, and
+[scope](docs/architecture.md#scope) for the current execution boundary.
+
+## Repository layout
+
+| Path | Purpose |
+| --- | --- |
+| `crates/trustgraph-core` | Deterministic verification, lineage and approval binding |
+| `crates/trustgraph-runtime` | Policy compilation, coordination, journals and recovery |
+| `crates/trustgraph-live` | Codex execution, hosted Hydra evidence, HTTP API and GitHub publication |
+| `crates/trustgraph-cli` | Commands, restricted MCP adapter and guided demo server |
+| `crates/trustgraph-sim` | Bounded model checks and reproducible simulation campaigns |
+| `web` | Embedded guided-demo and live-workspace assets |
+| `examples` | Policy examples, simulation inputs and fictional bank source material |
+| `docs` | Architecture, setup and usage guides |
+| `media` | Current explainers and captions |
+
+## Development
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+```
+
+See [development checks](docs/development.md#local-checks) for model exploration
+and campaign replay. Local configuration, runtime state, credentials and build
+output are ignored by Git.
+
+## Documentation
+
+| Guide | What it explains |
+| --- | --- |
+| [Architecture](docs/architecture.md) | Components, captured evidence, inherited access, approval and recovery |
+| [Policies and simulation](docs/policy.md) | Company YAML, live JSON and hypothetical policy comparisons |
+| [Agent integration](docs/agent-integration.md) | Restricted MCP tools, HTTP requests and operator authority |
+| [Demo walkthrough](docs/demo.md) | The complete fictional dashboard scenario |
+| [Development and live setup](docs/development.md) | Configuration, checks and the real bank workbench |
+
+Watch the [technical explainer](media/trustgraph-technical-explainer.mp4)
+([captions](media/trustgraph-technical-explainer.srt)) or the
+[story explainer](media/trustgraph-explainer.mp4)
+([captions](media/trustgraph-explainer.srt)).

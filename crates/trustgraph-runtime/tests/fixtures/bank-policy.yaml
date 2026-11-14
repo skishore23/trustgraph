@@ -1,0 +1,29 @@
+schema_version: 1
+id: bank-baseline-v1
+name: Atlas team boundary
+groups:
+  engineering: [maya, sam, agent]
+  risk: [arun, agent]
+sources:
+  engineering-requirements:
+    readers: [engineering, risk]
+  approved-specification:
+    readers: [engineering, risk]
+  risk-investigation:
+    readers: [risk]
+  task-prompt:
+    readers: [engineering, risk]
+destinations:
+  engineering-repo:
+    audience: [engineering]
+    requires_approval: true
+  risk-room:
+    audience: [risk]
+    requires_approval: true
+review:
+  approvers: [maya, arun]
+  max_age_seconds: 1800
+rules:
+  - derived_artifact_inherits_input_restrictions
+  - approval_binds_exact_patch_and_destination
+  - missing_lineage_blocks

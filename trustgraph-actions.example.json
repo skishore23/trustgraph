@@ -1,0 +1,11 @@
+{
+  "directory": ".trustgraph-live/issue-actions-preview",
+  "github_repository": "your-account/demo-repository",
+  "mode": "preview",
+  "connected_account_id": null,
+  "user_id": null,
+  "tool_version": null,
+  "composio_transport": "project_api",
+  "tool_schema_hash": null,
+  "agent_public_url": null
+}

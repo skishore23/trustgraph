@@ -1,0 +1,12 @@
+{
+  "directory": "/absolute/TrustGraph/.trustgraph-live/bank",
+  "context_repository": "/absolute/TrustGraph",
+  "context_files": [
+    "examples/bankcase/engineering-requirements.md",
+    "examples/bankcase/risk-investigation.md",
+    "examples/bankcase/approved-specification.md"
+  ],
+  "target_repository": "/absolute/private-workbench",
+  "github_repository": "your-account/private-workbench",
+  "departments": true
+}

@@ -1,0 +1,180 @@
+1
+00:00:00,551 --> 00:00:02,985
+Engineering needs a headcount dashboard.
+
+2
+00:00:02,985 --> 00:00:08,825
+A coding agent uses the company directory, department
+budgets, and HR salaries.
+
+3
+00:00:08,825 --> 00:00:11,258
+It can read them all.
+
+4
+00:00:11,258 --> 00:00:12,718
+But Engineering cannot.
+
+5
+00:00:14,059 --> 00:00:19,546
+Private information can travel through a summary, a chart,
+or a code change.
+
+6
+00:00:19,546 --> 00:00:25,033
+The original file may stay private while its output
+crosses into another department.
+
+7
+00:00:25,033 --> 00:00:28,409
+Passing tests does not fix that access problem.
+
+8
+00:00:29,695 --> 00:00:31,727
+TrustGraph checks work before publishing.
+
+9
+00:00:31,727 --> 00:00:36,603
+It follows where information came from, checks who can
+access the result,
+
+10
+00:00:36,603 --> 00:00:41,073
+and requires a human to approve the exact version being
+published.
+
+11
+00:00:42,432 --> 00:00:46,911
+Connect your coding agent through MCP or the local API.
+
+12
+00:00:46,911 --> 00:00:50,047
+It submits a task the operator allows.
+
+13
+00:00:50,047 --> 00:00:56,317
+TrustGraph starts a fresh Codex run and records the
+supplied data, instructions, and output.
+
+14
+00:00:57,824 --> 00:01:05,407
+The company writes its rules in YAML: salaries are HR
+only; shared planning data allows Engineering.
+
+15
+00:01:05,407 --> 00:01:07,777
+Rust follows every recorded input.
+
+16
+00:01:07,777 --> 00:01:13,938
+The output is accessible only to people allowed to access
+every contributing source.
+
+17
+00:01:15,389 --> 00:01:17,570
+This dashboard used salary data.
+
+18
+00:01:17,570 --> 00:01:21,060
+Engineering cannot access it, so publishing is blocked.
+
+19
+00:01:21,060 --> 00:01:27,603
+TrustGraph shows why: this salary file went into this
+agent run, which produced this dashboard.
+
+20
+00:01:28,926 --> 00:01:33,794
+Start a fresh run using the directory and separately
+shared planning data.
+
+21
+00:01:33,794 --> 00:01:36,228
+Exclude salaries and the restricted draft.
+
+22
+00:01:36,228 --> 00:01:39,473
+The new dashboard has a new source history.
+
+23
+00:01:39,473 --> 00:01:42,718
+Rewording the old draft would keep its restrictions.
+
+24
+00:01:44,096 --> 00:01:47,251
+Test proposed policy changes before applying them.
+
+25
+00:01:47,251 --> 00:01:53,111
+A twenty-minute-old approval passes a thirty-minute limit,
+but expires under a fifteen-minute limit.
+
+26
+00:01:53,111 --> 00:01:58,069
+Repeat with the same data, rules and time: the same
+decision.
+
+27
+00:01:58,069 --> 00:01:59,421
+Nothing is published.
+
+28
+00:02:00,835 --> 00:02:04,237
+Access is allowed, but approval is still required.
+
+29
+00:02:04,237 --> 00:02:06,363
+A human inspects the output.
+
+30
+00:02:06,363 --> 00:02:11,466
+Approval covers that exact version, the department with
+access, and the policy.
+
+31
+00:02:11,466 --> 00:02:14,442
+The agent cannot approve its own work.
+
+32
+00:02:15,875 --> 00:02:18,753
+Edit the dashboard and its fingerprint changes.
+
+33
+00:02:18,753 --> 00:02:21,220
+The old approval no longer fits.
+
+34
+00:02:21,220 --> 00:02:24,509
+Publishing pauses until the new version is reviewed.
+
+35
+00:02:24,509 --> 00:02:29,854
+An earlier release stays in history; it does not authorize
+the edited version.
+
+36
+00:02:31,305 --> 00:02:34,741
+HydraDB stores the evidence; Rust checks the rules.
+
+37
+00:02:34,741 --> 00:02:41,614
+The publishing gate checks again and records the attempt
+before creating a GitHub draft pull request.
+
+38
+00:02:41,614 --> 00:02:45,051
+An uncertain result is checked before any retry.
+
+39
+00:02:46,428 --> 00:02:49,100
+Workforce dashboards, pricing tools, incident fixes.
+
+40
+00:02:49,100 --> 00:02:53,551
+Agents can help across departments while permissions
+follow the information.
+
+41
+00:02:53,551 --> 00:02:59,339
+TrustGraph explains the path from the data used to the
+exact work approved.

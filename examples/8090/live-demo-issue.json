@@ -1,0 +1,9 @@
+{
+  "key": "wo-2-live-demo-20261114",
+  "title": "Demo: Review a fictional bank payment-reconciliation issue through TrustGraph",
+  "body": "## Task\nDemonstrate TrustGraph's exact-action approval workflow using a fictional bank payment-reconciliation GitHub issue proposal for TrustGraph Demo, WO-2.\n\nProject: 6b23e5ca-1d03-46a7-93dd-6a3608432db7\nWork order: WO-2\n\n## Acceptance criteria\n- The human operator manually submits this proposal to TrustGraph for permission checks and review.\n- Before execution, the human approves the exact title, body, repository, connected account and configured tool binding.\n- Any content change requires fresh approval.\n- Preview receipts are identified as simulated; only a live provider receipt confirms issue creation.\n- No code changes, patch generation, pull requests, merges or direct agent GitHub writes are performed.\n\nThis draft is not approval or permission to publish and has not been submitted or published.",
+  "work_order": {
+    "project_id": "6b23e5ca-1d03-46a7-93dd-6a3608432db7",
+    "id": "WO-2"
+  }
+}

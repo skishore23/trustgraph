@@ -1,8 +1,0 @@
-{
-  "name": "Explicit source-owner grant to Engineering",
-  "allowed_paths": ["src/lib.rs"],
-  "max_changed_files": 1,
-  "require_tests": true,
-  "approval_minutes": 30,
-  "departments": {"investigation_readers": ["risk", "engineering"]}
-}
