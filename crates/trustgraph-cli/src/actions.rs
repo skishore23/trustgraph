@@ -1,5 +1,6 @@
 //! Exact-action approval for native 8090 proposals. No generation or inferred source lineage.
 mod connect;
+mod walkthrough;
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path as RoutePath, State},
@@ -589,6 +590,25 @@ fn view(app: &App, key: &str) -> Result<Value> {
         .approvals
         .values()
         .any(|approval| approval.context.artifact == *request.artifact());
+    let review_history: Vec<_> = app
+        .gate
+        .state()
+        .evidence
+        .approvals
+        .values()
+        .filter(|approval| {
+            request
+                .revisions
+                .iter()
+                .any(|r| r.artifact == approval.context.artifact)
+        })
+        .map(|approval| {
+            json!({"artifact":approval.context.artifact,"context_digest":approval.context.digest(),
+            "issued_at":approval.issued_at,"expires_at":approval.expires_at,
+            "current":Some(approval.context.digest()) == context,
+            "revoked":app.gate.state().evidence.revoked.contains(&approval.id)})
+        })
+        .collect();
     let status = if operation.is_some() {
         "RELEASE_RECORDED"
     } else if !permission {
@@ -604,6 +624,7 @@ fn view(app: &App, key: &str) -> Result<Value> {
         json!({"id":key,"revision":request.revision(),"action":action,"context_digest":context,"decision":decision,
         "operation":operation,"approved":approved,"can_execute":permission && approved && operation.is_none(),
         "publication_allowed":permission,"status":status,"mode":app.config.mode,
+        "review_history":review_history,"walkthrough":request.summary.strip_prefix("walkthrough:"),
         "evidence_scope":"Exact submitted action only. Native-agent context and source lineage are not captured."}),
     )
 }
@@ -765,7 +786,7 @@ fn list_value(app: &App) -> Result<Value> {
         .collect::<Result<Vec<_>>>()?;
     Ok(
         json!({"mode":app.config.mode,"repository":app.config.github_repository,"tool":TOOL,
-            "publication_permission":permission_value(app)?,"items":items}),
+            "publication_permission":permission_value(app)?,"items":items,"story":walkthrough::metadata(app)}),
     )
 }
 async fn owner_list(State(shared): State<Shared>, headers: HeaderMap) -> WebResult {
@@ -976,6 +997,9 @@ fn routers(shared: Shared) -> (Router, Router) {
         .route("/api/session",post(session)).route("/api/actions",get(owner_list))
         .route("/api/publication-permission",post(change_permission))
         .route("/api/proposals/import",post(import_proposal))
+        .route("/api/walkthrough/start",post(walkthrough::start))
+        .route("/api/actions/{id}/evaluate",post(walkthrough::evaluate))
+        .route("/api/actions/{id}/edit",post(walkthrough::edit))
         .route("/api/actions/{id}/approve",post(approve)).route("/api/actions/{id}/execute",post(execute))
         .layer(DefaultBodyLimit::max(65_536)).with_state(shared.clone());
     let agent = Router::new()
@@ -1574,6 +1598,242 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guided_scenarios_use_real_gate_and_human_edits_need_new_approval() {
+        for scenario in ["permission", "revocation", "revision"] {
+            let directory = tempfile::tempdir().unwrap();
+            let (url, calls, server) = provider(true).await;
+            let shared = configured(directory.path(), &url);
+            let (owner, agent) = routers(shared.clone());
+            let start = json!({"scenario":scenario,"key":"ad6d3b23-0661-48ec-a1ab-5bdb20700da6"});
+            assert_eq!(
+                request(
+                    &agent,
+                    AGENT,
+                    "POST",
+                    "/api/walkthrough/start",
+                    start.clone()
+                )
+                .await
+                .0,
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(
+                request(
+                    &owner,
+                    AGENT,
+                    "POST",
+                    "/api/walkthrough/start",
+                    start.clone()
+                )
+                .await
+                .0,
+                StatusCode::UNAUTHORIZED
+            );
+            let first = request(
+                &owner,
+                OWNER,
+                "POST",
+                "/api/walkthrough/start",
+                start.clone(),
+            )
+            .await;
+            assert_eq!(first.0, StatusCode::OK);
+            let mut item = first.1;
+            assert_eq!(item["walkthrough"], scenario);
+            assert_eq!(item["publication_allowed"], false);
+            let base = format!("/api/actions/{}", item["id"].as_str().unwrap());
+            let blocked = request(
+                &owner,
+                OWNER,
+                "POST",
+                &format!("{base}/evaluate"),
+                binding(&item),
+            )
+            .await
+            .1;
+            assert_eq!(blocked["allowed"], false);
+            assert_eq!(blocked["provider_called"], false);
+            let change =
+                |granted: bool, revision: u64| json!({"granted":granted,"revision":revision});
+            let list = request(&owner, OWNER, "GET", "/api/actions", Value::Null)
+                .await
+                .1;
+            let policy_revision = list["publication_permission"]["revision"].as_u64().unwrap();
+            let list = request(
+                &owner,
+                OWNER,
+                "POST",
+                "/api/publication-permission",
+                change(true, policy_revision),
+            )
+            .await
+            .1;
+            item = list["items"][0].clone();
+            let repeated = request(
+                &owner,
+                OWNER,
+                "POST",
+                "/api/walkthrough/start",
+                start.clone(),
+            )
+            .await
+            .1;
+            assert_eq!(
+                repeated["publication_allowed"], true,
+                "idempotent start must not revoke a running walkthrough"
+            );
+            let check = request(
+                &owner,
+                OWNER,
+                "POST",
+                &format!("{base}/evaluate"),
+                binding(&item),
+            )
+            .await
+            .1;
+            assert_eq!(check["reason"], "review_required");
+            item = request(
+                &owner,
+                OWNER,
+                "POST",
+                &format!("{base}/approve"),
+                binding(&item),
+            )
+            .await
+            .1;
+            assert_eq!(item["approved"], true);
+            let approved_v1 = item.clone();
+            if scenario == "revocation" {
+                let revoked = request(
+                    &owner,
+                    OWNER,
+                    "POST",
+                    "/api/publication-permission",
+                    change(false, policy_revision + 1),
+                )
+                .await
+                .1;
+                item = revoked["items"][0].clone();
+                let check = request(
+                    &owner,
+                    OWNER,
+                    "POST",
+                    &format!("{base}/evaluate"),
+                    binding(&item),
+                )
+                .await
+                .1;
+                assert_eq!(check["reason"], "permission_revoked");
+                let restored = request(
+                    &owner,
+                    OWNER,
+                    "POST",
+                    "/api/publication-permission",
+                    change(true, policy_revision + 2),
+                )
+                .await
+                .1;
+                item = restored["items"][0].clone();
+                assert_eq!(item["approved"], false);
+            } else if scenario == "revision" {
+                assert_eq!(
+                    request(&agent, AGENT, "POST", &format!("{base}/edit"), json!({}))
+                        .await
+                        .0,
+                    StatusCode::NOT_FOUND
+                );
+                let edited = request(&owner,OWNER,"POST",&format!("{base}/edit"),json!({
+                    "revision":item["revision"],"title":"Revised issue title","body":"A changed requirement, reviewed separately."
+                })).await;
+                assert_eq!(edited.0, StatusCode::OK, "{edited:?}");
+                item = edited.1;
+                assert_eq!(item["revision"], 2);
+                assert_eq!(item["approved"], false);
+                assert!(!item["review_history"].as_array().unwrap().is_empty());
+                assert_ne!(item["context_digest"], approved_v1["context_digest"]);
+                let artifact = shared.lock().unwrap().gate.state().requests
+                    [item["id"].as_str().unwrap()]
+                .artifact()
+                .clone();
+                assert!(matches!(
+                    shared.lock().unwrap().gate.state().evidence.artifacts[&artifact].origin,
+                    Origin::Transformation(_)
+                ));
+            }
+            if scenario != "permission" {
+                assert_eq!(
+                    request(
+                        &owner,
+                        OWNER,
+                        "POST",
+                        &format!("{base}/execute"),
+                        binding(&approved_v1)
+                    )
+                    .await
+                    .0,
+                    StatusCode::CONFLICT
+                );
+                let check = request(
+                    &owner,
+                    OWNER,
+                    "POST",
+                    &format!("{base}/evaluate"),
+                    binding(&item),
+                )
+                .await
+                .1;
+                assert_eq!(check["allowed"], false);
+                assert_eq!(check["reason"], "review_required");
+                item = request(
+                    &owner,
+                    OWNER,
+                    "POST",
+                    &format!("{base}/approve"),
+                    binding(&item),
+                )
+                .await
+                .1;
+            }
+            assert!(calls.lock().unwrap().is_empty());
+            let check = request(
+                &owner,
+                OWNER,
+                "POST",
+                &format!("{base}/evaluate"),
+                binding(&item),
+            )
+            .await
+            .1;
+            assert_eq!(check["allowed"], true);
+            assert_eq!(check["provider_called"], false);
+            let published = request(
+                &owner,
+                OWNER,
+                "POST",
+                &format!("{base}/execute"),
+                binding(&item),
+            )
+            .await
+            .1;
+            assert_eq!(published["operation"]["state"], "PUBLISHED");
+            assert_eq!(calls.lock().unwrap().len(), 1);
+            assert_eq!(
+                calls.lock().unwrap()[0]["arguments"]["title"],
+                item["action"]["proposal"]["title"]
+            );
+            let repeated = request(&owner, OWNER, "POST", "/api/walkthrough/start", start)
+                .await
+                .1;
+            assert_eq!(repeated["operation"], published["operation"]);
+            assert_eq!(request(&owner,OWNER,"POST",&format!("{base}/edit"),json!({"revision":item["revision"],"title":"Do not edit a published request","body":"Changed"})).await.0,StatusCode::CONFLICT);
+            drop(owner);
+            drop(agent);
+            drop(shared);
+            server.abort();
         }
     }
 
