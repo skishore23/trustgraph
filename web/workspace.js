@@ -1,160 +1,509 @@
-const app = document.querySelector('#app');
-let state, graphState, timer, lastGraphCheck = 0;
-let selected = location.hash.split('/')[2];
-let goal = 'Fix valid_amount so zero-value payment authorizations are accepted while negative values remain invalid. Add a regression test for zero and preserve the existing tests. Only change src/lib.rs.';
-let simulationPolicy, simResult, simDraft, mapOpen = false, inspectingPlan = false;
-const names = { queued: 'Queued', running: 'Agent working', awaiting_review: 'Ready for review', approved: 'Approved', published: 'PR opened', blocked: 'Stopped', interrupted: 'Interrupted', outcome_unknown: 'Publication unconfirmed', publication_stopped: 'Publication stopped', gate_passed: 'Gate passed · action simulated' };
-const e = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const clone = value => JSON.parse(JSON.stringify(value));
-const page = () => location.hash.split('/')[1] || 'policy';
-const badge = (label, kind = '') => `<span class="badge ${kind}">${e(label)}</span>`;
-const heading = (title, description) => `<div class="heading"><h1>${e(title)}</h1><p>${e(description)}</p></div>`;
+const app = document.querySelector("#app");
+const e = (s) =>
+  String(s ?? "").replace(
+    /[&<>"']/g,
+    (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[
+        c
+      ],
+  );
+const clone = (x) => JSON.parse(JSON.stringify(x));
+let state,
+  graph,
+  timer,
+  candidate,
+  result,
+  suite,
+  mapOpen = false;
+let goal =
+  "Implement the approved payment reconciliation behavior in src/lib.rs. Accept zero-value authorizations, reject negative amounts, preserve positive values and existing tests, and add a zero regression test. Use the supplied bank documents; do not reproduce confidential prose. Only change src/lib.rs.";
+let draft = {
+  paths: ["src/lib.rs"],
+  tests_passed: true,
+  lineage_complete: true,
+  approval: "valid",
+  approval_age_minutes: 0,
+  include_risk: true,
+  audience: "engineering",
+};
+const names = {
+  queued: "Queued",
+  running: "Agent working",
+  awaiting_review: "Needs approval",
+  approved: "Approved",
+  published: "Draft PR opened",
+  blocked: "Blocked",
+  interrupted: "Interrupted",
+  revising: "Rechecking revised patch",
+  revision_failed: "Revision failed",
+  outcome_unknown: "Publication unconfirmed",
+  publication_stopped: "Publication stopped",
+};
+const route = () => location.pathname.split("/").filter(Boolean);
+const selected = () => (route()[0] === "agent" ? route()[1] : undefined);
+const page = () =>
+  ["policy", "simulator"].includes(route()[0]) ? route()[0] : "workspace";
+const badge = (text, kind = "") =>
+  `<span class="badge ${kind}">${e(text)}</span>`;
+const heading = (title, description) =>
+  `<div class="heading"><span class="eyebrow">TRUSTGRAPH / ${page().toUpperCase()}</span><h1>${e(title)}</h1><p>${e(description)}</p></div>`;
 async function api(path, body) {
-  const response = await fetch(`/api${path}`, { method: body ? 'POST' : 'GET', headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
+  const r = await fetch("/api" + path, {
+    method: body === undefined ? "GET" : "POST",
+    headers: body === undefined ? {} : { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const data = await r.json();
+  if (!r.ok) throw Error(data.error || `Request failed (${r.status})`);
   return data;
 }
 function notify(text) {
-  const notice = document.querySelector('#notice');
-  notice.textContent = text; notice.hidden = false;
-  setTimeout(() => notice.hidden = true, 7000);
+  const n = document.querySelector("#notice");
+  n.textContent = text;
+  n.hidden = false;
+  setTimeout(() => (n.hidden = true), 8000);
 }
-function story() {
-  return `<section class="story-strip" aria-label="Walkthrough"><strong>Payment authorization release</strong><p>A zero-value authorization is being rejected. Fix the bug without releasing an unreviewed change.</p><ol>${[['policy', 'Set the boundary'], ['simulator', 'Challenge the policy'], ['agent', 'Run and review Codex']].map(([route, label], i) => `<li><a href="#/${route}" ${page() === route ? 'aria-current="step"' : ''}><span>${i + 1}</span>${label}</a></li>`).join('')}</ol></section>`;
+function go(path) {
+  history.pushState({}, "", path);
+  load();
+}
+function sources(job) {
+  const inputs = job?.plan?.input_manifest;
+  const all = inputs
+    ? inputs.map((i) => state.sources.find((s) => s.id === i.id) || i)
+    : state.sources;
+  return `<details class="evidence sources"><summary>${all.length} captured inputs / HydraDB source records</summary>${all.map((s) => `<p>${e((s.path || s.name || s.id).split("@")[0])}${s.restricted ? " [RISK ONLY]" : ""}<small>SHA-256 ${e((s.hash || s.content_hash || "").slice(0, 20))}</small></p>`).join("")}<p class="muted">Generation uses exact bytes read back from HydraDB. The manifest records inputs actually supplied to this model turn.</p></details>`;
 }
 function architecture() {
-  const count = graphState?.records?.reduce((n, r) => n + Number(r.records || 0), 0) || 0;
-  const latest = state.jobs[0];
-  return `<details class="system-map" id="system-map" ${mapOpen ? 'open' : ''}><summary>How TrustGraph works ${badge(graphState?.connected ? 'HydraDB connected' : 'HydraDB unavailable', graphState?.connected ? 'good' : 'bad')}</summary><div class="map-top"><a href="#/agent"><strong>Coding agent</strong><small>HTTP intake · Codex</small></a><span>→</span><button class="map-node" id="inspect-plan"><strong>Plan + input manifest</strong><small>${state.sources.length} registered source files</small></button><span>→</span><a href="#/policy"><strong>Rust checks</strong><small>Policy · lineage · approval</small></a></div><div class="map-bottom"><a href="#/simulator"><strong>Simulator</strong><small>Impact + counterexample</small></a><span class="branch">↙ &nbsp; ↘</span><a href="#/agent"><strong>Runtime</strong><small>Coordinator → publication gate → simulated action</small></a></div><div class="hydra-core"><div><strong>HydraDB</strong><span>trustgraph / trustgraph-governance</span></div><p>Tracks which inputs produced a patch and which approval permits its release.</p>${badge(`${count} live records`)}</div><details class="map-plan"><summary>What the HydraDB records mean</summary><p class="muted">Source → exact input bytes. Manifest → inputs supplied to Codex. Artifact → generated patch. Checks → executed test receipt. Approval → exact patch and policy. Outcome → gate decision. Rust evaluates permissions; HydraDB stores and returns the connected evidence.</p></details>${inspectingPlan ? `<details open class="map-plan"><summary>Captured execution plan</summary><pre>${e(JSON.stringify(latest?.plan?.input_manifest ? latest.plan : { sources: state.sources, policy: state.policy.name }, null, 2))}</pre></details>` : ''}</details>`;
+  return `<details class="system-map" ${mapOpen ? "open" : ""}><summary>How it works ${badge(graph?.connected ? "HydraDB connected" : "HydraDB unavailable", graph?.connected ? "good" : "bad")}</summary><pre>CODING AGENT\n     |  HTTP / CLI\nPLAN + INPUT MANIFEST\n     |\nRUST POLICY + LINEAGE + APPROVAL\n     |                      |\nSIMULATOR                 RUNTIME\nimpact + counterexample     |\n                       PUBLICATION GATE\n                            |\n                       BRANCH + DRAFT PR\n\nHYDRADB: connected sources, generations, permissions, approvals, outcomes</pre><p class="muted">Rust evaluates the rules. HydraDB preserves the connected evidence and is read back before approval and publication. The runtime journals external actions.</p></details><footer class="hydra"><strong>[+] HYDRADB</strong><span>trustgraph / trustgraph-governance</span><span>${graph?.connected ? "CONNECTED EVIDENCE" : "CONNECTION UNAVAILABLE"}</span></footer>`;
 }
-function sources() {
-  return `<details class="sources"><summary>${state.sources.length} captured source files · stored in HydraDB</summary>${state.sources.map(s => `<p>${e(s.path.split('@')[0])}<small>SHA-256 ${e(s.hash.slice(0, 16))}… · Knowledge: ${e(graphState?.knowledge?.find(k => k.id === s.id)?.indexing_status || s.knowledge_status || 'not registered')}</small></p>`).join('')}<p>Knowledge files are optional browsing copies. The generation broker uses exact bytes from the governance graph.</p></details>`;
+function policyFields(p, id, advanced = false) {
+  return `<label for="${id}-name">Policy name</label><input id="${id}-name" maxlength="100" required value="${e(p.name)}">${state.departments ? `<label>Who may receive work derived from the investigation?</label><div class="source-card"><strong>[x] Fraud &amp; Risk</strong><label class="check"><input id="${id}-engineering" type="checkbox" ${p.departments?.investigation_readers.includes("engineering") ? "checked" : ""}> Engineering may also read the investigation</label><small>Checking this grants source access. Human approval alone never grants it.</small></div>` : ""}<label for="${id}-minutes">Approval lifetime (minutes)</label><input id="${id}-minutes" type="number" min="1" max="1440" required value="${p.approval_minutes}"><label class="check"><input type="checkbox" id="${id}-tests" ${p.require_tests ? "checked" : ""}> Require passing Rust tests</label><details class="evidence" ${advanced ? "open" : ""}><summary>File scope</summary><label for="${id}-paths">Allowed files (comma-separated exact relative paths)</label><input id="${id}-paths" required value="${e(p.allowed_paths.join(", "))}"><label for="${id}-max">Maximum changed files</label><input id="${id}-max" type="number" min="1" max="10" value="${p.max_changed_files}" required></details>`;
 }
-function policyFields(policy, prefix, live = false) {
-  return `<label for="${prefix}-name">Policy name</label><input id="${prefix}-name" value="${e(policy.name)}" required maxlength="100"><label for="${prefix}-paths">Allowed files</label><input id="${prefix}-paths" value="${e(policy.allowed_paths.join(', '))}" required aria-describedby="${prefix}-paths-help"><small class="field-help" id="${prefix}-paths-help">${live ? 'Live workbench: src/lib.rs and README.md. Try other relative paths in the Simulator.' : 'Comma-separated relative paths, for example src/lib.rs, README.md or payments/reconcile.rs. Exact paths; no wildcards.'}</small><div class="fields policy-fields"><label for="${prefix}-max">Maximum changed files<input id="${prefix}-max" type="number" min="1" max="10" value="${policy.max_changed_files}" required></label><label for="${prefix}-minutes">Approval lifetime (minutes)<input id="${prefix}-minutes" type="number" min="1" max="1440" value="${policy.approval_minutes}" required></label></div><label class="check"><input id="${prefix}-tests" type="checkbox" ${policy.require_tests ? 'checked' : ''}> Require passing Rust tests</label>`;
+function readPolicy(id) {
+  return {
+    name: document.querySelector(`#${id}-name`).value.trim(),
+    allowed_paths: document
+      .querySelector(`#${id}-paths`)
+      .value.split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
+    max_changed_files: Number(document.querySelector(`#${id}-max`).value),
+    require_tests: document.querySelector(`#${id}-tests`).checked,
+    approval_minutes: Number(document.querySelector(`#${id}-minutes`).value),
+    ...(state.departments
+      ? {
+          departments: {
+            investigation_readers: [
+              "risk",
+              ...(document.querySelector(`#${id}-engineering`).checked
+                ? ["engineering"]
+                : []),
+            ],
+          },
+        }
+      : {}),
+  };
 }
-function readPolicy(prefix) {
-  return { name: document.querySelector(`#${prefix}-name`).value.trim(), allowed_paths: document.querySelector(`#${prefix}-paths`).value.split(',').map(p => p.trim()).filter(Boolean), max_changed_files: Number(document.querySelector(`#${prefix}-max`).value), approval_minutes: Number(document.querySelector(`#${prefix}-minutes`).value), require_tests: document.querySelector(`#${prefix}-tests`).checked };
+function policyPage() {
+  return (
+    heading(
+      "Set the sharing boundary.",
+      "Policies decide who may receive derived work and what must happen before publication.",
+    ) +
+    `<div class="sim-layout"><section class="card"><div class="section-heading"><h2>Active policy</h2>${badge("REV " + state.policy_revision)}</div><form id="policy" data-revision="${state.policy_revision}">${policyFields(state.policy, "policy")}<div class="actions"><button type="button" class="secondary" id="test-policy">Test changes</button><button>Activate policy</button></div><p class="muted">Test first. Activation changes the authorization context; existing work needs a fresh run and review.</p></form></section><section class="card"><h2>One agent. Two departments.</h2><p class="muted">The agent may read both departments' sources. Engineering may receive only work derived from sources it can access.</p><dl><div><dt>Engineering requirements</dt><dd>Engineering + Risk</dd></div><div><dt>Approved specification</dt><dd>Engineering + Risk</dd></div><div><dt>Confidential investigation</dt><dd>${state.policy.departments?.investigation_readers.includes("engineering") ? "Engineering + Risk" : "Risk only"}</dd></div></dl><h2>Always enforced</h2><ul><li>Derived work inherits source restrictions.</li><li>Missing lineage blocks publication.</li><li>Approval binds exact bytes, policy and repository.</li><li>A reviewer cannot override source access.</li></ul><p class="muted">These are system guarantees. The editable policy sets their parameters; arbitrary English rules are not executable policy.</p></section></div>`
+  );
 }
-function policy() {
-  return heading('Policy', 'You own the release boundary. Allow the payment fix, require tests, and require approval of the exact change.') + `<section class="card"><div class="section-heading"><h2>Active release policy</h2>${badge(`Revision ${state.policy_revision}`)}</div><form id="policy" data-revision="${state.policy_revision}">${policyFields(state.policy, 'policy', true)}<div class="actions"><button type="button" class="secondary" id="test-policy">Test in Simulator →</button><button>Activate policy</button></div><p class="muted">Testing leaves this policy unchanged. Activation creates a new authorization context; existing work must be regenerated and reviewed under it.</p></form></section><section class="card"><h2>Always enforced by Rust</h2><ul>${state.invariants.map(i => `<li>${e(i)}</li>`).join('')}</ul><p class="muted">The live example uses your private workbench repository and its sole owner. Department access controls remain a separate fixture scenario.</p></section>`;
+const presets = [
+  ["risk", "Risk -> Engineering"],
+  ["clean", "Approved inputs"],
+  ["risk_room", "Risk audience"],
+  ["stale", "Patch changed"],
+  ["destination", "Audience changed"],
+  ["expired", "Expired approval"],
+  ["lineage", "Missing lineage"],
+  ["failed", "Failed tests"],
+];
+function preset(key) {
+  return {
+    paths: ["src/lib.rs"],
+    tests_passed: key !== "failed",
+    lineage_complete: key !== "lineage",
+    approval: ["stale", "destination", "expired"].includes(key) ? key : "valid",
+    approval_age_minutes: key === "expired" ? 1441 : 0,
+    include_risk: ["risk", "risk_room"].includes(key),
+    audience: key === "risk_room" ? "risk" : "engineering",
+  };
 }
-function simulator() {
-  if (!simDraft) simDraft = { paths: ['src/lib.rs'], tests_passed: true, lineage_complete: true, approval: 'valid', approval_age_minutes: 0 };
-  if (!simulationPolicy) simulationPolicy = clone(state.policy);
-  return heading('Simulator', 'Try a candidate policy against the same proposed change. Compare decisions before changing the live policy.') + `<p class="scope-note">Supports file scope, file count, required tests and approval lifetime. Inputs and approval below are explicit assumptions. No code executes and no policy is activated.</p><div class="scenario-buttons" aria-label="Proposed change presets">${[['files', 'Code + docs'], ['failed', 'Failed tests'], ['stale', 'Patch changed'], ['policy', 'Policy changed'], ['lineage', 'Missing input'], ['expired', 'Expired approval']].map(([id, label]) => `<button type="button" class="secondary" data-scenario="${id}">${label}</button>`).join('')}</div><form id="simulation"><div class="sim-layout"><section class="card"><div class="section-heading"><h2>1. Candidate policy</h2><button type="button" class="text-button" id="use-active">Use active policy</button></div>${policyFields(simulationPolicy, 'candidate')}<details class="evidence"><summary>Import a policy as JSON</summary><label for="candidate-json">Supported policy JSON</label><textarea id="candidate-json" rows="9" spellcheck="false">${e(JSON.stringify(simulationPolicy, null, 2))}</textarea><button type="button" class="secondary" id="import-policy">Use this JSON</button><p class="muted">Unknown fields and arbitrary English rules are rejected. The built-in lineage and approval guarantees remain enforced.</p><p id="json-error" role="alert"></p></details></section><section class="card"><h2>2. Proposed change</h2><label for="sim-paths">Changed files</label><input id="sim-paths" value="${e(simDraft.paths.join(', '))}"><label for="sim-tests">Test result<select id="sim-tests"><option value="true" ${simDraft.tests_passed ? 'selected' : ''}>Assume passed</option><option value="false" ${simDraft.tests_passed ? '' : 'selected'}>Assume failed</option></select></label><label for="sim-approval">Approval<select id="sim-approval">${[['valid', 'Assume exact approval'], ['stale', 'Patch changed after approval'], ['previous_policy', 'Policy changed after approval'], ['expired', 'Approval expired'], ['missing', 'No approval']].map(([value, label]) => `<option value="${value}" ${simDraft.approval === value ? 'selected' : ''}>${label}</option>`).join('')}</select></label><label for="sim-age">Approval age (minutes)<input id="sim-age" type="number" min="0" max="10080" value="${simDraft.approval_age_minutes || 0}"></label><small class="field-help">Both policies evaluate the same hypothetical approval age against their own lifetime.</small><label class="check"><input type="checkbox" id="sim-lineage" ${simDraft.lineage_complete ? 'checked' : ''}> Input manifest is complete</label><button type="button" class="text-button" id="use-latest" ${state.jobs.some(j => j.change) ? '' : 'disabled'}>Use latest agent change</button><div class="actions"><button>Compare policies</button></div><p class="muted">Checks this proposal against both active and candidate policies. Results and policy relationships are recorded in HydraDB.</p></section></div></form><div id="simulation-result" aria-live="polite">${simulationResult()}</div><details class="evidence"><summary>Run this experiment from Codex</summary><pre>cargo run --locked -p trustgraph-cli -- policy-simulate \\\n  --case examples/payment-change.json \\\n  --policy examples/payment-policy-expanded.json \\\n  --expect allowed</pre><p class="muted">The agent token can test candidate policies. It cannot activate them or approve publication.</p></details>`;
+function simulatorPage() {
+  candidate ||= clone(state.policy);
+  return (
+    heading(
+      "Test a policy. See the consequence.",
+      "Run one case or compare the same policy across several scenarios. Every decision uses the Rust evaluator.",
+    ) +
+    `<p class="scope-note">What-if inputs and approvals are assumptions. No GitHub action runs here. Candidate policies and results are recorded in HydraDB; the active policy stays unchanged.</p><div class="presets">${presets.map(([id, label]) => `<button class="secondary" data-preset="${id}">${label}</button>`).join("")}</div><form id="simulation"><div class="sim-layout"><section class="card"><div class="section-heading"><h2>1 / Candidate policy</h2><button type="button" class="text-button" id="use-active">Reset</button></div>${policyFields(candidate, "candidate")}<details class="evidence"><summary>Import supported policy JSON</summary><label for="policy-json">Policy</label><textarea id="policy-json" rows="9" spellcheck="false">${e(JSON.stringify(candidate, null, 2))}</textarea><button type="button" class="secondary" id="import-json">Use JSON</button><p id="json-error" role="alert"></p></details></section><section class="card"><h2>2 / Scenario</h2>${state.departments ? `<label class="check"><input id="sim-risk" type="checkbox" ${draft.include_risk ? "checked" : ""}> Generation uses the Risk investigation</label><label for="sim-audience">Who receives the work?</label><select id="sim-audience"><option value="engineering" ${draft.audience === "engineering" ? "selected" : ""}>Engineering</option><option value="risk" ${draft.audience === "risk" ? "selected" : ""}>Fraud &amp; Risk</option></select>` : ""}<label for="sim-approval">Approval condition</label><select id="sim-approval">${[
+      ["valid", "Exact approval"],
+      ["stale", "Patch changed after approval"],
+      ["destination", "Audience changed after approval"],
+      ["previous_policy", "Policy changed after approval"],
+      ["expired", "Expired approval"],
+      ["missing", "No approval"],
+    ]
+      .map(
+        ([v, l]) =>
+          `<option value="${v}" ${draft.approval === v ? "selected" : ""}>${l}</option>`,
+      )
+      .join(
+        "",
+      )}</select><label for="sim-age">Approval age (minutes)</label><input id="sim-age" type="number" min="0" max="10080" value="${draft.approval_age_minutes}"><label class="check"><input id="sim-tests" type="checkbox" ${draft.tests_passed ? "checked" : ""}> Tests passed</label><label class="check"><input id="sim-lineage" type="checkbox" ${draft.lineage_complete ? "checked" : ""}> Complete input manifest</label><label for="sim-paths">Proposed files</label><input id="sim-paths" value="${e(draft.paths.join(", "))}"><div class="actions"><button>Compare this case</button><button type="button" class="secondary" id="run-suite">Run all scenarios</button></div></section></div></form><section id="results" aria-live="polite">${results()}</section>`
+  );
 }
-const verdict = status => status === 'allowed' ? 'Allowed' : status === 'needs_approval' ? 'Needs approval' : 'Blocked';
-function decisionCard(result, title) {
-  return `<section class="card verdict-card"><div class="section-heading"><h2>${e(title)}</h2>${badge(verdict(result.status), result.status === 'allowed' ? 'good' : 'bad')}</div><dl><div><dt>Information permitted</dt><dd>${result.information_permitted ? 'Yes' : 'No'}</dd></div><div><dt>Business policy</dt><dd>${result.policy_passed ? 'Pass' : 'Fail'}</dd></div><div><dt>Exact approval</dt><dd>${result.approval_matched ? 'Assumed match' : 'Does not match'}</dd></div></dl>${result.counterexample ? `<div class="callout bad"><strong>${e(result.counterexample.rule)}</strong><p>${e(result.counterexample.explanation)}</p><p class="failure-path">${result.counterexample.path.map(e).join(' → ')}</p></div>` : '<p class="muted">All modeled conditions pass. Runtime still checks the actual patch and current evidence.</p>'}</section>`;
+const verdict = (x) =>
+  x.status === "allowed"
+    ? "Allowed"
+    : x.status === "needs_approval"
+      ? "Needs approval"
+      : "Blocked";
+function decisionCard(x, title) {
+  return `<section class="card"><div class="section-heading"><h2>${e(title)}</h2>${badge(verdict(x), x.status === "allowed" ? "good" : "bad")}</div><dl><div><dt>Sharing permitted</dt><dd>${x.information_permitted ? "Yes" : "No"}</dd></div><div><dt>Policy requirements</dt><dd>${x.policy_passed ? "Pass" : "Fail"}</dd></div><div><dt>Exact approval</dt><dd>${x.approval_matched ? "Assumed match" : "No match"}</dd></div></dl>${x.counterexample ? `<div class="callout"><strong>${e(x.counterexample.rule)}</strong><p>${e(x.counterexample.explanation)}</p><p class="failure-path">${x.counterexample.path.map(e).join(" -> ")}</p></div>` : '<p class="muted">All modeled conditions pass. Live publication rechecks actual evidence.</p>'}</section>`;
 }
-function simulationResult() {
-  const result = simResult;
-  if (!result) return '';
-  return `<div class="comparison-heading"><h2>Same proposed change. Two policy decisions.</h2>${badge('Hypothetical · zero publication effects')}</div><div class="sim-layout">${decisionCard(result.baseline, `Active: ${result.active_policy.name}`)}${decisionCard(result, `Candidate: ${result.candidate_policy.name}`)}</div><p class="scope-note">${result.policy_changed ? 'Candidate tested only. Your active policy and existing approvals were not changed.' : 'Candidate matches the active policy. Edit its conditions to explore a different decision.'}${result.active_policy_changed_during_check ? ' The live policy changed during this check; compare again before using the result.' : ''}</p>${result.impact?.length ? `<details class="card"><summary>Impact on ${result.impact.length} existing agent changes</summary><p class="muted">Business-policy projection against saved patches. A changed policy requires a fresh run; the runtime independently rechecks permissions and approval.</p>${result.impact.map(item => `<div class="impact-row"><p>${e(item.goal)}</p>${badge(item.violations.length ? 'Outside candidate policy' : 'Within candidate scope', item.violations.length ? 'bad' : 'good')}<p class="muted">${e(item.violations.join('; ') || (item.requires_fresh_run ? 'A fresh generation and review would be required under this candidate.' : 'Policy context unchanged. Current approval is checked separately.'))}</p></div>`).join('')}</details>` : ''}<div class="actions"><a class="button" href="#/agent">Run the real agent →</a></div><details class="evidence"><summary>Rust decisions and HydraDB evidence</summary><p>Candidate policy: ${e(result.candidate_policy_graph_id)}</p><p>Simulation: ${e(result.graph_id)}</p><pre>${e(JSON.stringify(result, null, 2))}</pre></details>`;
+function results() {
+  if (suite)
+    return `<section class="card"><div class="section-heading"><h2>Same scenarios. Two policies.</h2>${badge("NO GITHUB WRITES")}</div><div class="table-scroll"><table><thead><tr><th>Scenario</th><th>Active policy</th><th>Candidate policy</th><th>Candidate explanation</th></tr></thead><tbody>${suite.map(([label, x]) => `<tr><td>${e(label)}</td><td>${verdict(x.baseline)}</td><td>${verdict(x)}</td><td>${e(x.counterexample?.rule || "All modeled checks pass")}</td></tr>`).join("")}</tbody></table></div><p class="muted">${suite.length} independently evaluated cases recorded in HydraDB. This tests supported policy conditions; it does not prove arbitrary code properties.</p><details class="evidence"><summary>Recorded case evidence</summary><pre>${e(
+      JSON.stringify(
+        suite.map(([scenario, x]) => ({
+          scenario,
+          graph_id: x.graph_id,
+          candidate_policy_graph_id: x.candidate_policy_graph_id,
+        })),
+        null,
+        2,
+      ),
+    )}</pre></details></section>`;
+  if (!result) return "";
+  return `<h2 class="comparison-heading">One proposal / active vs candidate policy</h2><div class="sim-layout">${decisionCard(result.baseline, "Active: " + result.active_policy.name)}${decisionCard(result, "Candidate: " + result.candidate_policy.name)}</div><p class="scope-note">Candidate tested only. Activate it explicitly on the Policy page if you intend to change source access.</p><details class="evidence"><summary>Rust decision + HydraDB evidence</summary><pre>${e(JSON.stringify(result, null, 2))}</pre></details>`;
 }
 function readSimulation() {
-  simulationPolicy = readPolicy('candidate');
-  simDraft = { paths: document.querySelector('#sim-paths').value.split(',').map(p => p.trim()).filter(Boolean), tests_passed: document.querySelector('#sim-tests').value === 'true', approval: document.querySelector('#sim-approval').value, lineage_complete: document.querySelector('#sim-lineage').checked, approval_age_minutes: Number(document.querySelector('#sim-age').value) };
+  candidate = readPolicy("candidate");
+  draft = {
+    paths: document
+      .querySelector("#sim-paths")
+      .value.split(",")
+      .map((x) => x.trim())
+      .filter(Boolean),
+    tests_passed: document.querySelector("#sim-tests").checked,
+    lineage_complete: document.querySelector("#sim-lineage").checked,
+    approval: document.querySelector("#sim-approval").value,
+    approval_age_minutes: Number(document.querySelector("#sim-age").value),
+    include_risk: !!document.querySelector("#sim-risk")?.checked,
+    audience: document.querySelector("#sim-audience")?.value || "engineering",
+  };
 }
-function clearSimulation() {
-  simResult = undefined;
-  const output = document.querySelector('#simulation-result');
-  if (output) output.innerHTML = '';
+function workspace() {
+  const job = state.jobs.find((j) => j.id === selected());
+  if (job) return detail(job);
+  return (
+    heading(
+      "One agent. Two departments.",
+      "The agent can help Engineering and Fraud & Risk. That does not give Engineering access to everything the agent learns.",
+    ) +
+    `<section class="card"><div class="section-heading"><h2>Payment reconciliation</h2>${badge("LIVE AGENT + HYDRA + GITHUB")}</div><div class="grid"><div class="source-card"><span>ENGINEERING</span><strong>Implementation requirements</strong><p>Accept zero-value authorizations. Approved specification available to both teams.</p></div><div class="source-card"><span>FRAUD &amp; RISK</span><strong>Confidential investigation</strong><p>The agent may read it. Engineering cannot receive work derived from it.</p></div></div><form id="new-work"><label for="goal">Work order</label><textarea id="goal" rows="4" required maxlength="4000">${e(goal)}</textarea><label class="check"><input id="include-risk" type="checkbox" checked> Include the confidential Risk investigation</label><div class="actions"><button ${state.jobs.some((j) => ["queued", "running", "revising"].includes(j.status)) ? "disabled" : ""}>Run coding agent</button><a class="button secondary" href="/simulator">Test policy first</a></div><p class="muted">Fresh Codex turn. Actual Rust tests. Private Engineering repository. Bank documents are controlled test material; the integrations are live.</p></form></section><details class="evidence"><summary>Try from Codex or a terminal</summary><pre>cargo run --locked -p trustgraph-cli -- run --include-risk \\\n  --goal "$(cat examples/bankcase/work-order.txt)"</pre><p class="muted">The CLI uses a restricted agent token. It can submit work and test policies; approval remains with the operator.</p></details><section class="work-list"><h2>Recent work</h2>${state.jobs.length ? state.jobs.map((j) => `<button class="work-row" data-job="${e(j.id)}"><span><strong>${e(j.goal)}</strong><small>${j.include_risk ? "Risk investigation included" : "Approved inputs only"}${j.repair_of ? " / fresh repair" : ""} / ${e(j.id.slice(0, 16))}</small></span>${badge(names[j.status] || j.status, j.status === "blocked" ? "bad" : j.status === "published" ? "good" : "")}</button>`).join("") : '<p class="muted">No agent runs yet.</p>'}</section>`
+  );
+}
+function detail(j) {
+  const c = j.change;
+  const approved = j.decision?.status === "READY";
+  const permission = j.information_permitted;
+  const canReview =
+    permission &&
+    !j.violations.length &&
+    c?.checks.passed &&
+    !j.operation &&
+    !["running", "queued", "revising", "revision_failed"].includes(j.status);
+  const publish = approved && j.graph_approval_recorded && canReview;
+  return (
+    `<button class="back" id="back">&lt;- All work</button>` +
+    heading(
+      j.include_risk
+        ? "The patch carries the Risk boundary."
+        : "A fresh patch from approved inputs.",
+      j.goal,
+    ) +
+    `<div class="status-row">${badge(names[j.status] || j.status, j.status === "blocked" ? "bad" : j.status === "published" ? "good" : "")}<span>${j.include_risk ? "Risk context captured" : "Approved inputs only"}</span>${j.repair_of ? "<span>FRESH REPAIR</span>" : ""}</div><div class="flow">${j.include_risk ? '<span class="blocked">Risk investigation</span>' : "Approved sources"}<b>-></b> captured generation <b>-></b> proposed patch <b>-></b> Engineering</div>${j.error ? `<div class="callout">${e(j.error)}</div>` : ""}${j.include_risk && j.status === "blocked" ? `<section class="card"><h2>Start again inside the permitted boundary</h2><p class="muted">Keep this artifact in the Risk-authorized workspace. A fresh generation uses only Engineering requirements and the approved specification. Its context does not include this patch or investigation.</p><button data-action="repair">Generate from approved inputs</button><p class="muted">We do not claim the two patches are equivalent. Risk must authorize another specification if the approved inputs are insufficient.</p></section>` : ""}${["running", "queued", "revising"].includes(j.status) ? '<section class="card"><h2>Working...</h2><p class="muted">Actual activity appears below. This page updates automatically.</p></section>' : ""}${c ? `<section class="card"><div class="section-heading"><h2>Actual proposed patch</h2>${badge(c.files.length + " FILE(S)")}</div>${c.files.map((f) => `<details class="file"><summary>${e(f.path)} / inspect exact bytes</summary><div class="diff"><div><small>BEFORE</small><pre>${e(j.base_files.find((b) => b.path === f.path)?.content || "New file")}</pre></div><div><small>PROPOSED</small><pre>${e(f.content)}</pre></div></div></details>`).join("")}</section><section class="card"><h2>Publication checks</h2><dl><div><dt>Source permissions + lineage</dt><dd>${permission ? "Pass" : "Blocked"}</dd></div><div><dt>Policy requirements</dt><dd>${e(j.violations.join("; ") || "Pass")}</dd></div><div><dt>Executed Rust tests</dt><dd>${c.checks.passed ? "Passed" : "Failed"}</dd></div><div><dt>Approval for this exact patch</dt><dd>${approved ? "Matches" : j.operation ? "Recorded in outcome" : "Required / no current match"}</dd></div></dl><details><summary>Actual test output</summary><pre>${e(c.checks.command)}\n\n${e(c.checks.output)}</pre></details><div class="actions">${j.status === "published" ? `<a class="button" href="${e(j.operation?.receipt?.provider_id)}" target="_blank" rel="noopener">Open draft PR</a>` : `<button data-action="approve" ${canReview && !approved ? "" : "disabled"}>Approve exact patch</button><button data-action="publish" ${publish ? "" : "disabled"}>Publish draft PR</button>`}</div><p class="muted" id="action-status">${publish ? "Current approval recorded in HydraDB. Publication rechecks evidence before both GitHub operations." : "Approval cannot bypass source permissions. The gate checks current lineage, policy, patch and repository."}</p>${approved && !j.operation ? '<div class="revision-note">Test approval binding: revise the actual patch, rerun its tests and invalidate this approval.<div class="actions"><button class="secondary" data-action="revise">Revise patch after approval</button></div></div>' : ""}</section>` : ""}${sources(j)}<section class="card"><h2>Live activity</h2><ol class="activity">${j.events.map((x) => `<li><time>${new Date(x.at * 1000).toLocaleTimeString()}</time><span>${e(x.message)}</span></li>`).join("")}</ol></section><details class="evidence"><summary>Captured plan + connected evidence</summary><pre>${e(JSON.stringify({ plan: j.plan, provider: j.provider, patch_graph: j.graph_id, decision: j.decision, operation: j.operation }, null, 2))}</pre></details>`
+  );
+}
+function bind() {
+  document
+    .querySelector(".system-map")
+    ?.addEventListener("toggle", (ev) => (mapOpen = ev.target.open));
+  document
+    .querySelectorAll("[data-job]")
+    .forEach((b) => (b.onclick = () => go("/agent/" + b.dataset.job)));
+  document.querySelector("#back")?.addEventListener("click", () => go("/"));
+  document
+    .querySelector("#goal")
+    ?.addEventListener("input", (ev) => (goal = ev.target.value));
+  document
+    .querySelector("#new-work")
+    ?.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const b = ev.target.querySelector("button");
+      b.disabled = true;
+      b.textContent = "Submitting...";
+      try {
+        const j = await api("/work", {
+          goal,
+          include_risk: document.querySelector("#include-risk").checked,
+        });
+        go("/agent/" + j.id);
+      } catch (error) {
+        notify(error.message);
+        b.disabled = false;
+        b.textContent = "Run coding agent";
+      }
+    });
+  document.querySelectorAll("[data-action]").forEach(
+    (b) =>
+      (b.onclick = async () => {
+        document
+          .querySelectorAll("[data-action]")
+          .forEach((x) => (x.disabled = true));
+        const status = document.querySelector("#action-status");
+        if (status)
+          status.textContent =
+            b.dataset.action === "revise"
+              ? "Revising actual bytes and rerunning Rust tests..."
+              : "Reading current evidence from HydraDB...";
+        try {
+          const j = state.jobs.find((x) => x.id === selected());
+          const response = await api(
+            `/work/${j.id}/${b.dataset.action}`,
+            b.dataset.action === "repair"
+              ? {}
+              : { context_digest: j.context_digest },
+          );
+          if (b.dataset.action === "repair") go("/agent/" + response.id);
+          else await load();
+        } catch (error) {
+          notify(error.message);
+          load();
+        }
+      }),
+  );
+  document.querySelector("#test-policy")?.addEventListener("click", () => {
+    candidate = readPolicy("policy");
+    result = suite = undefined;
+    go("/simulator");
+  });
+  document.querySelector("#policy")?.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const b = ev.target.querySelector("button:last-of-type");
+    b.disabled = true;
+    try {
+      await api("/policy", {
+        policy: readPolicy("policy"),
+        activate: true,
+        expected_revision: Number(ev.target.dataset.revision),
+      });
+      notify(
+        "Policy activated. Existing work requires a fresh run and review.",
+      );
+      load();
+    } catch (error) {
+      notify(error.message);
+      b.disabled = false;
+    }
+  });
+  bindSimulator();
 }
 function bindSimulator() {
-  const form = document.querySelector('#simulation');
-  if (!form) return;
-  form.addEventListener('input', () => { readSimulation(); clearSimulation(); });
-  document.querySelector('#use-active').onclick = () => { readSimulation(); simulationPolicy = clone(state.policy); clearSimulation(); render(); };
-  document.querySelector('#import-policy').onclick = () => {
-    try {
-      const value = JSON.parse(document.querySelector('#candidate-json').value);
-      const keys = ['name', 'allowed_paths', 'max_changed_files', 'require_tests', 'approval_minutes'];
-      if (!value || typeof value !== 'object' || Object.keys(value).length !== keys.length || keys.some(k => !Object.hasOwn(value, k)) || !Array.isArray(value.allowed_paths) || value.allowed_paths.some(path => typeof path !== 'string') || typeof value.name !== 'string' || typeof value.require_tests !== 'boolean' || !Number.isInteger(value.max_changed_files) || !Number.isInteger(value.approval_minutes)) throw new Error('Use exactly the five supported policy fields shown in the example.');
-      readSimulation(); simulationPolicy = value; clearSimulation(); render();
-    } catch (error) { document.querySelector('#json-error').textContent = error.message; }
-  };
-  document.querySelectorAll('[data-scenario]').forEach(button => button.onclick = () => {
+  const f = document.querySelector("#simulation");
+  if (!f) return;
+  f.addEventListener("input", () => {
     readSimulation();
-    const scenario = button.dataset.scenario;
-    simDraft = { paths: scenario === 'files' ? ['src/lib.rs', 'README.md'] : ['src/lib.rs'], tests_passed: scenario !== 'failed', lineage_complete: scenario !== 'lineage', approval: scenario === 'stale' ? 'stale' : scenario === 'policy' ? 'previous_policy' : scenario === 'expired' ? 'expired' : 'valid', approval_age_minutes: scenario === 'expired' ? 1441 : 0 };
-    clearSimulation(); render();
+    result = suite = undefined;
+    document.querySelector("#results").innerHTML = "";
   });
-  document.querySelector('#use-latest').onclick = () => {
-    readSimulation(); const latest = state.jobs.find(j => j.change);
-    if (latest) { simDraft.paths = latest.change.files.map(f => f.path); simDraft.tests_passed = latest.change.checks.passed; clearSimulation(); render(); }
+  document.querySelector("#use-active").onclick = () => {
+    readSimulation();
+    candidate = clone(state.policy);
+    result = suite = undefined;
+    render();
   };
-  form.onsubmit = async event => {
-    event.preventDefault(); readSimulation(); clearSimulation();
-    const controls = [...form.elements, ...document.querySelectorAll('[data-scenario]')];
-    controls.forEach(control => control.disabled = true);
-    const output = document.querySelector('#simulation-result');
-    output.innerHTML = '<p role="status">Comparing policies in Rust and recording evidence in HydraDB…</p>';
-    output.setAttribute('aria-busy', 'true');
-    try { simResult = await api('/simulate', { ...simDraft, policy: simulationPolicy }); output.innerHTML = simulationResult(); output.tabIndex = -1; output.focus({ preventScroll: true }); output.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
-    catch (error) { output.innerHTML = `<p class="callout bad" role="alert">${e(error.message)}</p>`; }
-    finally { controls.forEach(control => control.disabled = false); output.removeAttribute('aria-busy'); }
+  document.querySelectorAll("[data-preset]").forEach(
+    (b) =>
+      (b.onclick = () => {
+        readSimulation();
+        draft = preset(b.dataset.preset);
+        result = suite = undefined;
+        render();
+      }),
+  );
+  document.querySelector("#import-json").onclick = () => {
+    try {
+      const v = JSON.parse(document.querySelector("#policy-json").value);
+      const allowed = [
+        "name",
+        "allowed_paths",
+        "max_changed_files",
+        "require_tests",
+        "approval_minutes",
+        "departments",
+      ];
+      if (
+        !v ||
+        Array.isArray(v) ||
+        typeof v !== "object" ||
+        Object.keys(v).some((k) => !allowed.includes(k)) ||
+        allowed.slice(0, 5).some((k) => !Object.hasOwn(v, k)) ||
+        typeof v.name !== "string" ||
+        !Array.isArray(v.allowed_paths) ||
+        v.allowed_paths.some((p) => typeof p !== "string") ||
+        typeof v.require_tests !== "boolean" ||
+        !Number.isInteger(v.max_changed_files) ||
+        !Number.isInteger(v.approval_minutes) ||
+        (state.departments &&
+          (!v.departments ||
+            !Array.isArray(v.departments.investigation_readers) ||
+            v.departments.investigation_readers.some(
+              (r) => !["engineering", "risk"].includes(r),
+            ) ||
+            Object.keys(v.departments).some(
+              (k) => k !== "investigation_readers",
+            )))
+      )
+        throw Error(
+          "Use the supported structured fields shown above. Unknown rules are rejected by Rust.",
+        );
+      readSimulation();
+      candidate = v;
+      result = suite = undefined;
+      render();
+    } catch (error) {
+      document.querySelector("#json-error").textContent = error.message;
+    }
   };
+  async function run(all) {
+    readSimulation();
+    const controls = [
+      ...f.elements,
+      ...document.querySelectorAll("[data-preset]"),
+    ];
+    controls.forEach((x) => (x.disabled = true));
+    const out = document.querySelector("#results");
+    out.setAttribute("aria-busy", "true");
+    out.innerHTML =
+      '<p role="status">Evaluating in Rust and recording case evidence in HydraDB...</p>';
+    result = suite = undefined;
+    try {
+      if (all) {
+        const rows = [];
+        for (const [key, label] of presets) {
+          out.innerHTML = `<p role="status">Checking ${e(label)} (${rows.length + 1}/${presets.length})...</p>`;
+          rows.push([
+            label,
+            await api("/simulate", { ...preset(key), policy: candidate }),
+          ]);
+        }
+        suite = rows;
+      } else result = await api("/simulate", { ...draft, policy: candidate });
+      out.innerHTML = results();
+      out.scrollIntoView({ behavior: "smooth", block: "start" });
+    } catch (error) {
+      out.innerHTML = `<p class="callout" role="alert">${e(error.message)}</p>`;
+    } finally {
+      controls.forEach((x) => (x.disabled = false));
+      out.removeAttribute("aria-busy");
+    }
+  }
+  f.onsubmit = (ev) => {
+    ev.preventDefault();
+    run(false);
+  };
+  document.querySelector("#run-suite").onclick = () => run(true);
 }
-function work() {
-  const job = state.jobs.find(j => j.id === selected);
-  if (job) return detail(job);
-  return heading('Agent', 'Run a real coding agent, inspect its actual patch and tests, then decide whether to release it.') + `<section class="card"><h2>Fix the zero-value authorization bug</h2><p class="muted">The private workbench rejects <code>valid_amount(0)</code>. Codex should accept zero, reject negatives, preserve positive values and add a regression test.</p><form id="new-work"><label for="goal">Work order</label><textarea id="goal" required maxlength="4000" rows="4">${e(goal)}</textarea>${sources()}<button ${state.jobs.some(j => ['running', 'queued'].includes(j.status)) ? 'disabled' : ''}>Run Codex</button></form><details class="evidence"><summary>Run from Codex or your terminal</summary><pre>cargo run --locked -p trustgraph-cli -- run \\\n  --goal "Fix valid_amount to accept zero, reject negatives and add a zero regression test. Only change src/lib.rs."</pre><p class="muted">Run from TrustGraph. The CLI reads the restricted agent token locally and streams actual run stages. Approval stays in this app.</p></details></section><section class="work-list"><h2>Recent work</h2>${state.jobs.map(j => `<button class="work-row" data-job="${j.id}"><span><strong>${e(j.goal)}</strong><small>${new Date(j.created_at * 1000).toLocaleString()}</small></span>${badge(names[j.status] || j.status, j.status === 'gate_passed' || j.status === 'published' ? 'good' : j.status === 'blocked' ? 'bad' : '')}</button>`).join('') || '<p class="muted">Your agent’s work will appear here.</p>'}</section>`;
-}
-function detail(job) {
-  const change = job.change, ready = job.decision?.status === 'READY', pending = job.decision?.status === 'PENDING_APPROVAL';
-  const passed = change?.checks.passed, testCount = change?.checks.output.match(/test result: ok\. (\d+) passed/)?.[1];
-  const canReview = (pending || (!ready && job.information_permitted) || (ready && !job.graph_approval_recorded)) && !job.violations.length && job.status !== 'blocked' && !job.operation;
-  const canGate = ready && job.graph_approval_recorded && !job.violations.length && job.status !== 'blocked';
-  return `<button class="back" id="back">← All work</button>` + heading('Agent run', job.goal) + `<div class="status-row">${badge(names[job.status] || job.status, job.status === 'gate_passed' ? 'good' : '')}<span>${e(state.repository)}</span></div><section class="progress" aria-label="Work progress"><span>HydraDB inputs</span><b>→</b><span>Codex</span><b>→</b><span>Rust tests</span><b>→</b><span>Your review</span><b>→</b><span>Publication gate</span></section>${job.error ? `<div class="callout bad">${e(job.error)}</div>` : ''}${['running', 'queued'].includes(job.status) ? '<section class="card"><h2>Codex is working</h2><p class="muted">The broker loaded exact source bytes from HydraDB into a fresh turn. This view updates with actual activity.</p></section>' : ''}${change ? `<section class="card"><div class="section-heading"><h2>Proposed changes</h2>${badge(`${change.files.length} file${change.files.length === 1 ? '' : 's'}`)}</div>${change.files.map(file => `<details class="file" open><summary>${e(file.path)}</summary><div class="diff"><div><span>Before</span><pre>${e(job.base_files.find(base => base.path === file.path)?.content || 'New file')}</pre></div><div><span>Proposed</span><pre>${e(file.content)}</pre></div></div></details>`).join('')}</section><section class="card"><h2>Release checks</h2><dl><div><dt>Source permission and complete lineage</dt><dd>${job.information_permitted ? 'Passed' : 'Blocked'}</dd></div><div><dt>Business policy</dt><dd>${job.violations.length ? e(job.violations.join('; ')) : 'Passed'}</dd></div><div><dt>Tests for this exact patch</dt><dd class="${passed ? 'good' : 'bad'}">${passed ? `Passed${testCount ? ` · ${testCount} tests` : ''}` : 'Failed'}</dd></div><div><dt>Exact operator approval</dt><dd>${ready ? 'Approved' : job.status === 'published' ? 'Recorded' : job.decision?.violations?.some(v => v.code === 'APPROVAL_EXPIRED') ? 'Expired · review again' : 'Required'}</dd></div></dl><details><summary>View actual test output</summary><p class="muted">${e(change.checks.command)}</p><pre>${e(change.checks.output)}</pre></details><div class="actions">${job.status === 'published' ? `<a class="button" href="${e(job.operation?.receipt?.provider_id)}" target="_blank" rel="noopener">Open draft PR ↗</a>` : `<button data-action="approve" ${canReview ? '' : 'disabled'}>Approve exact change</button><button class="secondary" data-action="gate" ${canGate ? '' : 'disabled'}>Run publication gate</button>`}</div><p class="muted" id="action-status" role="status">${canGate ? 'Approval is recorded. The gate will fetch and validate HydraDB evidence again.' : 'Review the actual patch and test receipt before approving. Approval enables the gate.'}</p><p class="muted">The gate’s default action is simulated. No branch or PR is created.</p><details><summary>Optional: publish a real draft PR</summary><p class="muted">Separate action targeting only the private workbench repository. This is outside the default walkthrough.</p><button class="secondary" data-action="publish" ${canGate ? '' : 'disabled'}>Open real draft PR</button></details></section>` : ''}${sources()}<section class="card"><h2>Live activity</h2><ol class="activity">${(job.events || []).map(event => `<li><time>${new Date(event.at * 1000).toLocaleTimeString()}</time><span>${e(event.message)}</span></li>`).join('')}</ol></section><details class="evidence"><summary>Plan, manifest and HydraDB evidence</summary><pre>${e(JSON.stringify(job.plan, null, 2))}</pre><p>Generation: ${e(job.provider?.provider || 'Pending')}</p><p>Capture: ${e(job.provider?.capture || 'Pending')}</p><p>Patch graph record: ${e(job.graph_id || 'Pending')}</p><pre>${e(JSON.stringify(job.decision, null, 2))}</pre></details>`;
-}
-async function render() {
-  document.querySelectorAll('nav a').forEach(link => { const active = link.hash === `#/${page()}`; link.classList.toggle('active', active); if (active) link.setAttribute('aria-current', 'page'); else link.removeAttribute('aria-current'); });
-  document.title = `TrustGraph · ${page() === 'policy' ? 'Policy' : page() === 'simulator' ? 'Simulator' : 'Agent'}`;
-  app.innerHTML = story() + architecture() + `<section id="panel">${page() === 'policy' ? policy() : page() === 'simulator' ? simulator() : work()}</section>`;
-  document.querySelector('#system-map').addEventListener('toggle', event => mapOpen = event.target.open);
-  document.querySelector('#inspect-plan').onclick = () => { inspectingPlan = !inspectingPlan; render(); };
-  bindSimulator();
-  document.querySelectorAll('[data-job]').forEach(button => button.onclick = () => { location.hash = `/agent/${button.dataset.job}`; });
-  document.querySelector('#back')?.addEventListener('click', () => { selected = undefined; location.hash = '/agent'; render(); });
-  document.querySelector('#goal')?.addEventListener('input', event => goal = event.target.value);
-  document.querySelector('#new-work')?.addEventListener('submit', async event => {
-    event.preventDefault(); const button = event.target.querySelector('button'); button.disabled = true; button.textContent = 'Submitting to TrustGraph…';
-    try { const job = await api('/work', { goal }); location.hash = `/agent/${job.id}`; }
-    catch (error) { notify(error.message); button.disabled = false; button.textContent = 'Run Codex'; }
+function render() {
+  document.title = "TrustGraph / " + page();
+  document.querySelectorAll("nav a").forEach((a) => {
+    const active =
+      (new URL(a.href).pathname === "/"
+        ? "workspace"
+        : new URL(a.href).pathname.slice(1)) === page();
+    a.classList.toggle("active", active);
+    if (active) a.setAttribute("aria-current", "page");
+    else a.removeAttribute("aria-current");
   });
-  document.querySelectorAll('[data-action]').forEach(button => button.onclick = async () => {
-    document.querySelectorAll('[data-action]').forEach(control => control.disabled = true);
-    document.querySelector('#action-status').textContent = button.dataset.action === 'approve' ? 'Recording exact approval and reading back its connected evidence from HydraDB…' : 'Rechecking current policy, exact approval and HydraDB evidence…';
-    try { const job = state.jobs.find(j => j.id === selected); await api(`/work/${job.id}/${button.dataset.action}`, { context_digest: job.context_digest }); await load(); }
-    catch (error) { notify(error.message); await load(); }
-  });
-  document.querySelector('#test-policy')?.addEventListener('click', () => { simulationPolicy = readPolicy('policy'); clearSimulation(); location.hash = '/simulator'; });
-  document.querySelector('#policy')?.addEventListener('submit', async event => {
-    event.preventDefault(); const button = event.target.querySelector('button:last-of-type'); button.disabled = true;
-    try { await api('/policy', { policy: readPolicy('policy'), activate: true, expected_revision: Number(event.target.dataset.revision) }); notify('Policy activated. Existing work requires a fresh run under this context.'); await load(); }
-    catch (error) { notify(error.message); button.disabled = false; }
-  });
+  app.innerHTML =
+    (page() === "policy"
+      ? policyPage()
+      : page() === "simulator"
+        ? simulatorPage()
+        : workspace()) + architecture();
+  bind();
 }
 async function load() {
   clearTimeout(timer);
   try {
-    state = await api('/work');
-    if (!graphState || Date.now() - lastGraphCheck > 8000) {
-      try { graphState = await api('/graph'); lastGraphCheck = Date.now(); } catch { graphState = { connected: false }; }
+    state = await api("/work");
+    if (!graph) {
+      try {
+        graph = await api("/graph");
+      } catch {
+        graph = { connected: false };
+      }
     }
-    await render();
-  } catch (error) { app.innerHTML = heading('Workspace unavailable', error.message === 'workspace authentication required' ? 'Operator sign-in required. Open operator.html in your local state folder, or start TrustGraph to create it.' : error.message); }
-  if (state?.jobs.some(j => ['queued', 'running'].includes(j.status)) && page() === 'agent') timer = setTimeout(load, 2500);
+    render();
+  } catch (error) {
+    app.innerHTML = heading(
+      "Open your workspace.",
+      error.message === "workspace authentication required"
+        ? "Operator sign-in required. Open operator.html in your local state folder."
+        : error.message,
+    );
+  }
+  if (
+    state?.jobs.some((j) =>
+      ["queued", "running", "revising"].includes(j.status),
+    ) &&
+    page() === "workspace"
+  )
+    timer = setTimeout(load, 2500);
 }
-window.addEventListener('hashchange', () => { selected = location.hash.split('/')[2]; load(); });
+document.addEventListener("click", (ev) => {
+  const a = ev.target.closest("a");
+  if (
+    a &&
+    a.origin === location.origin &&
+    !a.target &&
+    !ev.metaKey &&
+    !ev.ctrlKey
+  ) {
+    ev.preventDefault();
+    go(a.pathname);
+  }
+});
+window.addEventListener("popstate", load);
 async function initialize() {
-  if (page() === 'connect') {
-    const token = location.hash.split('/')[2]; history.replaceState({}, '', '/#/policy'); selected = undefined;
-    try { const response = await fetch('/api/session', { method: 'POST', headers: { Authorization: `Bearer ${token}` } }); if (!response.ok) throw new Error('Operator sign-in failed'); }
-    catch (error) { app.textContent = error.message; return; }
+  const hash = location.hash.split("/");
+  if (hash[1] === "connect") {
+    const token = hash[2];
+    history.replaceState({}, "", "/");
+    try {
+      const r = await fetch("/api/session", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!r.ok) throw Error("Operator sign-in failed");
+    } catch (error) {
+      app.textContent = error.message;
+      return;
+    }
+  } else if (location.search || location.hash) {
+    const legacy = ["policy", "simulator", "agent"].includes(hash[1])
+      ? "/" + hash.slice(1).join("/")
+      : "/";
+    history.replaceState({}, "", legacy);
   }
   await load();
 }

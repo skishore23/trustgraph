@@ -1,192 +1,118 @@
 # TrustGraph
 
-## Live policy workspace
+One coding agent can help two departments without making everything it learns
+available to both. TrustGraph is a Rust policy and publication gateway that
+captures generation inputs, follows their permissions, binds human approval to
+an exact change and gates a real GitHub draft pull request.
 
-The real **Policy → Simulator → Agent** workspace is available with
-`cargo run --locked -p trustgraph-cli -- start --port 9080` and local configuration.
-It uses the authenticated hosted HydraDB graph, actual captured Codex generation
-and isolated Rust tests against a private workbench repository. Its default
-publication action is simulated. See [setup, walkthrough and scope](docs/live-workspace.md).
-The fixture workflow described below remains available through `serve`.
-For a rehearsable presentation, follow the [hackathon story and Codex trial](docs/hackathon-walkthrough.md).
+## The working case
 
-A Rust compiler for safe agent plans. Before an agent acts, TrustGraph checks how
-its proposed reads, generation, approval and publication compose. It identifies a
-concrete recipient/source conflict, offers permitted alternatives, then enforces
-exact output and destination bindings when the selected plan runs.
+A bank is modernizing payment reconciliation. Engineering owns implementation
+requirements. Fraud & Risk owns a confidential investigation. The same coding
+agent may help both, but Engineering cannot read the investigation.
 
-The default workflow is now **one coding agent, two bank departments**. Engineering
-requirements are shareable; a Fraud & Risk investigation is not. TrustGraph blocks
-a derived patch from entering Engineering's repository, offers a fresh-context
-repair and requires approval of the actual artifact and destination.
+1. Generate a patch using both sources. Actual tests may pass, but publication
+   to Engineering is blocked by the Risk-only dependency.
+2. Start a fresh generation from Engineering requirements and an approved Risk
+   specification. The restricted patch is not reused.
+3. Approve the exact new patch. Revise its actual bytes and rerun tests: the old
+   approval no longer matches.
+4. Approve again. The gate reads connected evidence from HydraDB, rechecks Rust
+   authorization and creates a real branch and draft PR in the private workbench.
 
-The [small explicit policy layer](docs/policies.md) lets you author versioned YAML,
-run five deterministic cases and activate a reviewed policy atomically. A coding
-agent can propose and test policies through MCP, but cannot activate or approve.
-The [three-chapter guided demo](docs/bank-story-demo.md) shows restricted inputs,
-exact approval binding and a hypothetical access change across a five-level
-release graph. The [agent workflow](docs/bank-demo.md) and
-[policy examples](examples/bank-policy.yaml) cover the persistent workspace.
-
-The fixture app uses synthetic documents, fixture patch generation and local simulated
-delivery. **The fixture server uses no real coding agent or Composio publisher.**
-The separate live workspace captures actual isolated Codex input; Composio remains
-unconfigured. The standalone Hydra adapter supports namespace configuration,
-projection and validated historical bundle reconstruction; its qualification
-is separate from the hosted adapter used by the live workspace. [Composio contract](docs/composio-plan.md).
-
-The earlier [consulting business case](docs/business-case.md) remains available as
-`--scenario consulting`; existing data is preserved. This is one workspace per
-running app, without tenancy or billing.
+The bank documents are controlled test material; Codex, HydraDB, executed Rust
+checks and the GitHub publisher are live. The configured department audiences
+are an explicit model, not an import of enterprise IAM. The local operator is a
+Risk-authorized reviewer/source owner. Composio is not configured; the qualified
+publisher currently uses authenticated GitHub API calls through `gh`.
 
 ## Run
 
-Requires Rust 1.90 or newer. Built and tested with Rust 1.97.1. Dependencies are
-locked in `Cargo.lock`; no Node server, model API key or database is needed for
-the local workflow.
+Requirements: Rust, signed-in `hydradb`, `codex` and `gh` CLIs, and macOS
+`sandbox-exec` for the isolated Rust checks. Configure `trustgraph.local.json`
+using [the setup guide](docs/live-workspace.md), then:
 
 ```sh
-cargo run --locked -p trustgraph-cli -- policy-check examples/bank-policy.yaml
-cargo run --locked -p trustgraph-cli -- serve
+cargo run --locked -p trustgraph-cli -- start
 ```
 
-Open [the bank walkthrough](http://127.0.0.1:8080/#/demo). Click **Reset**
-for the rehearsable three-chapter story. Preview as **Ravi** (internal ID `arun`)
-for restricted work, then **Maya** for the approval chapter. The walkthrough uses
-a fixed fictional policy and separate in-memory history; it never mutates the
-persistent workspace or calls a publisher. Reports are fixtures, not executed-test
-attestations.
+Open the private `operator.html` launch file printed at startup once to sign in.
+The app is at [localhost:8080](http://127.0.0.1:8080/), with **Workspace**,
+**Policy** and **Simulator**. Appearance is fixed ASCII; no theme or demo route
+is needed. Old theme/demo URLs normalize to the app root.
 
-For the configurable agent workflow, open [the permission simulator](http://127.0.0.1:8080/#/simulator)
-as Ravi for Risk or Maya for Engineering. Select evidence and choose Engineering’s
-repository or the Risk review room. The real
-Rust compiler powers the verdict and document/recipient permission matrix.
-
-Keep the audience and omit unshareable evidence, or keep the evidence and restrict
-the audience. A passing selection can **Prepare patch for review**. The broker
-records the actual inputs and content, then requires a human to **Approve & release**
-the exact version and destination. Reviews, Deliveries and Sources support this
-workflow. Agent plans and bounded verification remain available through the CLI and API.
-
-The **Verification** page explores the bounded model and can show a deliberate
-approval-reuse fault with a shortest counterexample. This changes the model only,
-never the running app's policy.
-
-The browser uses fixed demo identities (`demo-maya`, `demo-arun`, `demo-sam`,
-`demo-agent`). The server binds only to loopback, checks origin/host and authorizes
-each API request. These are development identities, not production authentication.
-Agent identity cannot approve. Sam cannot retrieve private source or draft data.
-
-The default bank workspace survives restarts in `.trustgraph-bank/`. The consulting
-workspace remains in `.trustgraph-consulting/`; use `serve --scenario consulting`
-to open it. Existing
-Northstar data in `.trustgraph/` is preserved; do not reuse that directory for the
-consulting scenario. To start a new seeded workspace without
-deleting evidence, stop the current server and run:
+Try the same controlled agent intake from Codex or a terminal:
 
 ```sh
-demo_directory=$(mktemp -d /tmp/trustgraph-demo.XXXXXX)
-cargo run --locked -p trustgraph-cli -- serve --data "$demo_directory"
+cargo run --locked -p trustgraph-cli -- run --include-risk \
+  --goal "$(cat examples/bankcase/work-order.txt)"
 ```
 
-## Use it from an agent
+A blocked exit is expected with Risk context. Use **Generate from approved
+inputs** in the app for a new isolated run. The agent credential cannot activate
+policies, approve, publish, or introduce an unadmitted work order as public input.
+An operator can admit a new task by submitting it in Workspace.
 
-TrustGraph now serves real MCP through the official Rust SDK. Keep the app running,
-then add [the local configuration](examples/mcp.local.json) to your client's MCP
-settings, or download the configuration from **Connect agent** in the app.
-The stdio command connects to the same running workspace; it does not start a
-second journal owner. Agents can inspect, simulate, propose, analyze, repair,
-prepare and read status. Approval stays in the reviewer app.
+## Policy experiments
 
-[Try MCP](docs/mcp.md) includes a trial prompt and transport contract.
-[8090 Software Factory integration](docs/8090-integration.md) explains the working
-companion-agent approach and what remains before a direct hosted-agent deployment.
-Real 8090 documents and ACLs are not imported by this synthetic integration.
-
-## Stages and current status
-
-| Stage | Deliverable | Status |
-| --- | --- | --- |
-| Product demo | Three-chapter bank walkthrough, source/audience simulator, scoped release impact and guarded review | Implemented with synthetic data and a resettable isolated sandbox |
-| Policy layer | Explicit YAML, immutable versions, five-case suite, atomic human activation and MCP proposal/testing | Implemented |
-| 1. Typed compiler | Read/Generate/Approve/Publish contracts, ordered references, explicit input manifests and runtime approval obligation | Implemented |
-| 2. Counterexample and repairs | Concrete forbidden recipient/source/path; narrower audience or fresh permitted context; no ACL changes | Implemented and tested |
-| 3. Controlled plan execution | Journaled proposals and run reservations, exact source/output bindings, resumable generation, human review and guarded dispatch | Implemented with local fixture generation/publishing |
-| 4. Finite verification | Breadth-first bounded exploration, independent invariants and a model-only approval-reuse mutant | Implemented; scoped bounds are explicit |
-| 5. TrustGraph MCP | Agent-facing propose/analyze/repair/prepare/status transport; no approval or raw publisher credential access | Implemented with authenticated loopback MCP and stdio bridge; live third-party registration pending |
-| 6. Hydra persistence | Store plans/run relationships and load validated graph evidence from a real server | Existing projection/protocol tests; live plan/evidence backend pending |
-| 7. Composio action | One real dedicated destination with server-owned credentials, idempotency and outcome reconciliation | Pending qualification; publishing is simulated |
-| 8. Narrow formal tools | Optional Kani authorization-function checks, then broader least-authority synthesis research | Planned |
-
-The current [bank/policy design](docs/superpowers/specs/2026-11-14-bank-policy-design.md)
-builds on the [compiler design](docs/superpowers/specs/2026-11-14-plan-compiler.md)
-and supersedes the earlier demo framing. The existing pure verifier,
-immutable content, permission-filtered evidence, journal and controlled publisher
-remain the underlying execution machinery. [Integration gates](docs/next-stages.md)
-record what is not yet live-qualified.
-
-## Test and simulate
+Policies are the rules and parameters. The Simulator tests them across cases;
+it does not publish code. Edit source readers, approval lifetime, required tests
+or file scope. Compare a candidate with the active policy, or **Run all scenarios**.
 
 ```sh
-cargo run --locked -p trustgraph-cli -- compile-plan examples/launch-plan.json
-cargo run --locked -p trustgraph-cli -- check-model --depth 6
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
+python3 scripts/bank-policy-rehearsal.py
+cargo run --locked -p trustgraph-cli -- policy-simulate \
+  --case examples/bankcase/risk-to-engineering.json \
+  --policy examples/bankcase/policy-source-grant.json --expect allowed
+```
+
+The 16-case rehearsal covers department sharing, changed patch/audience/policy,
+missing and expired approval, unknown lineage, failed tests, source grants,
+shorter lifetimes and custom file scopes. It records evidence in HydraDB without
+changing active policy, saved jobs or GitHub. Supported structured policy fields
+are explicit; arbitrary English rules are rejected. Source inheritance, complete
+lineage and exact approval binding are system guarantees.
+
+## Architecture
+
+```text
+CODING AGENT -- HTTP / CLI --> PLAN + INPUT MANIFEST
+                                      |
+                         RUST POLICY / LINEAGE / APPROVAL
+                              |                 |
+                          SIMULATOR           RUNTIME
+                        counterexample          |
+                                         PUBLICATION GATE
+                                                |
+                                         BRANCH + DRAFT PR
+
+HYDRADB: sources -> permissions -> captured generation -> patch -> approval -> outcome
+```
+
+HydraDB is a required evidence store and readback dependency. Rust evaluates
+permissions and exact bindings; a durable runtime journal tracks publication
+attempts. GitHub credentials remain in the gateway, outside the generated code's
+execution sandbox. This controls the brokered workflow; it cannot constrain an
+external agent that independently holds GitHub credentials or unseen context.
+
+[Five-minute walkthrough](docs/hackathon-walkthrough.md) ·
+[Live setup and limits](docs/live-workspace.md) ·
+[Film and production sources](media/trustgraph-film/README.md)
+
+Earlier offline fixtures remain available through `serve`, the bounded state
+checker through `check-model`, and the fixture MCP bridge through `mcp`. These
+are separate development paths. The live coding-agent integration currently
+uses HTTP/CLI; a live MCP transport and Composio adapter remain future work.
+
+## Verification
+
+```sh
 cargo test --workspace --locked
-cargo run --locked -p trustgraph-cli -- simulate --seed 0 --count 64 --output /tmp/trustgraph-campaign.json
-cargo run --locked -p trustgraph-cli -- replay /tmp/trustgraph-campaign.json
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo fmt --all --check
 ```
 
-`check-model` exhausts the declared finite abstraction within its depth bound.
-The depth-6 normal run explores 103 nonterminal states and 624 transitions. Use
-`--broken-rule` to demonstrate a counterexample; this command intentionally exits
-with status 1 when a violation is found. It does not mutate production policy.
-
-`simulate` runs all eight seeded scenarios by default. Select one with, for example,
-`--scenario acl-race`. Scenarios cover the complete demo, ACL and revocation
-ordering, ambiguous provider acknowledgment and restart, journal uncertainty,
-approval expiry, audience changes and policy changes. See [simulator details](docs/simulator.md)
-and the [verification record](evidence/README.md).
-
-## Workspace
-
-| Crate | Responsibility |
-| --- | --- |
-| `trustgraph-core` | Typed plan compiler and repairs; schema/lineage checks, finite reader policy, approval binding and replay |
-| `trustgraph-runtime` | Trusted generation, append-only storage, effect coordinator, simulated publisher and Hydra projection |
-| `trustgraph-sim` | Exhaustive finite checker plus reproducible virtual schedules and declared faults over the runtime |
-| `trustgraph-cli` | CLI, loopback Axum API and embedded HTML/CSS/JavaScript review desk |
-
-Exact text hashes use SHA-256 over UTF-8 bytes. Structured hashes use compact
-sorted-key JSON, ordered arrays, explicit null fields, integer timestamps and a
-domain/schema envelope. Artifacts never change in place. A source's current ACL
-pointer can advance while previous ACL revisions remain historical evidence.
-
-The publication lock covers current verification, persisted reservation,
-persisted dispatch, provider call and observed outcome. Repeated keys return the
-same logical operation; using the key with different context conflicts. An
-uncertain operation is reconciled by lookup and is never resent automatically.
-An operation left reserved at recovery is confirmed unsent; one left dispatching
-becomes unknown. A corrupt or torn journal blocks startup.
-
-## Hydra
-
-The live workspace requires the authenticated hosted HydraDB graph for input
-retrieval, lineage validation and authorization evidence. The older fixture server
-uses the local journal with an optional standalone Hydra projection. [Hydra setup and qualification](docs/hydra.md)
-documents the real roundtrip command and its remaining checks.
-
-## Scope
-
-The fixture workflow is a synthetic development MVP. The live workspace has the
-[narrow execution scope](docs/live-workspace.md#real-execution-and-current-scope)
-described separately. Neither is a production security certification.
-The fixed generation template demonstrates provenance plumbing, not goal understanding or LLM behavior. Plan goals are descriptive metadata; the compiler does not infer actions from natural language. The virtual
-scheduler controls commands and modeled faults, not arbitrary threads or network
-packets. Export digests detect inconsistent edits; without signatures and a trusted
-collector they do not prevent an adversary from rewriting an entire history.
-Historical replay explains recorded authorization at recorded time. It grants no
-current publishing permission and cannot recall content already delivered.
-
-No Hydra engine source is embedded or relicensed here. Application licensing has
-not been selected. Choose it separately before distribution.
+The local suite passes 85 tests, with one standalone-Hydra contract test requiring
+an explicitly configured external fixture. The separate live rehearsal qualifies
+the hosted Hydra path. [Current qualification](docs/live-qualification.md) records
+the real agent, stale-approval check and actual draft PR.

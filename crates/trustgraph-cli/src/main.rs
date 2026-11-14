@@ -25,7 +25,7 @@ enum Command {
         case: PathBuf,
         #[arg(long)]
         policy: Option<PathBuf>,
-        #[arg(long, default_value = "http://127.0.0.1:9080")]
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
         url: String,
         #[arg(long, default_value = ".trustgraph-live/state/agent-token")]
         token_file: PathBuf,
@@ -40,7 +40,9 @@ enum Command {
     Run {
         #[arg(long)]
         goal: String,
-        #[arg(long, default_value = "http://127.0.0.1:9080")]
+        #[arg(long)]
+        include_risk: bool,
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
         url: String,
         #[arg(long, default_value = ".trustgraph-live/state/agent-token")]
         token_file: PathBuf,
@@ -49,7 +51,7 @@ enum Command {
     Start {
         #[arg(long, default_value = "trustgraph.local.json")]
         config: PathBuf,
-        #[arg(long, default_value_t = 9080)]
+        #[arg(long, default_value_t = 8080)]
         port: u16,
     },
     /// Compile a typed plan against the synthetic Northstar source snapshot.
@@ -179,6 +181,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
             if let Some(policy) = policy {
                 request["policy"] = serde_json::from_slice(&std::fs::read(policy)?)?;
             }
+            let token_file = if token_file == Path::new(".trustgraph-live/state/agent-token") {
+                std::fs::read("trustgraph.local.json")
+                    .ok()
+                    .and_then(|bytes| {
+                        serde_json::from_slice::<trustgraph_live::Config>(&bytes).ok()
+                    })
+                    .map(|config| config.directory.join("agent-token"))
+                    .unwrap_or(token_file)
+            } else {
+                token_file
+            };
             let token = std::fs::read_to_string(token_file)?;
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(60))
@@ -233,6 +246,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         Command::Run {
             goal,
+            include_risk,
             url,
             token_file,
         } => {
@@ -246,6 +260,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
             {
                 return Err("agent API must be a local HTTP URL".into());
             }
+            let token_file = if token_file == Path::new(".trustgraph-live/state/agent-token") {
+                std::fs::read("trustgraph.local.json")
+                    .ok()
+                    .and_then(|bytes| {
+                        serde_json::from_slice::<trustgraph_live::Config>(&bytes).ok()
+                    })
+                    .map(|config| config.directory.join("agent-token"))
+                    .unwrap_or(token_file)
+            } else {
+                token_file
+            };
             let token = std::fs::read_to_string(token_file)?;
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
@@ -254,7 +279,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let response = client
                 .post(format!("{}/api/work", url.trim_end_matches('/')))
                 .bearer_auth(token.trim())
-                .json(&serde_json::json!({"goal":goal}))
+                .json(&serde_json::json!({"goal":goal,"include_risk":include_risk}))
                 .send()
                 .await?;
             let status = response.status();
@@ -294,7 +319,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let stage = job["status"].as_str().unwrap_or("");
                 if !["queued", "running"].contains(&stage) {
                     println!(
-                        "Status: {stage}\nReview: {}/#/agent/{id}",
+                        "Status: {stage}\nReview: {}/agent/{id}",
                         url.trim_end_matches('/')
                     );
                     if stage == "blocked" || stage == "interrupted" {

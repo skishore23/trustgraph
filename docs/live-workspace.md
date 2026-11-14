@@ -1,154 +1,129 @@
-# Live policy workspace
+# Live bank workspace
 
-Open `http://127.0.0.1:9080/`. The three views are **Policy**, **Simulator** and
-**Agent**. A policy is a set of business rules and settings. Allowed files,
-maximum changed files, required test results and approval lifetime are editable.
-The [hackathon walkthrough](hackathon-walkthrough.md) provides a five-minute
-story, exact screen actions, a 14-case rehearsal suite and a Codex trial prompt.
+The app has three pages: **Workspace** runs/reviews the agent, **Policy** sets
+access and execution conditions, **Simulator** compares policy changes across
+hypothetical cases. All use the same Rust evaluator. No page is named Demo and
+appearance is fixed ASCII. Routes are `/`, `/policy`, `/simulator` and `/agent/{id}`.
 
-Source restrictions, captured lineage and exact approval binding are always
-enforced by the Rust engine; they are not repeated in each policy.
+## Setup
 
-The currently configured workbench is a dedicated private repository:
-https://github.com/skishore23/trustgraph-agent-workbench. Its `valid_amount`
-function rejects zero-value authorizations. The work order asks Codex to fix that
-bug and add a regression test. The other inputs are committed TrustGraph code and
-documentation. These are real repositories and actual model/test executions;
-there is no confidential bank investigation in this live workspace.
+Requirements: authenticated `hydradb`, `codex` and `gh` CLIs, Rust, macOS
+`sandbox-exec`. Credentials remain local. Never commit tokens, transcripts or
+runtime state. Use a dedicated private GitHub repository with its sole personal
+owner; the publisher checks privacy/collaborators before sending. It will not
+publish into an arbitrary shared or public repository.
 
-## Start and submit work
-
-Requirements: Rust, authenticated `hydradb`, `codex` and `gh` CLIs; macOS
-`sandbox-exec` for the isolated Rust runner. Credentials are read locally. Do not
-commit local configuration, tokens, model transcripts or runtime state.
-
-Create `trustgraph.local.json` with absolute paths:
+The current target is `skishore23/trustgraph-agent-workbench`. Its `main` remains
+unchanged for repeatable runs. Initialize another target with the same small
+Rust fixture if needed, then set it explicitly in the local config. Existing
+state namespaces must not be repurposed for different audiences.
 
 ```json
 {
-  "directory": "/absolute/TrustGraph/.trustgraph-live/state",
+  "directory": "/absolute/TrustGraph/.trustgraph-live/bank",
   "context_repository": "/absolute/TrustGraph",
-  "context_files": ["README.md", "crates/trustgraph-core/src/verifier.rs"],
+  "context_files": [
+    "examples/bankcase/engineering-requirements.md",
+    "examples/bankcase/risk-investigation.md",
+    "examples/bankcase/approved-specification.md"
+  ],
   "target_repository": "/absolute/TrustGraph/.trustgraph-live/workbench",
-  "github_repository": "skishore23/trustgraph-agent-workbench"
+  "github_repository": "skishore23/trustgraph-agent-workbench",
+  "departments": true
 }
 ```
 
-```sh
-cargo run --locked -p trustgraph-cli -- start --port 9080
-```
-
-On first use, open `.trustgraph-live/state/operator.html` to sign in. This private
-local launch file exchanges an operator token for an HttpOnly session, then removes
-the token from the URL. Merely opening the app grants no review permissions.
-
-Then use the Agent form or a second terminal:
+Save as ignored `trustgraph.local.json`. Source imports read committed Git bytes;
+commit controlled source material before starting. Only one server may own a
+state directory. `departments: true` creates the `bank-departments` evidence
+namespace; earlier personal-workbench histories stay in their original directory.
 
 ```sh
-cargo run --locked -p trustgraph-cli -- run \
-  --url http://127.0.0.1:9080 \
-  --goal "Fix valid_amount to accept zero, reject negatives, and add a zero regression test"
+cargo run --locked -p trustgraph-cli -- start
 ```
 
-The CLI uses `.trustgraph-live/state/agent-token`, streams actual activity and
-stops when review is required. The agent token can submit/read work and compare candidate policies in the
-simulator. It cannot approve, activate policy or publish. Another agent or 8090 can call the same HTTP intake:
-`POST /api/work` with `Authorization: Bearer <agent token>` and a JSON `goal`.
-This delegates generation to the controlled fresh Codex broker. It does not
-accept a caller's claim that an arbitrary patch has trustworthy provenance. The
-older MCP bridge targets the synthetic workspace and is not a live-workspace
-MCP integration.
+Open the printed private `operator.html` file once. It establishes an HttpOnly,
+SameSite local session and clears the launch fragment. The browser root itself
+does not grant operator authority. Then use `http://127.0.0.1:8080/`.
 
-## Walkthrough
-
-1. **Policy:** allow only `src/lib.rs`, one changed file, passing tests and a
-   30-minute approval. Test an unsaved candidate or save a new active version.
-2. **Simulator:** edit a candidate policy or import supported JSON. Compare the
-   same proposed change against active and candidate policies. Presets cover code
-   + docs, failed tests, changed patches/policies, missing inputs and expiry.
-   Results separate information flow, business rules and approval, with concrete
-   failure paths and zero publication effects. Nothing is activated. Custom safe
-   relative paths are supported here; the live runner retains its two-file scope.
-3. **Agent:** submit the work order. See the actual code before/after, captured
-   plan/input manifest, provider metadata, isolated test output and live activity.
-4. Review the exact patch, then **Approve exact change**. **Run publication gate**
-   checks live Hydra evidence and current Rust authorization. The default action
-   is simulated; no branch or PR is created.
-
-Policy changes invalidate the authorization context. Existing work must be
-regenerated under the active business policy. An approval of an older patch is
-not permission for a changed patch. Human approval cannot override missing
-lineage or a source-access violation.
-
-## HydraDB is on the decision path
-
-The hosted adapter uses the authenticated HydraDB BYOG API, database selected by
-`hydradb`, collection `trustgraph-governance`. The BYOG graph supplies the actual
-source bytes to the generation broker. The current source snapshot comprises two
-committed TrustGraph files and three workbench files, not an entire repository. Content fingerprints and exact incoming
-`USED_AS_INPUT` relationships are read back before review and effects.
-
-The five captured source documents were also registered explicitly in HydraDB
-**Knowledge**, using the same source IDs. Knowledge ingestion is optional and is
-not performed automatically on startup. In the Hydra dashboard select database
-`trustgraph`, collection `trustgraph-governance`. Knowledge indexing is asynchronous;
-`queued` does not mean searchable. The BYOG governance graph and the Knowledge
-source list are separate namespaces, and the graph record count is not a Knowledge
-source count. The app shows registration status separately for each captured file.
-
-Sources, prompts, plans, policies, generated artifacts, manifests, test receipts,
-approvals, simulator results and gate outcomes have content-addressed records.
-After approval the adapter also writes and reads back the normalized evidence
-projection: principals, source ACLs, artifacts, transformation input occurrences,
-audiences, policy, exact approval context and bundle, joined by typed relations.
-Each authorization snapshot has its own namespace so later snapshots do not
-change an earlier snapshot's relationship set. Historical replay validates the
-snapshot; the Rust coordinator separately checks current authorization.
-
-HydraDB being unavailable or evidence/relationships failing validation stops the
-path. The local journal persists reservations and current coordinator state;
-it is not a substitute for the live graph checks. The graph database does not
-execute the permission rules itself.
-
-## Real execution and current scope
-
-A fresh Codex turn has external tools disabled, no resumed session, no repository
-instructions and only the broker-supplied input bytes. The broker rejects tool
-activity or failed/incomplete turns. It captures the prompt, schema, input
-manifest and provider result. This checks the modeled input boundary; it is not
-a proof about the model's training data or the semantic correctness of code.
-
-The host compiles and executes the returned `src/lib.rs` tests with `rustc --test`
-in a macOS sandbox. No network or home-directory file contents are allowed.
-Compilation, tests and model execution have time and output bounds. This narrow
-runner intentionally supports no dependencies or build scripts. The initial
-policy supports `src/lib.rs` and `README.md`, rather than arbitrary repositories.
-
-The live audience is the sole owner of a private personal GitHub repository.
-Local operator authentication is separate from agent authentication. This is not
-organization IAM, automatic department ACL import or multi-user approval.
-The bank's Engineering/Risk story remains a separate synthetic fixture.
-
-An optional server-owned GitHub provider exists behind the explicit real-draft-PR
-control. It rechecks the private repository's readers, exact payload and base,
-records an attempt before writes and never blindly retries an uncertain effect.
-The default walkthrough does not invoke it. Composio is not configured or
-live-qualified. The standalone Hydra protocol adapter and its separately ignored
-contract test remain independent from this hosted integration.
-
-## Test policies from Codex
+## Agent intake
 
 ```sh
-python3 scripts/hackathon-check.py
-cargo run --locked -p trustgraph-cli -- policy-simulate \
-  --case examples/payment-change.json \
-  --policy examples/payment-policy-expanded.json \
-  --expect allowed
+cargo run --locked -p trustgraph-cli -- run --include-risk \
+  --goal "$(cat examples/bankcase/work-order.txt)"
 ```
 
-The CLI uses the restricted agent token and prints active/candidate outcomes.
-`--json` returns full evidence; `--output FILE` writes it; `--expect` verifies a
-verdict for scripts. Supported policy fields are `name`, `allowed_paths`,
-`max_changed_files`, `require_tests` and `approval_minutes`. Approval assumptions
-are `valid`, `missing`, `stale`, `previous_policy` and `expired`. This is a typed
-policy experiment, not an arbitrary English policy interpreter or code runner.
+The CLI resolves the restricted agent token from the configured state directory.
+It streams actual generation/test stages; the Risk-context case ends blocked.
+Omit `--include-risk` for approved sources only, or use the app's fresh repair.
+8090 can call `POST /api/work` with `{ "goal": "<admitted work order>",
+"include_risk": true }` and the restricted Bearer token. Generation is performed
+by TrustGraph's controlled fresh Codex broker. Caller-provided patches or claims
+of complete lineage are not accepted.
+
+An agent may trigger the committed `examples/bankcase/work-order.txt` task or an
+exact task previously admitted by the operator. It cannot invent a new public
+input by putting previously restricted material in a freeform goal. New human
+work orders can be submitted in the operator UI. Repairs retain that admitted
+goal and start a fresh model turn with the investigation and old patch excluded.
+
+The live integration is HTTP/CLI. The existing fixture MCP bridge targets the
+older offline app and must not be presented as this live transport. A general
+external agent with unseen context/direct GitHub credentials remains outside
+this enforcement boundary.
+
+## Evidence and publication
+
+HydraDB `trustgraph` / BYOG `trustgraph-governance` stores source bytes, source
+permissions, goals, plans, prompts, manifests, generated artifacts, checks,
+approvals, normalized authorization graphs and publication receipts. Before
+approval/publication the runtime reads back exact content, parent sets and
+current permission evidence. Knowledge indexing is optional browsing support;
+its status is separate from required governance graph writes/readbacks.
+
+Rust checks inheritance, captured lineage and exact context. GitHub's real
+adapter revalidates the configured repository readers, unchanged base commit,
+checked patch digest and exact file bytes. It journals intent before mutation,
+creates a branch and draft PR and records an actual receipt in HydraDB. An
+uncertain outcome is never blindly resent. No simulated publisher is exposed as
+the live app's release action. `/gate` delegates to this same real publisher.
+
+The operator may approve, revise the actual patch (tests rerun and approval
+becomes stale), approve again, then **Publish draft PR**. Publication requires
+both current authorization and Hydra-recorded approval. Review cannot bypass
+source restrictions. No PR is merged automatically.
+
+## Simulator
+
+Supported fields: `name`, exact `allowed_paths`, `max_changed_files`,
+`require_tests`, `approval_minutes`, and
+`departments.investigation_readers` (`risk` always; `engineering` optional).
+A source grant is an explicit source-owner policy change, not a human review
+exception. Unknown fields, unsupported readers and arbitrary English rules fail
+validation. The simulator accepts safe custom file paths; the live runner is
+currently limited to `src/lib.rs` and `README.md`.
+
+Scenario fields include Risk input, Engineering/Risk audience, test outcome,
+manifest completeness, approval age and missing/stale/expired approval. Active
+and candidate decisions are compared for the same hypothetical inputs. **Run all
+scenarios** evaluates eight cases in the UI. The CLI rehearsal evaluates sixteen,
+including additional policy variants:
+
+```sh
+python3 scripts/bank-policy-rehearsal.py
+```
+
+Simulation makes no GitHub writes, activates no policy and executes no proposed
+code. Its inputs, candidate policy and results are persisted in HydraDB. Actual
+agent work executes its own real tests and still requires current authorization.
+
+## Boundaries
+
+Bank documents are controlled test material. Department permissions are explicit
+configured identities, not imported enterprise IAM. The local owner is trusted
+to admit inputs and is authorized to read Risk material. This is one local
+workspace, without multitenancy or enterprise SSO. The model runner disables
+external tools, uses a fresh turn and cannot publish. Tests run with filesystem
+and network restrictions. These controls check modeled lineage/access, not code
+correctness or an absolute absence of secrets. Composio is not configured; real
+publication currently uses `gh`-authenticated GitHub API calls.

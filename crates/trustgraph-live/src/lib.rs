@@ -37,6 +37,8 @@ pub struct Config {
     pub context_files: Vec<String>,
     pub target_repository: PathBuf,
     pub github_repository: String,
+    #[serde(default)]
+    pub departments: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -46,6 +48,13 @@ pub struct WorkPolicy {
     pub max_changed_files: usize,
     pub require_tests: bool,
     pub approval_minutes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub departments: Option<DepartmentPolicy>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DepartmentPolicy {
+    pub investigation_readers: Vec<String>,
 }
 impl Default for WorkPolicy {
     fn default() -> Self {
@@ -55,11 +64,29 @@ impl Default for WorkPolicy {
             max_changed_files: 1,
             require_tests: true,
             approval_minutes: 30,
+            departments: None,
         }
     }
 }
 impl WorkPolicy {
     fn validate(&self) -> Result<()> {
+        if let Some(policy) = &self.departments
+            && (!policy.investigation_readers.iter().any(|r| r == "risk")
+                || policy
+                    .investigation_readers
+                    .iter()
+                    .any(|r| !["risk", "engineering"].contains(&r.as_str()))
+                || policy
+                    .investigation_readers
+                    .iter()
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    != policy.investigation_readers.len())
+        {
+            return Err(err(
+                "investigation readers must include its Risk owner; supported audiences are risk and engineering",
+            ));
+        }
         if self.name.trim().is_empty()
             || self.name.len() > 100
             || !(1..=10).contains(&self.max_changed_files)
@@ -151,6 +178,10 @@ struct SourceRecord {
     graph_id: String,
     #[serde(default)]
     knowledge_status: String,
+    #[serde(default)]
+    restricted: bool,
+    #[serde(default)]
+    permissions_graph: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Job {
@@ -176,9 +207,15 @@ struct Job {
     approval_graph: Option<String>,
     #[serde(default)]
     authorization_graph: Option<String>,
+    #[serde(default)]
+    include_risk: bool,
+    #[serde(default)]
+    repair_of: Option<String>,
 }
 #[derive(Serialize, Deserialize, Default)]
 struct Saved {
+    #[serde(default)]
+    admitted_work_orders: BTreeSet<String>,
     jobs: Vec<Job>,
     policy: WorkPolicy,
     sources: Vec<SourceRecord>,
@@ -312,6 +349,100 @@ fn genesis(repo: &str) -> Evidence {
         revoked: BTreeSet::new(),
     }
 }
+fn department_policy() -> WorkPolicy {
+    WorkPolicy {
+        name: "Engineering and Risk sharing".into(),
+        departments: Some(DepartmentPolicy {
+            investigation_readers: vec!["risk".into()],
+        }),
+        ..WorkPolicy::default()
+    }
+}
+fn genesis_for(repo: &str, departments: bool) -> Evidence {
+    let mut evidence = genesis(repo);
+    if departments {
+        let workspace: WorkspaceId = "bank-departments".into();
+        evidence.workspace = workspace.clone();
+        evidence.policy.workspace = workspace.clone();
+        for principal in evidence.principals.values_mut() {
+            principal.workspace = workspace.clone();
+        }
+        for audience in evidence.audiences.values_mut() {
+            audience.workspace = workspace.clone();
+        }
+        evidence.principals.insert(
+            "engineering".into(),
+            Principal {
+                id: "engineering".into(),
+                workspace: workspace.clone(),
+                role: Role::Human,
+                enabled: true,
+            },
+        );
+        evidence
+            .audiences
+            .get_mut(&AudienceId::from("repository"))
+            .expect("repository")
+            .recipients = BTreeSet::from(["engineering".into()]);
+        evidence.audiences.insert(
+            "risk-room".into(),
+            Audience {
+                id: "risk-room".into(),
+                workspace,
+                destination: "risk://internal-review".into(),
+                revision: 1,
+                recipients: BTreeSet::from(["owner".into()]),
+                resolved: true,
+            },
+        );
+        evidence.policy.configuration =
+            Some(digest::structured("work-policy", &department_policy()));
+    }
+    evidence
+}
+fn source_readers(policy: &WorkPolicy, restricted: bool) -> Readers {
+    let mut readers = BTreeSet::from(["owner".into(), "agent".into()]);
+    if policy
+        .departments
+        .as_ref()
+        .is_some_and(|p| !restricted || p.investigation_readers.iter().any(|r| r == "engineering"))
+    {
+        readers.insert("engineering".into());
+    }
+    readers
+}
+fn apply_source_policy(gate: &mut Gate, source: &SourceRecord, policy: &WorkPolicy) -> Result<()> {
+    let current = gate
+        .state()
+        .evidence
+        .sources
+        .get(&SourceId(source.id.0.clone()))
+        .ok_or_else(|| err("source missing"))?;
+    let readers = source_readers(policy, source.restricted);
+    if gate.state().evidence.acls[&current.acl].readers == readers {
+        return Ok(());
+    }
+    let source_id = current.id.clone();
+    let key = digest::structured(
+        "source-permission",
+        &(
+            source_id.clone(),
+            policy,
+            gate.state().evidence.policy.revision,
+        ),
+    );
+    gate.change_acl(&"owner".into(), &source_id, readers, &key.0)?;
+    Ok(())
+}
+fn source_permission(gate: &Gate, id: &ArtifactId) -> Result<Value> {
+    let source = gate
+        .state()
+        .evidence
+        .sources
+        .get(&SourceId(id.0.clone()))
+        .ok_or_else(|| err("source missing"))?;
+    Ok(json!({"source":source,"acl":gate.state().evidence.acls[&source.acl]}))
+}
 impl Workspace {
     fn save(&self) -> Result<()> {
         atomic(&self.config.directory.join("work.json"), &self.saved)
@@ -332,7 +463,11 @@ impl Workspace {
             &"owner".into(),
             id.clone(),
             content,
-            BTreeSet::from(["owner".into(), "agent".into()]),
+            if self.config.departments {
+                BTreeSet::from(["owner".into(), "engineering".into(), "agent".into()])
+            } else {
+                BTreeSet::from(["owner".into(), "agent".into()])
+            },
         )?;
         Ok(self.gate.state().evidence.artifacts[&id].clone())
     }

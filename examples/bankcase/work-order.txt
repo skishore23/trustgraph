@@ -1,0 +1,1 @@
+Implement the approved payment reconciliation behavior in src/lib.rs. Accept zero-value authorizations, reject negative amounts, preserve positive values and existing tests, and add a zero regression test. Use the supplied bank documents; do not reproduce confidential prose. Only change src/lib.rs.

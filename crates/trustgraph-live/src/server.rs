@@ -81,9 +81,21 @@ pub async fn router(config: Config) -> Result<Router> {
     let mut saved: Saved = if saved_path.exists() {
         serde_json::from_slice(&fs::read(saved_path)?)?
     } else {
-        Saved::default()
+        Saved {
+            policy: if config.departments {
+                department_policy()
+            } else {
+                WorkPolicy::default()
+            },
+            ..Saved::default()
+        }
     };
     saved.policy.validate_live()?;
+    if config.departments != saved.policy.departments.is_some() {
+        return Err(err(
+            "use a separate state directory for the department workspace",
+        ));
+    }
     for job in &mut saved.jobs {
         if ["queued", "running"].contains(&job.status.as_str()) {
             job.status = "interrupted".into();
@@ -96,9 +108,14 @@ pub async fn router(config: Config) -> Result<Router> {
             &config.github_repository,
             config.directory.join("publisher"),
         )?,
-        genesis(&config.github_repository),
+        genesis_for(&config.github_repository, config.departments),
     )?;
-    if gate.state().evidence.workspace.0 != "repository-work"
+    if gate.state().evidence.workspace.0
+        != if config.departments {
+            "bank-departments"
+        } else {
+            "repository-work"
+        }
         || gate.state().evidence.audiences[&AudienceId::from("repository")].destination
             != format!("github://{}/pulls", config.github_repository)
         || gate.state().evidence.policy.configuration
@@ -142,13 +159,28 @@ pub async fn router(config: Config) -> Result<Router> {
             .knowledge_status(&a.id.0)
             .await
             .unwrap_or_else(|_| "status unavailable".into());
-        sources.push(SourceRecord {
+        let mut record = SourceRecord {
             id: a.id,
+            restricted: w.config.departments && path.contains("/risk-investigation.md@"),
             path,
             hash: a.hash,
             graph_id,
             knowledge_status,
-        });
+            permissions_graph: None,
+        };
+        if w.config.departments {
+            apply_source_policy(&mut w.gate, &record, &w.saved.policy)?;
+            record.permissions_graph = Some(
+                w.hydra
+                    .put(
+                        "source-permission",
+                        &source_permission(&w.gate, &record.id)?,
+                        std::slice::from_ref(&record.graph_id),
+                    )
+                    .await?,
+            );
+        }
+        sources.push(record);
     }
     w.hydra.put("policy", &w.saved.policy, &[]).await?;
     w.saved.sources = sources;
@@ -156,6 +188,10 @@ pub async fn router(config: Config) -> Result<Router> {
     let shared = Arc::new(Mutex::new(w));
     Ok(Router::new()
         .route("/", get(index))
+        .route("/agent", get(index))
+        .route("/policy", get(index))
+        .route("/simulator", get(index))
+        .route("/agent/{id}", get(index))
         .route("/api/session", post(session))
         .route(
             "/workspace.js",
@@ -178,6 +214,8 @@ pub async fn router(config: Config) -> Result<Router> {
         .route("/api/work", get(view).post(create))
         .route("/api/work/{id}/approve", post(approve))
         .route("/api/work/{id}/publish", post(publish))
+        .route("/api/work/{id}/repair", post(repair))
+        .route("/api/work/{id}/revise", post(revise))
         .route("/api/policy", post(policy))
         .route("/api/simulate", post(simulate))
         .route("/api/graph", get(graph))
@@ -266,19 +304,23 @@ fn job_view(w: &Workspace, j: &Job) -> Value {
         .operation
         .as_ref()
         .and_then(|id| w.gate.state().operations.get(id));
-    json!({"id":j.id,"goal":j.goal,"status":j.status,"created_at":j.created_at,"artifact":j.artifact,"change":j.change,"base_files":j.base_files,"error":j.error,"provider":j.provider,"graph_id":j.graph_id,"decision":decision,"context_digest":context,"violations":violations,"information_permitted":information_permitted,"operation":operation,"events":j.events,"plan":j.plan,"graph_approval_recorded":j.authorization_graph.is_some()&&j.approval_graph.is_some()})
+    json!({"id":j.id,"goal":j.goal,"status":j.status,"created_at":j.created_at,"artifact":j.artifact,"change":j.change,"base_files":j.base_files,"error":j.error,"provider":j.provider,"graph_id":j.graph_id,"decision":decision,"context_digest":context,"violations":violations,"information_permitted":information_permitted,"operation":operation,"events":j.events,"plan":j.plan,"graph_approval_recorded":j.authorization_graph.is_some()&&j.approval_graph.is_some(),"include_risk":j.include_risk,"repair_of":j.repair_of})
 }
 async fn view(State(s): State<Shared>, h: HeaderMap) -> WebResult {
     let w = lock(&s)?;
     authorized(&h, &w, false)?;
     Ok(Json(
-        json!({"repository":w.config.github_repository,"policy":w.saved.policy,"policy_revision":w.gate.state().evidence.policy.revision,"sources":w.saved.sources,"jobs":w.saved.jobs.iter().rev().map(|j|job_view(&w,j)).collect::<Vec<_>>(),"invariants":["Source permissions follow derived work","Approval binds the exact change and repository","Uncaptured input prevents publication"]}),
+        json!({"departments":w.config.departments,"repository":w.config.github_repository,"policy":w.saved.policy,"policy_revision":w.gate.state().evidence.policy.revision,"sources":w.saved.sources,"jobs":w.saved.jobs.iter().rev().map(|j|job_view(&w,j)).collect::<Vec<_>>(),"invariants":["Source permissions follow derived work","Approval binds the exact change and repository","Uncaptured input prevents publication"]}),
     ))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NewWork {
     goal: String,
+    #[serde(default)]
+    include_risk: bool,
+    #[serde(default)]
+    repair_of: Option<String>,
 }
 async fn create(State(s): State<Shared>, h: HeaderMap, Json(body): Json<NewWork>) -> WebResult {
     if body.goal.trim().is_empty() || body.goal.len() > 4000 {
@@ -288,10 +330,23 @@ async fn create(State(s): State<Shared>, h: HeaderMap, Json(body): Json<NewWork>
     {
         let mut w = lock(&s)?;
         authorized(&h, &w, false)?;
+        if w.config.departments {
+            let owner = authorized(&h, &w, true).is_ok();
+            let predefined = include_str!("../../../examples/bankcase/work-order.txt").trim();
+            if !owner
+                && body.goal != predefined
+                && !w.saved.admitted_work_orders.contains(&body.goal)
+            {
+                return Err(WebError("Agent work orders must match an operator-admitted task. Use examples/bankcase/work-order.txt, or submit the new task as the operator in Workspace first. An agent cannot declare new input text public.".into()));
+            }
+            if owner {
+                w.saved.admitted_work_orders.insert(body.goal.clone());
+            }
+        }
         if w.saved
             .jobs
             .iter()
-            .any(|j| ["queued", "running"].contains(&j.status.as_str()))
+            .any(|j| ["queued", "running", "revising"].contains(&j.status.as_str()))
         {
             return Err(WebError("one agent run is already active".into()));
         }
@@ -315,6 +370,8 @@ async fn create(State(s): State<Shared>, h: HeaderMap, Json(body): Json<NewWork>
             plan: Value::Null,
             approval_graph: None,
             authorization_graph: None,
+            include_risk: body.include_risk,
+            repair_of: body.repair_of,
         });
         w.save()?;
     }
@@ -343,10 +400,16 @@ async fn work(s: &Shared, id: &str) -> Result<()> {
             .ok_or_else(|| err("run missing"))?;
         j.status = "running".into();
         let goal = j.goal.clone();
+        let include_risk = j.include_risk;
         w.save()?;
         (
             w.hydra.clone(),
-            w.saved.sources.clone(),
+            w.saved
+                .sources
+                .iter()
+                .filter(|source| include_risk || !source.restricted)
+                .cloned()
+                .collect::<Vec<_>>(),
             w.config.clone(),
             w.saved.policy.clone(),
             goal,
@@ -362,16 +425,13 @@ async fn work(s: &Shared, id: &str) -> Result<()> {
     let policy_graph = hydra.put("policy", &policy, &[]).await?;
     let manifest: Vec<_> = sources.iter().map(|source| json!({"id":source.id,"path":source.path,"hash":source.hash,"graph_id":source.graph_id})).collect();
     let plan = json!({"goal":goal,"input_manifest":manifest,"policy_fingerprint":digest::structured("work-policy",&policy),"repository":config.github_repository,"base_commit":base,"steps":["load registered inputs","generate changed files","run isolated Rust checks","require exact human approval","check publication gate"]});
-    let plan_graph = hydra
-        .put(
-            "plan",
-            &plan,
-            &sources
-                .iter()
-                .map(|s| s.graph_id.clone())
-                .collect::<Vec<_>>(),
-        )
-        .await?;
+    let source_parents: Vec<_> = sources
+        .iter()
+        .flat_map(|source| {
+            std::iter::once(source.graph_id.clone()).chain(source.permissions_graph.clone())
+        })
+        .collect();
+    let plan_graph = hydra.put("plan", &plan, &source_parents).await?;
     {
         let mut w = lock(s)?;
         if let Some(j) = w.saved.jobs.iter_mut().find(|j| j.id == id) {
@@ -389,6 +449,15 @@ async fn work(s: &Shared, id: &str) -> Result<()> {
     let mut material = Vec::new();
     let mut base_files = Vec::new();
     for source in &sources {
+        if let Some(permission) = &source.permissions_graph {
+            let actual: Value = serde_json::from_str(&hydra.get(permission).await?)?;
+            let expected = { source_permission(&lock(s)?.gate, &source.id)? };
+            if actual != expected {
+                return Err(err(
+                    "HydraDB source permission no longer matches the current authority",
+                ));
+            }
+        }
         let a: Artifact = serde_json::from_str(&hydra.get(&source.graph_id).await?)?;
         if a.id != source.id
             || a.hash != source.hash
@@ -435,8 +504,29 @@ async fn work(s: &Shared, id: &str) -> Result<()> {
         "{prompt}\n\nRecorded execution plan:\n{}",
         serde_json::to_string(&plan)?
     );
-    let prompt_artifact = { lock(s)?.import(&format!("work-order/{id}"), prompt.clone())? };
-    let prompt_graph = hydra.put("source", &prompt_artifact, &[]).await?;
+    let (goal_artifact, prompt_artifact) = {
+        let mut w = lock(s)?;
+        let goal_artifact = w.import(&format!("work-order/{id}"), goal.clone())?;
+        inputs.push(goal_artifact.id.clone());
+        let prompt_id = ArtifactId(format!("prompt-{id}"));
+        w.gate.record_broker_output(
+            &"agent".into(),
+            prompt_id.clone(),
+            inputs.clone(),
+            prompt.clone(),
+            "captured-prompt-assembly",
+        )?;
+        (
+            goal_artifact,
+            w.gate.state().evidence.artifacts[&prompt_id].clone(),
+        )
+    };
+    let goal_graph = hydra.put("source", &goal_artifact, &[]).await?;
+    let mut prompt_parents = source_parents.clone();
+    prompt_parents.extend([goal_graph.clone(), plan_graph.clone(), policy_graph.clone()]);
+    let prompt_graph = hydra
+        .put("captured-prompt", &prompt_artifact, &prompt_parents)
+        .await?;
     inputs.push(prompt_artifact.id.clone());
     let dir = config.directory.join("runs").join(id);
     fs::create_dir_all(&dir)?;
@@ -468,7 +558,7 @@ async fn work(s: &Shared, id: &str) -> Result<()> {
         )?;
         w.gate.state().evidence.artifacts[&aid].clone()
     };
-    let mut parents: Vec<_> = sources.iter().map(|s| s.graph_id.clone()).collect();
+    let mut parents = source_parents.clone();
     parents.push(prompt_graph.clone());
     parents.push(plan_graph.clone());
     parents.push(policy_graph.clone());
@@ -541,12 +631,15 @@ async fn work(s: &Shared, id: &str) -> Result<()> {
         .iter()
         .map(|s| (s.graph_id.clone(), vec![]))
         .collect();
-    graph_edges.insert(prompt_graph.clone(), vec![]);
+    for source in &sources {
+        if let Some(permission) = &source.permissions_graph {
+            graph_edges.insert(permission.clone(), vec![source.graph_id.clone()]);
+        }
+    }
+    graph_edges.insert(goal_graph, vec![]);
+    graph_edges.insert(prompt_graph.clone(), prompt_parents);
     graph_edges.insert(policy_graph.clone(), vec![]);
-    graph_edges.insert(
-        plan_graph,
-        sources.iter().map(|s| s.graph_id.clone()).collect(),
-    );
+    graph_edges.insert(plan_graph, source_parents);
     graph_edges.insert(raw_graph.clone(), parents);
     graph_edges.insert(checked_graph.clone(), vec![raw_graph]);
     graph_edges.insert(graph_id.clone(), final_parents);
@@ -565,13 +658,21 @@ async fn work(s: &Shared, id: &str) -> Result<()> {
         .policy
         .violations(&change.files, Some(&change.checks));
     let changed_policy = w.saved.policy != policy;
+    let flow_allowed = matches!(
+        verify(
+            &w.gate.state().evidence,
+            &w.intent(&artifact.id, "owner"),
+            now()
+        ),
+        Decision::PendingApproval { .. } | Decision::Ready { .. }
+    );
     let j = w
         .saved
         .jobs
         .iter_mut()
         .find(|j| j.id == id)
         .ok_or_else(|| err("run missing"))?;
-    j.status = if failures.is_empty() && !changed_policy {
+    j.status = if failures.is_empty() && !changed_policy && flow_allowed {
         "awaiting_review"
     } else {
         "blocked"
@@ -579,6 +680,8 @@ async fn work(s: &Shared, id: &str) -> Result<()> {
     .into();
     j.error = if changed_policy {
         Some("Policy changed during generation. Run again under the active policy.".into())
+    } else if !flow_allowed {
+        Some("Risk investigation -> captured generation -> proposed patch -> Engineering repository. Engineering is not permitted to read the Risk-only input. Human approval cannot override source access.".into())
     } else if failures.is_empty() {
         None
     } else {
@@ -598,6 +701,122 @@ async fn work(s: &Shared, id: &str) -> Result<()> {
 #[serde(deny_unknown_fields)]
 struct Review {
     context_digest: Digest,
+}
+async fn repair(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    RoutePath(id): RoutePath<String>,
+) -> WebResult {
+    let goal = {
+        let w = lock(&s)?;
+        authorized(&h, &w, false)?;
+        let old = w
+            .saved
+            .jobs
+            .iter()
+            .find(|j| j.id == id)
+            .ok_or_else(|| err("work missing"))?;
+        if !old.include_risk {
+            return Err(WebError(
+                "this run already used approved inputs only".into(),
+            ));
+        }
+        old.goal.clone()
+    };
+    create(
+        State(s),
+        h,
+        Json(NewWork {
+            goal,
+            include_risk: false,
+            repair_of: Some(id),
+        }),
+    )
+    .await
+}
+async fn revise(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    RoutePath(id): RoutePath<String>,
+    Json(body): Json<Review>,
+) -> WebResult {
+    let (config, mut change, base, old, parent, hydra) = {
+        let mut w = lock(&s)?;
+        authorized(&h, &w, true)?;
+        let artifact = preflight(&w, &id)?;
+        let decision = verify(
+            &w.gate.state().evidence,
+            &w.intent(&artifact, "owner"),
+            now(),
+        );
+        if !matches!(decision, Decision::Ready { .. })
+            || decision.context().map(Context::digest) != Some(body.context_digest)
+        {
+            return Err(WebError(
+                "approve the exact current patch before testing a revision".into(),
+            ));
+        }
+        let j = w
+            .saved
+            .jobs
+            .iter()
+            .find(|j| j.id == id)
+            .ok_or_else(|| err("work missing"))?;
+        if j.operation.is_some() {
+            return Err(WebError(
+                "published or uncertain work cannot be revised in place".into(),
+            ));
+        }
+        let values = (
+            w.config.clone(),
+            j.change.clone().ok_or_else(|| err("change missing"))?,
+            j.base_files.clone(),
+            artifact,
+            j.graph_id.clone().ok_or_else(|| err("graph missing"))?,
+            w.hydra.clone(),
+        );
+        let j = w.saved.jobs.iter_mut().find(|j| j.id == id).expect("job");
+        j.status = "revising".into();
+        w.save()?;
+        values
+    };
+    let result: Result<()> = async {
+        let file = change.files.iter_mut().find(|file| file.path == "src/lib.rs").ok_or_else(|| err("Rust file missing"))?;
+        file.content.push_str("\n// Reconciliation patch revised after the previous review.\n");
+        let hash = patch_digest(&change.repository, &change.base_commit, &change.files);
+        let files = change.files.clone();let dir = config.directory.join("runs").join(&id).join(format!("revision-{}",Uuid::new_v4()));
+        change.checks = tokio::task::spawn_blocking(move || runner::test(&files, &base, &dir, &hash)).await??;
+        if !change.checks.passed { return Err(err("revised patch tests failed")); }
+        let artifact = {
+            let mut w = lock(&s)?;
+            if change.policy != w.saved.policy { return Err(err("policy changed during revision")); }
+            let updated = w.gate.edit(&"owner".into(), &old, &serde_json::to_string(&change)?, &format!("revision-{}",Uuid::new_v4().simple()))?;
+            w.gate.state().evidence.artifacts[&updated].clone()
+        };
+        let check_graph = hydra.put("checks", &change.checks, std::slice::from_ref(&parent)).await?;
+        let parents = vec![parent.clone(),check_graph.clone()];
+        let graph = hydra.put("change", &artifact, &parents).await?;
+        let mut w = lock(&s)?;
+        if change.policy != w.saved.policy { return Err(err("policy changed during revision persistence")); }
+        let j = w.saved.jobs.iter_mut().find(|j|j.id == id).ok_or_else(|| err("work missing"))?;
+        if j.artifact.as_ref() != Some(&old) || j.status != "revising" { return Err(err("current patch changed during revision")); }
+        j.graph_edges.insert(check_graph, vec![parent]);j.graph_edges.insert(graph.clone(), parents);
+        j.artifact = Some(artifact.id);j.graph_id = Some(graph);j.change = Some(change);
+        j.approval_graph = None;j.authorization_graph = None;j.status = "awaiting_review".into();j.error = None;
+        j.events.push(json!({"at":now(),"stage":"revision","message":"Actual patch revised and Rust tests rerun; previous approval no longer matches"}));w.save()?;
+        Ok(())
+    }.await;
+    if let Err(error) = result {
+        if let Ok(mut w) = lock(&s) {
+            if let Some(j) = w.saved.jobs.iter_mut().find(|j| j.id == id) {
+                j.status = "revision_failed".into();
+                j.error = Some(error.to_string());
+            }
+            let _ = w.save();
+        }
+        return Err(WebError(error.to_string()));
+    }
+    Ok(Json(json!({"revised":true,"requires_new_approval":true})))
 }
 async fn graph_check(s: &Shared, id: &str) -> Result<()> {
     let (hydra, graph, expected, edges) = {
@@ -621,6 +840,28 @@ async fn graph_check(s: &Shared, id: &str) -> Result<()> {
             j.graph_edges.clone(),
         )
     };
+    let permissions = {
+        let w = lock(s)?;
+        w.saved
+            .sources
+            .iter()
+            .filter_map(|source| {
+                source
+                    .permissions_graph
+                    .as_ref()
+                    .map(|graph| (graph.clone(), source_permission(&w.gate, &source.id)))
+            })
+            .collect::<Vec<_>>()
+    };
+    for (graph, expected) in permissions {
+        let expected = expected?;
+        let actual: Value = serde_json::from_str(&hydra.get(&graph).await?)?;
+        if actual != expected {
+            return Err(err(
+                "live source permissions do not match the current authority",
+            ));
+        }
+    }
     for (id, parents) in &edges {
         hydra.validate_edges(id, parents).await?;
     }
@@ -664,6 +905,11 @@ fn preflight(w: &Workspace, id: &str) -> Result<ArtifactId> {
         .iter()
         .find(|j| j.id == id)
         .ok_or_else(|| err("work item missing"))?;
+    if ["revising", "revision_failed"].contains(&j.status.as_str()) {
+        return Err(err(
+            "a patch revision must finish before review or publication",
+        ));
+    }
     let change = j
         .change
         .as_ref()
@@ -797,7 +1043,29 @@ async fn publish(
     {
         let w = lock(&s)?;
         authorized(&h, &w, true)?;
-        preflight(&w, &id)?;
+        let artifact = preflight(&w, &id)?;
+        if let Decision::Blocked { violations } = verify(
+            &w.gate.state().evidence,
+            &w.intent(&artifact, "owner"),
+            now(),
+        ) {
+            let reason = match violations[0].code {
+                trustgraph_core::Code::RestrictedSource => {
+                    "Engineering cannot receive work derived from a Risk-only source. Approval cannot grant source access."
+                }
+                trustgraph_core::Code::StaleApproval => {
+                    "Approval no longer matches the current patch, policy or audience. Review the current change again."
+                }
+                trustgraph_core::Code::ApprovalExpired => {
+                    "Approval has expired. Review the current change again."
+                }
+                _ => "Current policy or lineage blocks publication.",
+            };
+            return Err(WebError(format!(
+                "Policy blocks this action: {:?}. {reason}",
+                violations[0].code
+            )));
+        }
     }
     {
         let w = lock(&s)?;
@@ -814,8 +1082,10 @@ async fn publish(
         }
     }
     graph_check(&s, &id).await?;
+    let work_id = id.clone();
+    let publish_state = s.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<Value> {
-        let mut w = lock(&s)?;
+        let mut w = lock(&publish_state)?;
         authorized(&h, &w, true)?;
         let artifact = preflight(&w, &id)?;
         let intent = w.intent(&artifact, "owner");
@@ -846,7 +1116,51 @@ async fn publish(
         Ok(serde_json::to_value(result)?)
     })
     .await??;
-    Ok(Json(result))
+    let (hydra, parents) = {
+        let w = lock(&s)?;
+        let job = w
+            .saved
+            .jobs
+            .iter()
+            .find(|j| j.id == work_id)
+            .ok_or_else(|| err("work missing"))?;
+        (
+            w.hydra.clone(),
+            [
+                job.graph_id.clone(),
+                job.approval_graph.clone(),
+                job.authorization_graph.clone(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>(),
+        )
+    };
+    let receipt = hydra
+        .put(
+            "publication-receipt",
+            &json!({"work":work_id,"result":result,"observed_at":now()}),
+            &parents,
+        )
+        .await;
+    let mut response = result;
+    match receipt {
+        Ok(graph) => {
+            response["graph_id"] = json!(graph);
+            activity(
+                &s,
+                &work_id,
+                "publication",
+                "GitHub action observed; exact publication receipt recorded in HydraDB",
+            )?;
+        }
+        Err(error) => {
+            response["evidence_warning"] = json!(format!(
+                "GitHub outcome is journaled; graph receipt synchronization needs attention: {error}"
+            ));
+        }
+    }
+    Ok(Json(response))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -854,6 +1168,38 @@ struct PolicyInput {
     policy: WorkPolicy,
     activate: bool,
     expected_revision: u64,
+}
+async fn sync_source_permissions(s: &Shared) -> Result<()> {
+    let (hydra, entries) = {
+        let w = lock(s)?;
+        (
+            w.hydra.clone(),
+            w.saved
+                .sources
+                .iter()
+                .filter(|_| w.config.departments)
+                .map(|source| {
+                    Ok((
+                        source.id.clone(),
+                        source.graph_id.clone(),
+                        source_permission(&w.gate, &source.id)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        )
+    };
+    for (id, parent, expected) in entries {
+        let graph = hydra.put("source-permission", &expected, &[parent]).await?;
+        let mut w = lock(s)?;
+        if source_permission(&w.gate, &id)? != expected {
+            return Err(err("source policy changed during graph synchronization"));
+        }
+        if let Some(source) = w.saved.sources.iter_mut().find(|source| source.id == id) {
+            source.permissions_graph = Some(graph);
+        }
+        w.save()?;
+    }
+    Ok(())
 }
 async fn policy(State(s): State<Shared>, h: HeaderMap, Json(body): Json<PolicyInput>) -> WebResult {
     body.policy.validate()?;
@@ -863,29 +1209,45 @@ async fn policy(State(s): State<Shared>, h: HeaderMap, Json(body): Json<PolicyIn
     let hydra = {
         let w = lock(&s)?;
         authorized(&h, &w, true)?;
+        if w.config.departments && body.policy.departments.is_none() {
+            return Err(WebError(
+                "department policy must explicitly specify investigation readers".into(),
+            ));
+        }
         w.hydra.clone()
     };
     if body.activate {
         hydra.put("policy", &body.policy, &[]).await?;
     }
-    let mut w = lock(&s)?;
-    authorized(&h, &w, true)?;
-    if body.expected_revision != w.gate.state().evidence.policy.revision {
-        return Err(WebError("policy changed; reload before saving".into()));
-    }
-    let cases:Vec<_>=w.saved.jobs.iter().filter_map(|j|j.change.as_ref().map(|c|json!({"work":j.id,"violations":body.policy.violations(&c.files,Some(&c.checks))}))).collect();
+    let cases = {
+        let mut w = lock(&s)?;
+        authorized(&h, &w, true)?;
+        if body.expected_revision != w.gate.state().evidence.policy.revision {
+            return Err(WebError("policy changed; reload before saving".into()));
+        }
+        let cases: Vec<_> = w.saved.jobs.iter().filter_map(|j|j.change.as_ref().map(|c|json!({"work":j.id,"violations":body.policy.violations(&c.files,Some(&c.checks))}))).collect();
+        if body.activate {
+            w.gate.set_policy_configuration(
+                &"owner".into(),
+                digest::structured("work-policy", &body.policy),
+                body.policy.approval_minutes * 60,
+            )?;
+            if w.config.departments {
+                for source in w.saved.sources.clone() {
+                    apply_source_policy(&mut w.gate, &source, &body.policy)?;
+                }
+            }
+            w.saved.policy = body.policy;
+            w.save()?;
+        }
+        cases
+    };
     if body.activate {
-        let hash = digest::structured("work-policy", &body.policy);
-        w.gate.set_policy_configuration(
-            &"owner".into(),
-            hash,
-            body.policy.approval_minutes * 60,
-        )?;
-        w.saved.policy = body.policy;
-        w.save()?;
+        sync_source_permissions(&s).await?;
     }
     Ok(Json(json!({"activated":body.activate,"cases":cases})))
 }
+
 async fn connections(State(s): State<Shared>, h: HeaderMap) -> WebResult {
     let (hydra, repo, config) = {
         let w = lock(&s)?;
@@ -935,6 +1297,7 @@ enum ApprovalAssumption {
     Stale,
     PreviousPolicy,
     Expired,
+    Destination,
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -946,7 +1309,16 @@ struct Simulation {
     #[serde(default)]
     approval_age_minutes: u64,
     #[serde(default)]
+    include_risk: bool,
+    #[serde(default = "engineering_audience")]
+    audience: String,
+    #[serde(skip)]
+    restricted_inputs: Vec<ArtifactId>,
+    #[serde(default)]
     policy: Option<WorkPolicy>,
+}
+fn engineering_audience() -> String {
+    "engineering".into()
 }
 fn evaluate_simulation(
     e: &Evidence,
@@ -959,6 +1331,23 @@ fn evaluate_simulation(
     let mut evidence = e.clone();
     evidence.approvals.clear();
     evidence.revoked.clear();
+    if policy.departments.is_some() {
+        for id in &case.restricted_inputs {
+            let source = evidence
+                .sources
+                .get(&SourceId(id.0.clone()))
+                .ok_or_else(|| err("restricted input missing"))?;
+            let acl = evidence
+                .acls
+                .get_mut(&source.acl)
+                .ok_or_else(|| err("source ACL missing"))?;
+            let readers = source_readers(policy, true);
+            if acl.readers != readers {
+                acl.readers = readers;
+                acl.revision += 1;
+            }
+        }
+    }
     evidence.policy.configuration = Some(digest::structured("work-policy", policy));
     evidence.policy.max_approval_lifetime = policy.approval_minutes * 60;
     let mut w = Coordinator::open_with_evidence(
@@ -976,7 +1365,11 @@ fn evaluate_simulation(
     )?;
     let mut intent = Intent {
         artifact: id.clone(),
-        audience: "repository".into(),
+        audience: if case.audience == "risk" {
+            "risk-room".into()
+        } else {
+            "repository".into()
+        },
         requester: "owner".into(),
     };
     if !matches!(case.approval, ApprovalAssumption::Missing) {
@@ -988,17 +1381,25 @@ fn evaluate_simulation(
             case.approval_age_minutes
         };
         let reviewed_at = timestamp.saturating_sub(age_minutes * 60);
-        let context = verify(&w.state().evidence, &intent, reviewed_at)
+        if let Some(context) = verify(&w.state().evidence, &intent, reviewed_at)
             .context()
-            .ok_or_else(|| err("simulated input permission blocked"))?
-            .digest();
-        w.approve(
-            &"owner".into(),
-            &intent,
-            &context,
-            "assumed-review",
-            reviewed_at,
-        )?;
+            .map(Context::digest)
+        {
+            w.approve(
+                &"owner".into(),
+                &intent,
+                &context,
+                "assumed-review",
+                reviewed_at,
+            )?;
+        }
+    }
+    if matches!(case.approval, ApprovalAssumption::Destination) {
+        intent.audience = if case.audience == "risk" {
+            "repository".into()
+        } else {
+            "risk-room".into()
+        };
     }
     if matches!(case.approval, ApprovalAssumption::Stale) {
         intent.artifact = w.edit(
@@ -1057,6 +1458,9 @@ fn evaluate_simulation(
         )
     } else if let Decision::Blocked { violations } = &decision {
         let explanation = match violations[0].code {
+            trustgraph_core::Code::RestrictedSource => {
+                "Risk investigation -> agent generation -> proposed patch -> Engineering repository: Engineering cannot read the Risk-only input. Approval cannot grant source access."
+            }
             trustgraph_core::Code::IncompleteLineage => {
                 "An input manifest is incomplete. The artifact cannot be authorized."
             }
@@ -1067,6 +1471,11 @@ fn evaluate_simulation(
                 if matches!(case.approval, ApprovalAssumption::PreviousPolicy) =>
             {
                 "Policy changed after approval. The previous approval does not authorize the new policy context."
+            }
+            trustgraph_core::Code::StaleApproval
+                if matches!(case.approval, ApprovalAssumption::Destination) =>
+            {
+                "The audience changed after approval. The saved approval does not authorize this destination."
             }
             _ => "The saved approval covers a different artifact version.",
         };
@@ -1109,11 +1518,12 @@ fn compare_simulation(
 async fn simulate(
     State(s): State<Shared>,
     h: HeaderMap,
-    Json(case): Json<Simulation>,
+    Json(mut case): Json<Simulation>,
 ) -> WebResult {
     if case.paths.len() > 16
         || case.paths.iter().any(|p| p.len() > 160)
         || case.approval_age_minutes > 10080
+        || !["engineering", "risk"].contains(&case.audience.as_str())
     {
         return Err(WebError("bounded file list required".into()));
     }
@@ -1137,7 +1547,12 @@ async fn simulate(
             .collect();
         (
             w.hydra.clone(),
-            w.saved.sources.clone(),
+            w.saved
+                .sources
+                .iter()
+                .filter(|source| case.include_risk || !source.restricted)
+                .cloned()
+                .collect::<Vec<_>>(),
             w.gate.state().evidence.clone(),
             w.saved.policy.clone(),
             impacts,
@@ -1151,6 +1566,11 @@ async fn simulate(
             ));
         }
     }
+    case.restricted_inputs = sources
+        .iter()
+        .filter(|source| source.restricted)
+        .map(|source| source.id.clone())
+        .collect();
     let candidate = case.policy.as_ref().unwrap_or(&active);
     let mut result = compare_simulation(
         &evidence,
@@ -1205,88 +1625,160 @@ async fn publication_gate(
     RoutePath(id): RoutePath<String>,
     Json(body): Json<Review>,
 ) -> WebResult {
-    {
-        let w = lock(&s)?;
-        authorized(&h, &w, true)?;
-        preflight(&w, &id)?;
-    }
-    graph_check(&s, &id).await?;
-    let (hydra, result, parents) = {
-        let w = lock(&s)?;
-        let artifact = preflight(&w, &id)?;
-        let intent = w.intent(&artifact, "owner");
-        let decision = verify(&w.gate.state().evidence, &intent, now());
-        if decision.context().map(Context::digest) != Some(body.context_digest.clone())
-            || !matches!(decision, Decision::Ready { .. })
-        {
-            return Err(WebError("an exact current approval is required".into()));
-        }
-        let j = w
-            .saved
-            .jobs
-            .iter()
-            .find(|j| j.id == id)
-            .ok_or_else(|| err("work missing"))?;
-        if j.operation.is_some() {
-            return Err(WebError(
-                "a real publication was already attempted; inspect its outcome".into(),
-            ));
-        }
-        if j.authorization_graph.is_none() {
-            return Err(WebError(
-                "authorization graph must be verified in HydraDB".into(),
-            ));
-        }
-        let approval = j
-            .approval_graph
-            .clone()
-            .ok_or_else(|| err("approval has not been verified in HydraDB"))?;
-        (
-            w.hydra.clone(),
-            json!({"work":id,"decision":decision,"simulated_action":true,"effect":"none","at":now()}),
-            vec![
-                j.graph_id
-                    .clone()
-                    .ok_or_else(|| err("graph evidence missing"))?,
-                approval,
-            ],
-        )
-    };
-    let record = hydra.put("publication-gate", &result, &parents).await?;
-    activity(
-        &s,
-        &id,
-        "publication_gate",
-        "Publication gate passed; action simulated, no branch or PR created",
-    )?;
-    {
-        let mut w = lock(&s)?;
-        let artifact = preflight(&w, &id)?;
-        let current = verify(
-            &w.gate.state().evidence,
-            &w.intent(&artifact, "owner"),
-            now(),
-        );
-        if !matches!(current, Decision::Ready { .. })
-            || current.context().map(Context::digest) != Some(body.context_digest.clone())
-        {
-            return Err(WebError(
-                "context changed while the gate result was recorded; recheck required".into(),
-            ));
-        }
-        if let Some(j) = w.saved.jobs.iter_mut().find(|j| j.id == id) {
-            j.status = "gate_passed".into();
-        }
-        w.save()?;
-    }
-    Ok(Json(
-        json!({"allowed":true,"simulated_action":true,"graph_id":record}),
-    ))
+    publish(State(s), h, RoutePath(id), Json(body)).await
 }
 
 #[cfg(test)]
 mod simulator_tests {
     use super::*;
+    #[test]
+    fn bank_policies_check_source_flow_repair_audiences_and_exact_approval() {
+        use trustgraph_runtime::{journal::MemoryJournal, publisher::LocalPublisher};
+        let mut gate = Coordinator::open_with_evidence(
+            MemoryJournal::default(),
+            LocalPublisher::default(),
+            genesis_for("owner/repo", true),
+        )
+        .unwrap();
+        let all: Readers = BTreeSet::from(["owner".into(), "engineering".into(), "agent".into()]);
+        let public = gate
+            .import_source(
+                &"owner".into(),
+                "engineering-source".into(),
+                "Engineering requirements".into(),
+                all.clone(),
+            )
+            .unwrap();
+        let risk = gate
+            .import_source(
+                &"owner".into(),
+                "risk-source".into(),
+                "Risk investigation".into(),
+                all,
+            )
+            .unwrap();
+        gate.change_acl(
+            &"owner".into(),
+            &"risk-source".into(),
+            BTreeSet::from(["owner".into(), "agent".into()]),
+            "risk-only",
+        )
+        .unwrap();
+        let policy = department_policy();
+        let mut case = Simulation {
+            paths: vec!["src/lib.rs".into()],
+            tests_passed: true,
+            lineage_complete: true,
+            approval: ApprovalAssumption::Valid,
+            approval_age_minutes: 0,
+            include_risk: true,
+            audience: "engineering".into(),
+            restricted_inputs: vec![risk.clone()],
+            policy: Some(policy.clone()),
+        };
+        let risky = evaluate_simulation(
+            &gate.state().evidence,
+            &policy,
+            vec![public.clone(), risk.clone()],
+            &case,
+        )
+        .unwrap();
+        assert_eq!(risky["counterexample"]["rule"], "RESTRICTED_SOURCE");
+        assert_eq!(risky["information_permitted"], false);
+        case.audience = "risk".into();
+        assert_eq!(
+            evaluate_simulation(
+                &gate.state().evidence,
+                &policy,
+                vec![public.clone(), risk.clone()],
+                &case
+            )
+            .unwrap()["status"],
+            "allowed"
+        );
+        case.audience = "engineering".into();
+        case.include_risk = false;
+        assert_eq!(
+            evaluate_simulation(&gate.state().evidence, &policy, vec![public.clone()], &case)
+                .unwrap()["status"],
+            "allowed"
+        );
+        case.approval = ApprovalAssumption::Destination;
+        assert_eq!(
+            evaluate_simulation(&gate.state().evidence, &policy, vec![public.clone()], &case)
+                .unwrap()["counterexample"]["rule"],
+            "STALE_APPROVAL"
+        );
+        case.approval = ApprovalAssumption::Valid;
+        let mut granted = policy.clone();
+        granted
+            .departments
+            .as_mut()
+            .unwrap()
+            .investigation_readers
+            .push("engineering".into());
+        assert_eq!(
+            compare_simulation(
+                &gate.state().evidence,
+                &policy,
+                &granted,
+                vec![public.clone(), risk.clone()],
+                &case
+            )
+            .unwrap()["baseline"]["status"],
+            "blocked"
+        );
+        assert_eq!(
+            compare_simulation(
+                &gate.state().evidence,
+                &policy,
+                &granted,
+                vec![public.clone(), risk.clone()],
+                &case
+            )
+            .unwrap()["status"],
+            "allowed"
+        );
+        // The fully assembled model prompt is also derived work. It must retain Risk restrictions.
+        let prompt = gate
+            .record_broker_output(
+                &"agent".into(),
+                "captured-prompt".into(),
+                vec![public.clone(), risk],
+                "actual supplied prompt".into(),
+                "broker",
+            )
+            .unwrap();
+        let patch = gate
+            .record_broker_output(
+                &"agent".into(),
+                "risk-patch".into(),
+                vec![prompt],
+                "does not quote the source".into(),
+                "model",
+            )
+            .unwrap();
+        let intent = Intent {
+            artifact: patch,
+            audience: "repository".into(),
+            requester: "owner".into(),
+        };
+        assert!(matches!(
+            verify(&gate.state().evidence, &intent, 1),
+            Decision::Blocked { .. }
+        ));
+        assert!(
+            gate.approve(
+                &"owner".into(),
+                &intent,
+                &digest::content(b"not permission"),
+                "cannot-override",
+                1
+            )
+            .is_err()
+        );
+        assert_eq!(gate.publisher.sends, 0);
+    }
     #[test]
     fn expired_review_can_be_renewed_and_retries_reuse_current_approval() {
         let mut w = Coordinator::open_with_evidence(
@@ -1381,6 +1873,9 @@ mod simulator_tests {
             lineage_complete: true,
             approval: ApprovalAssumption::Valid,
             approval_age_minutes: 0,
+            include_risk: false,
+            audience: "engineering".into(),
+            restricted_inputs: vec![],
             policy: Some(candidate.clone()),
         };
         let before = w.state().clone();
@@ -1485,6 +1980,9 @@ mod simulator_tests {
             lineage_complete: true,
             approval: ApprovalAssumption::Valid,
             approval_age_minutes: 0,
+            include_risk: false,
+            audience: "engineering".into(),
+            restricted_inputs: vec![],
             policy: None,
         };
         let evaluate = |case: &Simulation| {

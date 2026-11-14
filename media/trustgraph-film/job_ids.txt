@@ -1,0 +1,17 @@
+paper_world 2b5f68bb-2b35-4583-bab1-9ad91e9d9a0e
+bank_world 2db60d3d-26ac-4384-acdc-ba38f6b2c0f8
+prop_sheet 796a54d3-a3f2-4cae-9b9f-53d634dd2744
+voice_1 697c82b2-1142-4fea-8160-cf611234c4fb
+voice_2 5c4bda8d-235c-4b81-a39f-5f938bb44f67
+voice_3 aa236499-b379-44b9-af3e-508dbc92147d
+voice_4 2c7c3024-1201-4663-a528-f6854fa2e7cc
+voice_5 c5e4f3de-54ce-4958-bbe4-087ffd9049de
+voice_6 806ccaeb-7b37-4620-9c99-10fd37111fc7
+voice_7 3ee5b89b-6e75-4d6b-b72b-626dc73c93ce
+voice_8 3e3e01f7-0b52-4d23-8ec2-277bd2813435
+score_curiosity 1c0207f2-6def-4684-b8d1-a877994fadf1
+score_boundary f34e9640-ba58-44c2-bb8f-2f645ff9084c
+score_resolution c0420427-be35-443b-a70a-23446a626ed4
+score_curiosity_seed 17203bff-168d-4884-bd7c-d7917760c515
+score_boundary_seed ae6f7bae-d45a-4857-b812-9f3bf66e7c48
+score_resolution_seed f0b8c22d-d391-4861-8ead-a1fc656942b3
