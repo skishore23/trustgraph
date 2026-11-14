@@ -1,5 +1,14 @@
 # TrustGraph
 
+## Live policy workspace
+
+The real **Policy → Simulator → Agent** workspace is available with
+`cargo run --locked -p trustgraph-cli -- start --port 9080` and local configuration.
+It uses the authenticated hosted HydraDB graph, actual captured Codex generation
+and isolated Rust tests against a private workbench repository. Its default
+publication action is simulated. See [setup, walkthrough and scope](docs/live-workspace.md).
+The fixture workflow described below remains available through `serve`.
+
 A Rust compiler for safe agent plans. Before an agent acts, TrustGraph checks how
 its proposed reads, generation, approval and publication compose. It identifies a
 concrete recipient/source conflict, offers permitted alternatives, then enforces
@@ -18,11 +27,12 @@ exact approval binding and a hypothetical access change across a five-level
 release graph. The [agent workflow](docs/bank-demo.md) and
 [policy examples](examples/bank-policy.yaml) cover the persistent workspace.
 
-The app uses synthetic documents, fixture patch generation and local simulated
-delivery. **Real isolated coding-agent input capture and the gated Composio branch/PR
-publisher are not implemented yet.** Hydra supports namespace configuration,
-projection and fully validated historical bundle reconstruction; live qualification
-awaits the service details. [Composio contract](docs/composio-plan.md).
+The fixture app uses synthetic documents, fixture patch generation and local simulated
+delivery. **The fixture server uses no real coding agent or Composio publisher.**
+The separate live workspace captures actual isolated Codex input; Composio remains
+unconfigured. The standalone Hydra adapter supports namespace configuration,
+projection and validated historical bundle reconstruction; its qualification
+is separate from the hosted adapter used by the live workspace. [Composio contract](docs/composio-plan.md).
 
 The earlier [consulting business case](docs/business-case.md) remains available as
 `--scenario consulting`; existing data is preserved. This is one workspace per
@@ -160,14 +170,16 @@ becomes unknown. A corrupt or torn journal blocks startup.
 
 ## Hydra
 
-No Hydra instance was available during this build. The local journal is the
-authority and Hydra is an optional, connected evidence projection. It is not yet
-the runtime's evidence-loading backend. [Hydra setup and qualification](docs/hydra.md)
+The live workspace requires the authenticated hosted HydraDB graph for input
+retrieval, lineage validation and authorization evidence. The older fixture server
+uses the local journal with an optional standalone Hydra projection. [Hydra setup and qualification](docs/hydra.md)
 documents the real roundtrip command and its remaining checks.
 
 ## Scope
 
-This is a synthetic development MVP, not a production security certification.
+The fixture workflow is a synthetic development MVP. The live workspace has the
+[narrow execution scope](docs/live-workspace.md#real-execution-and-current-scope)
+described separately. Neither is a production security certification.
 The fixed generation template demonstrates provenance plumbing, not goal understanding or LLM behavior. Plan goals are descriptive metadata; the compiler does not infer actions from natural language. The virtual
 scheduler controls commands and modeled faults, not arbitrary threads or network
 packets. Export digests detect inconsistent edits; without signatures and a trusted

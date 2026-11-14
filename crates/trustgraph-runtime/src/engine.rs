@@ -95,6 +95,87 @@ impl<J: Journal, P: Publisher> Coordinator<J, P> {
     pub fn state(&self) -> &State {
         &self.state
     }
+    /// Trusted importer entry point. HTTP callers never supply provenance.
+    pub fn import_source(
+        &mut self,
+        actor: &PrincipalId,
+        id: ArtifactId,
+        content: String,
+        readers: Readers,
+    ) -> Result<ArtifactId, Error> {
+        self.reviewer(actor)?;
+        validate_key(&id.0)?;
+        if content.is_empty() || content.len() > 131_072 || !readers.contains(actor) {
+            return Err(Error::Invalid(
+                "source content or readers are invalid".into(),
+            ));
+        }
+        let artifact = Artifact::new(
+            id.clone(),
+            self.state.evidence.workspace.clone(),
+            content,
+            Origin::Source(SourceId(id.0.clone())),
+        );
+        if let Some(old) = self.state.evidence.artifacts.get(&id) {
+            return if old == &artifact {
+                Ok(id)
+            } else {
+                Err(Error::Conflict)
+            };
+        }
+        let acl = Acl {
+            id: AclId(format!("acl-{}", id.0)),
+            workspace: self.state.evidence.workspace.clone(),
+            revision: 1,
+            readers,
+        };
+        let source = Source {
+            id: SourceId(id.0.clone()),
+            workspace: self.state.evidence.workspace.clone(),
+            artifact: id.clone(),
+            acl: acl.id.clone(),
+        };
+        self.commit(Event::SourceImported {
+            artifact,
+            source,
+            acl,
+            imported_by: actor.clone(),
+        })?;
+        Ok(id)
+    }
+    /// Only the application-owned generation broker calls this with its captured inputs.
+    pub fn record_broker_output(
+        &mut self,
+        actor: &PrincipalId,
+        id: ArtifactId,
+        inputs: Vec<ArtifactId>,
+        content: String,
+        provider: &str,
+    ) -> Result<ArtifactId, Error> {
+        if self.actor(actor)?.role != Role::Agent {
+            return Err(Error::Unauthorized);
+        }
+        validate_key(&id.0)?;
+        self.create_derived(actor, id, inputs, content, None, provider)
+    }
+    pub fn set_policy_configuration(
+        &mut self,
+        actor: &PrincipalId,
+        configuration: digest::Digest,
+        lifetime: u64,
+    ) -> Result<(), Error> {
+        self.reviewer(actor)?;
+        if !(60..=86400).contains(&lifetime) {
+            return Err(Error::Invalid(
+                "approval lifetime outside 60..86400 seconds".into(),
+            ));
+        }
+        let mut policy = self.state.evidence.policy.clone();
+        policy.revision = policy.revision.checked_add(1).ok_or(Error::Conflict)?;
+        policy.configuration = Some(configuration);
+        policy.max_approval_lifetime = lifetime;
+        self.commit(Event::PolicyUpdated { policy })
+    }
     fn ensure_healthy(&self) -> Result<(), Error> {
         if self.healthy {
             Ok(())
@@ -498,7 +579,8 @@ impl<J: Journal, P: Publisher> Coordinator<J, P> {
         match self.publisher.send(&payload) {
             Ok((Outcome::Accepted, Some(ack))) if ack.payload == payload => {
                 operation.state = OperationState::Published;
-                operation.receipt = Some(receipt(&operation, &ack, now));
+                operation.receipt =
+                    Some(receipt(&operation, &ack, now, self.publisher.simulated()));
             }
             Ok((Outcome::Rejected, _)) => operation.state = OperationState::FailedConfirmed,
             _ => operation.state = OperationState::OutcomeUnknown,
@@ -542,7 +624,7 @@ impl<J: Journal, P: Publisher> Coordinator<J, P> {
             }
             operation.state = OperationState::Published;
             operation.updated_at = now;
-            operation.receipt = Some(receipt(&operation, &ack, now));
+            operation.receipt = Some(receipt(&operation, &ack, now, self.publisher.simulated()));
             self.commit(Event::OperationRecorded {
                 operation: Box::new(operation.clone()),
             })?;
@@ -563,7 +645,7 @@ pub(crate) fn validate_key(key: &str) -> Result<(), Error> {
     }
     Ok(())
 }
-fn receipt(operation: &Operation, ack: &Acknowledgment, now: u64) -> Receipt {
+fn receipt(operation: &Operation, ack: &Acknowledgment, now: u64, simulated: bool) -> Receipt {
     Receipt {
         operation: operation.key.clone(),
         context_digest: operation.context.digest(),
@@ -571,13 +653,48 @@ fn receipt(operation: &Operation, ack: &Acknowledgment, now: u64) -> Receipt {
         destination: operation.context.audience.destination.clone(),
         provider_id: ack.provider_id.clone(),
         observed_at: now,
-        simulated: true,
+        simulated,
     }
 }
 
 fn reduce(state: &mut State, event: &Event) -> Result<(), Error> {
     let e = &mut state.evidence;
     match event {
+        Event::SourceImported {
+            artifact,
+            source,
+            acl,
+            imported_by,
+        } => {
+            if !e.principals.get(imported_by).is_some_and(|p| {
+                p.enabled && p.role == Role::Human && e.policy.approvers.contains(imported_by)
+            }) || artifact.workspace != e.workspace
+                || source.workspace != e.workspace
+                || acl.workspace != e.workspace
+                || artifact.hash != digest::content(artifact.content.as_bytes())
+                || artifact.origin != Origin::Source(source.id.clone())
+                || source.artifact != artifact.id
+                || source.acl != acl.id
+                || acl.revision != 1
+                || !acl.readers.contains(imported_by)
+                || acl.readers.iter().any(|id| {
+                    !e.principals
+                        .get(id)
+                        .is_some_and(|p| p.enabled && p.workspace == e.workspace)
+                })
+                || e.artifacts.contains_key(&artifact.id)
+                || e.sources.contains_key(&source.id)
+                || e.acls.contains_key(&acl.id)
+            {
+                return Err(Error::Conflict);
+            }
+            state
+                .source_authority
+                .insert(source.id.clone(), acl.readers.clone());
+            e.artifacts.insert(artifact.id.clone(), artifact.clone());
+            e.sources.insert(source.id.clone(), source.clone());
+            e.acls.insert(acl.id.clone(), acl.clone());
+        }
         Event::PolicyProposed { .. } | Event::PolicyActivated { .. } => {
             return crate::policy::reduce(state, event);
         }

@@ -1876,6 +1876,7 @@ dependencies = [
  "tokio-stream",
  "tower",
  "trustgraph-core",
+ "trustgraph-live",
  "trustgraph-runtime",
  "trustgraph-sim",
  "uuid",
@@ -1890,6 +1891,22 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
+]
+
+[[package]]
+name = "trustgraph-live"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "trustgraph-core",
+ "trustgraph-runtime",
+ "uuid",
 ]
 
 [[package]]

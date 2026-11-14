@@ -32,6 +32,9 @@ pub enum Outcome {
 
 /// An unknown result never permits an implicit resend. Lookup is read-only.
 pub trait Publisher {
+    fn simulated(&self) -> bool {
+        true
+    }
     fn send(&mut self, payload: &Payload) -> Result<(Outcome, Option<Acknowledgment>), Error>;
     fn lookup(&mut self, operation: &str) -> Result<Option<Acknowledgment>, Error>;
 }

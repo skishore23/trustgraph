@@ -132,6 +132,12 @@ pub struct Submission {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
+    SourceImported {
+        artifact: Artifact,
+        source: Source,
+        acl: Acl,
+        imported_by: PrincipalId,
+    },
     PolicyProposed {
         version: Box<crate::policy::PolicyVersion>,
     },

@@ -1,0 +1,1222 @@
+use crate::*;
+use axum::{
+    Json, Router,
+    extract::{Path as RoutePath, State},
+    http::{HeaderMap, StatusCode, header},
+    response::{Html, IntoResponse, Response},
+    routing::{get, post},
+};
+
+#[derive(Debug)]
+struct WebError(String);
+impl<E: std::fmt::Display> From<E> for WebError {
+    fn from(e: E) -> Self {
+        Self(e.to_string())
+    }
+}
+impl IntoResponse for WebError {
+    fn into_response(self) -> Response {
+        (StatusCode::BAD_REQUEST, Json(json!({"error":self.0}))).into_response()
+    }
+}
+type WebResult = std::result::Result<Json<Value>, WebError>;
+fn lock(s: &Shared) -> Result<std::sync::MutexGuard<'_, Workspace>> {
+    s.lock().map_err(|_| err("workspace requires restart"))
+}
+fn authorized(h: &HeaderMap, w: &Workspace, owner: bool) -> Result<()> {
+    let host = h
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !(host.starts_with("127.0.0.1:") || host.starts_with("localhost:")) {
+        return Err(err("loopback host required"));
+    }
+    if let Some(origin) = h.get(header::ORIGIN)
+        && origin.to_str().ok() != Some(format!("http://{host}").as_str())
+    {
+        return Err(err("same-origin request required"));
+    }
+    let bearer = h
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let cookie = h
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| {
+            s.split(';')
+                .map(str::trim)
+                .find_map(|c| c.strip_prefix("trustgraph_owner="))
+        });
+    if bearer == Some(w.owner_token.as_str())
+        || cookie == Some(w.owner_token.as_str())
+        || (!owner && bearer == Some(w.agent_token.as_str()))
+    {
+        Ok(())
+    } else {
+        Err(err("workspace authentication required"))
+    }
+}
+
+pub async fn router(config: Config) -> Result<Router> {
+    if !config.github_repository.contains('/')
+        || config
+            .github_repository
+            .bytes()
+            .any(|b| !(b.is_ascii_alphanumeric() || b"-_./".contains(&b)))
+        || config.context_files.is_empty()
+        || config.context_files.len() > 8
+    {
+        return Err(err("invalid repository setup"));
+    }
+    fs::create_dir_all(&config.directory)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&config.directory, fs::Permissions::from_mode(0o700))?;
+    }
+    let owner_token = token(&config.directory.join("owner-token"))?;
+    let agent_token = token(&config.directory.join("agent-token"))?;
+    let saved_path = config.directory.join("work.json");
+    let mut saved: Saved = if saved_path.exists() {
+        serde_json::from_slice(&fs::read(saved_path)?)?
+    } else {
+        Saved::default()
+    };
+    saved.policy.validate()?;
+    for job in &mut saved.jobs {
+        if ["queued", "running"].contains(&job.status.as_str()) {
+            job.status = "interrupted".into();
+            job.error = Some("Application restarted. This run was not retried.".into());
+        }
+    }
+    let gate = Coordinator::open_with_evidence(
+        DiskJournal::open(&config.directory.join("journal"))?,
+        github::GitHub::new(
+            &config.github_repository,
+            config.directory.join("publisher"),
+        )?,
+        genesis(&config.github_repository),
+    )?;
+    if gate.state().evidence.workspace.0 != "repository-work"
+        || gate.state().evidence.audiences[&AudienceId::from("repository")].destination
+            != format!("github://{}/pulls", config.github_repository)
+        || gate.state().evidence.policy.configuration
+            != Some(digest::structured("work-policy", &saved.policy))
+    {
+        return Err(err(
+            "saved workspace and configuration differ; use the matching configuration",
+        ));
+    }
+    let hydra = hydra::Hydra::local()?;
+    hydra.check().await?;
+    let mut w = Workspace {
+        config,
+        gate,
+        saved,
+        hydra,
+        owner_token,
+        agent_token,
+    };
+    let base = git_head(&w.config.target_repository)?;
+    let context_base = git_head(&w.config.context_repository)?;
+    let mut material = Vec::new();
+    for p in &w.config.context_files {
+        material.push((
+            format!("TrustGraph/{p}@{context_base}"),
+            git_file(&w.config.context_repository, &context_base, p)?,
+        ));
+    }
+    for p in ["src/lib.rs", "README.md", "Cargo.toml"] {
+        material.push((
+            format!("{}/{p}@{base}", w.config.github_repository),
+            git_file(&w.config.target_repository, &base, p)?,
+        ));
+    }
+    let mut sources = Vec::new();
+    for (path, content) in material {
+        let a = w.import(&path, content)?;
+        let graph_id = w.hydra.put("source", &a, &[]).await?;
+        let knowledge_status = w
+            .hydra
+            .knowledge_status(&a.id.0)
+            .await
+            .unwrap_or_else(|_| "status unavailable".into());
+        sources.push(SourceRecord {
+            id: a.id,
+            path,
+            hash: a.hash,
+            graph_id,
+            knowledge_status,
+        });
+    }
+    w.hydra.put("policy", &w.saved.policy, &[]).await?;
+    w.saved.sources = sources;
+    w.save()?;
+    let shared = Arc::new(Mutex::new(w));
+    Ok(Router::new()
+        .route("/", get(index))
+        .route("/api/session", post(session))
+        .route(
+            "/workspace.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript")],
+                    include_str!("../../../web/workspace.js"),
+                )
+            }),
+        )
+        .route(
+            "/workspace.css",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/css")],
+                    include_str!("../../../web/workspace.css"),
+                )
+            }),
+        )
+        .route("/api/work", get(view).post(create))
+        .route("/api/work/{id}/approve", post(approve))
+        .route("/api/work/{id}/publish", post(publish))
+        .route("/api/policy", post(policy))
+        .route("/api/simulate", post(simulate))
+        .route("/api/graph", get(graph))
+        .route("/api/work/{id}/gate", post(publication_gate))
+        .route("/api/connections", get(connections))
+        .with_state(shared))
+}
+async fn index(State(s): State<Shared>, h: HeaderMap) -> Response {
+    let host = h
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !(host.starts_with("127.0.0.1:") || host.starts_with("localhost:")) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if lock(&s).is_err() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    ([(header::CACHE_CONTROL,"no-store"),(header::CONTENT_SECURITY_POLICY,"default-src 'self'; script-src 'self'; style-src 'self'; frame-ancestors 'none'; base-uri 'none'")],Html(include_str!("../../../web/workspace.html"))).into_response()
+}
+async fn session(State(s): State<Shared>, h: HeaderMap) -> Response {
+    let w = match lock(&s) {
+        Ok(w) => w,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    if authorized(&h, &w, true).is_err() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":"operator authentication required"})),
+        )
+            .into_response();
+    }
+    (
+        [
+            (
+                header::SET_COOKIE,
+                format!(
+                    "trustgraph_owner={}; HttpOnly; SameSite=Strict; Path=/",
+                    w.owner_token
+                ),
+            ),
+            (header::CACHE_CONTROL, "no-store".into()),
+        ],
+        Json(json!({"authenticated":true})),
+    )
+        .into_response()
+}
+fn job_view(w: &Workspace, j: &Job) -> Value {
+    let decision = j
+        .artifact
+        .as_ref()
+        .map(|id| verify(&w.gate.state().evidence, &w.intent(id, "owner"), now()));
+    let mut violations = j
+        .change
+        .as_ref()
+        .map(|c| w.saved.policy.violations(&c.files, Some(&c.checks)))
+        .unwrap_or_default();
+    if j.change
+        .as_ref()
+        .is_some_and(|c| c.policy != w.saved.policy)
+    {
+        violations.push("Policy changed; run this work again under the active policy".into());
+    }
+    let information_permitted = j.artifact.as_ref().is_some_and(|id| {
+        let mut e = w.gate.state().evidence.clone();
+        e.approvals.clear();
+        matches!(
+            verify(&e, &w.intent(id, "owner"), now()),
+            Decision::PendingApproval { .. }
+        )
+    });
+    let context = decision
+        .as_ref()
+        .and_then(Decision::context)
+        .map(Context::digest);
+    let operation = j
+        .operation
+        .as_ref()
+        .and_then(|id| w.gate.state().operations.get(id));
+    json!({"id":j.id,"goal":j.goal,"status":j.status,"created_at":j.created_at,"artifact":j.artifact,"change":j.change,"base_files":j.base_files,"error":j.error,"provider":j.provider,"graph_id":j.graph_id,"decision":decision,"context_digest":context,"violations":violations,"information_permitted":information_permitted,"operation":operation,"events":j.events,"plan":j.plan,"graph_approval_recorded":j.authorization_graph.is_some()&&j.approval_graph.is_some()})
+}
+async fn view(State(s): State<Shared>, h: HeaderMap) -> WebResult {
+    let w = lock(&s)?;
+    authorized(&h, &w, false)?;
+    Ok(Json(
+        json!({"repository":w.config.github_repository,"policy":w.saved.policy,"policy_revision":w.gate.state().evidence.policy.revision,"sources":w.saved.sources,"jobs":w.saved.jobs.iter().rev().map(|j|job_view(&w,j)).collect::<Vec<_>>(),"invariants":["Source permissions follow derived work","Approval binds the exact change and repository","Uncaptured input prevents publication"]}),
+    ))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewWork {
+    goal: String,
+}
+async fn create(State(s): State<Shared>, h: HeaderMap, Json(body): Json<NewWork>) -> WebResult {
+    if body.goal.trim().is_empty() || body.goal.len() > 4000 {
+        return Err(WebError("task needs 1..4000 bytes".into()));
+    }
+    let id = format!("job-{}", Uuid::new_v4().simple());
+    {
+        let mut w = lock(&s)?;
+        authorized(&h, &w, false)?;
+        if w.saved
+            .jobs
+            .iter()
+            .any(|j| ["queued", "running"].contains(&j.status.as_str()))
+        {
+            return Err(WebError("one agent run is already active".into()));
+        }
+        w.saved.jobs.push(Job {
+            id: id.clone(),
+            goal: body.goal,
+            status: "queued".into(),
+            created_at: now(),
+            artifact: None,
+            change: None,
+            error: None,
+            provider: Value::Null,
+            graph_id: None,
+            graph_edges: BTreeMap::new(),
+            base_files: vec![],
+            input_ids: vec![],
+            operation: None,
+            events: vec![
+                json!({"at":now(),"stage":"accepted","message":"Work order accepted through HTTP"}),
+            ],
+            plan: Value::Null,
+            approval_graph: None,
+            authorization_graph: None,
+        });
+        w.save()?;
+    }
+    let run_id = id.clone();
+    tokio::spawn(async move {
+        if let Err(e) = work(&s, &run_id).await
+            && let Ok(mut w) = lock(&s)
+        {
+            if let Some(j) = w.saved.jobs.iter_mut().find(|j| j.id == run_id) {
+                j.status = "blocked".into();
+                j.error = Some(e.to_string());
+            }
+            let _ = w.save();
+        }
+    });
+    Ok(Json(json!({"id":id})))
+}
+async fn work(s: &Shared, id: &str) -> Result<()> {
+    let (hydra, sources, config, policy, goal, base) = {
+        let mut w = lock(s)?;
+        let j = w
+            .saved
+            .jobs
+            .iter_mut()
+            .find(|j| j.id == id)
+            .ok_or_else(|| err("run missing"))?;
+        j.status = "running".into();
+        let goal = j.goal.clone();
+        w.save()?;
+        (
+            w.hydra.clone(),
+            w.saved.sources.clone(),
+            w.config.clone(),
+            w.saved.policy.clone(),
+            goal,
+            git_head(&w.config.target_repository)?,
+        )
+    };
+    activity(
+        s,
+        id,
+        "hydra_inputs",
+        "Loading exact source bytes from HydraDB",
+    )?;
+    let policy_graph = hydra.put("policy", &policy, &[]).await?;
+    let plan = json!({"goal":goal,"input_manifest":sources,"policy_fingerprint":digest::structured("work-policy",&policy),"repository":config.github_repository,"base_commit":base,"steps":["load registered inputs","generate changed files","run isolated Rust checks","require exact human approval","check publication gate"]});
+    let plan_graph = hydra
+        .put(
+            "plan",
+            &plan,
+            &sources
+                .iter()
+                .map(|s| s.graph_id.clone())
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+    {
+        let mut w = lock(s)?;
+        if let Some(j) = w.saved.jobs.iter_mut().find(|j| j.id == id) {
+            j.plan = plan.clone();
+        }
+        w.save()?;
+    }
+    activity(
+        s,
+        id,
+        "manifest",
+        "Plan and input manifest recorded in HydraDB",
+    )?;
+    let mut inputs = Vec::new();
+    let mut material = Vec::new();
+    let mut base_files = Vec::new();
+    for source in &sources {
+        let a: Artifact = serde_json::from_str(&hydra.get(&source.graph_id).await?)?;
+        if a.id != source.id
+            || a.hash != source.hash
+            || a.hash != digest::content(a.content.as_bytes())
+        {
+            return Err(err(
+                "HydraDB source does not match its imported fingerprint",
+            ));
+        }
+        if source
+            .path
+            .starts_with(&format!("{}/", config.github_repository))
+        {
+            if !source.path.ends_with(&format!("@{base}")) {
+                return Err(err(
+                    "target base changed since import; restart to refresh source snapshots",
+                ));
+            }
+            let path = source
+                .path
+                .strip_prefix(&format!("{}/", config.github_repository))
+                .unwrap_or("")
+                .split('@')
+                .next()
+                .unwrap_or("");
+            base_files.push(ChangedFile {
+                path: path.into(),
+                content: a.content.clone(),
+            });
+        }
+        inputs.push(a.id.clone());
+        material.push(json!({"path":source.path,"sha256":a.hash,"content":a.content}));
+    }
+    let prompt = format!(
+        "You are the coding agent for a controlled TrustGraph work order. Produce only the requested JSON object. All repository source inputs and instructions are supplied here. Do not use tools, other files, personal memory, web search or external context. Do not publish or claim tests executed. Return full contents of changed files only, never unchanged files. Allowed paths: {}. Target repository: {}. Base: {}. Work order: {}\n\nBusiness policy:\n{}\n\nCaptured repository inputs:\n{}",
+        policy.allowed_paths.join(", "),
+        config.github_repository,
+        base,
+        goal,
+        serde_json::to_string(&policy)?,
+        serde_json::to_string(&material)?
+    );
+    let prompt = format!(
+        "{prompt}\n\nRecorded execution plan:\n{}",
+        serde_json::to_string(&plan)?
+    );
+    let prompt_artifact = { lock(s)?.import(&format!("work-order/{id}"), prompt.clone())? };
+    let prompt_graph = hydra.put("source", &prompt_artifact, &[]).await?;
+    inputs.push(prompt_artifact.id.clone());
+    let dir = config.directory.join("runs").join(id);
+    fs::create_dir_all(&dir)?;
+    activity(
+        s,
+        id,
+        "agent",
+        "Codex started with the captured inputs; external tools disabled",
+    )?;
+    let clone_dir = dir.clone();
+    let (output, provider) =
+        tokio::task::spawn_blocking(move || runner::generate(&prompt, &clone_dir)).await??;
+    if output.summary.trim().is_empty() || output.summary.len() > 2000 {
+        return Err(err("agent summary is missing or oversized"));
+    }
+    let failures = policy.violations(&output.files, None);
+    if !failures.is_empty() {
+        return Err(err(&failures.join("; ")));
+    }
+    let raw = {
+        let mut w = lock(s)?;
+        let aid = ArtifactId(format!("agent-{id}"));
+        w.gate.record_broker_output(
+            &"agent".into(),
+            aid.clone(),
+            inputs.clone(),
+            serde_json::to_string(&output)?,
+            "codex-cli-captured-v1",
+        )?;
+        w.gate.state().evidence.artifacts[&aid].clone()
+    };
+    let mut parents: Vec<_> = sources.iter().map(|s| s.graph_id.clone()).collect();
+    parents.push(prompt_graph.clone());
+    parents.push(plan_graph.clone());
+    parents.push(policy_graph.clone());
+    let manifest = {
+        let w = lock(s)?;
+        match &raw.origin {
+            Origin::Transformation(t) => w.gate.state().evidence.transformations[t].clone(),
+            _ => return Err(err("generated manifest missing")),
+        }
+    };
+    let raw_graph = hydra
+        .put(
+            "generation",
+            &json!({"artifact":raw,"manifest":manifest,"provider":provider}),
+            &parents,
+        )
+        .await?;
+    let files = output.files.clone();
+    let base_for_check = base_files.clone();
+    let patch = patch_digest(&config.github_repository, &base, &files);
+    let check_dir = dir.clone();
+    let check_hash = patch.clone();
+    activity(
+        s,
+        id,
+        "checks",
+        "Running Rust checks against the exact proposed patch in isolation",
+    )?;
+    let checks = tokio::task::spawn_blocking(move || {
+        runner::test(&files, &base_for_check, &check_dir, &check_hash)
+    })
+    .await??;
+    let change = ChangeSet {
+        repository: config.github_repository,
+        base_commit: base,
+        summary: output.summary,
+        files: output.files,
+        checks,
+        policy: policy.clone(),
+    };
+    let (checked, artifact) = {
+        let mut w = lock(s)?;
+        let checked = ArtifactId(format!("checks-{id}"));
+        w.gate.record_broker_output(
+            &"agent".into(),
+            checked.clone(),
+            vec![raw.id.clone()],
+            serde_json::to_string(&change.checks)?,
+            "isolated-rust-test-v1",
+        )?;
+        let artifact = ArtifactId(format!("change-{id}"));
+        w.gate.record_broker_output(
+            &"agent".into(),
+            artifact.clone(),
+            vec![raw.id, checked.clone()],
+            serde_json::to_string(&change)?,
+            "checked-change-assembly-v1",
+        )?;
+        (
+            w.gate.state().evidence.artifacts[&checked].clone(),
+            w.gate.state().evidence.artifacts[&artifact].clone(),
+        )
+    };
+    let checked_graph = hydra
+        .put("checks", &checked, std::slice::from_ref(&raw_graph))
+        .await?;
+    let final_parents = vec![raw_graph.clone(), checked_graph.clone()];
+    let graph_id = hydra.put("change", &artifact, &final_parents).await?;
+    let mut graph_edges: BTreeMap<String, Vec<String>> = sources
+        .iter()
+        .map(|s| (s.graph_id.clone(), vec![]))
+        .collect();
+    graph_edges.insert(prompt_graph.clone(), vec![]);
+    graph_edges.insert(policy_graph.clone(), vec![]);
+    graph_edges.insert(
+        plan_graph,
+        sources.iter().map(|s| s.graph_id.clone()).collect(),
+    );
+    graph_edges.insert(raw_graph.clone(), parents);
+    graph_edges.insert(checked_graph.clone(), vec![raw_graph]);
+    graph_edges.insert(graph_id.clone(), final_parents);
+    for (id, parents) in &graph_edges {
+        hydra.validate_edges(id, parents).await?;
+    }
+    activity(
+        s,
+        id,
+        "review",
+        "Generated patch, check receipt and lineage verified in HydraDB",
+    )?;
+    let mut w = lock(s)?;
+    let failures = w
+        .saved
+        .policy
+        .violations(&change.files, Some(&change.checks));
+    let changed_policy = w.saved.policy != policy;
+    let j = w
+        .saved
+        .jobs
+        .iter_mut()
+        .find(|j| j.id == id)
+        .ok_or_else(|| err("run missing"))?;
+    j.status = if failures.is_empty() && !changed_policy {
+        "awaiting_review"
+    } else {
+        "blocked"
+    }
+    .into();
+    j.error = if changed_policy {
+        Some("Policy changed during generation. Run again under the active policy.".into())
+    } else if failures.is_empty() {
+        None
+    } else {
+        Some(failures.join("; "))
+    };
+    j.artifact = Some(artifact.id);
+    j.change = Some(change);
+    j.provider = provider;
+    j.graph_id = Some(graph_id);
+    j.graph_edges = graph_edges;
+    j.input_ids = inputs;
+    j.base_files = base_files;
+    w.save()?;
+    Ok(())
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Review {
+    context_digest: Digest,
+}
+async fn graph_check(s: &Shared, id: &str) -> Result<()> {
+    let (hydra, graph, expected, edges) = {
+        let w = lock(s)?;
+        let j = w
+            .saved
+            .jobs
+            .iter()
+            .find(|j| j.id == id)
+            .ok_or_else(|| err("work item missing"))?;
+        let a = j
+            .artifact
+            .as_ref()
+            .ok_or_else(|| err("agent has not produced a checked change"))?;
+        (
+            w.hydra.clone(),
+            j.graph_id
+                .clone()
+                .ok_or_else(|| err("graph evidence missing"))?,
+            w.gate.state().evidence.artifacts[a].clone(),
+            j.graph_edges.clone(),
+        )
+    };
+    for (id, parents) in &edges {
+        hydra.validate_edges(id, parents).await?;
+    }
+    let approval = {
+        let w = lock(s)?;
+        w.saved
+            .jobs
+            .iter()
+            .find(|j| j.id == id)
+            .and_then(|j| j.approval_graph.clone())
+    };
+    if let Some(approval) = approval {
+        let _: Approval = serde_json::from_str(&hydra.get(&approval).await?)?;
+    }
+    let authorization = {
+        let w = lock(s)?;
+        w.saved
+            .jobs
+            .iter()
+            .find(|j| j.id == id)
+            .and_then(|j| j.authorization_graph.clone())
+    };
+    if let Some(authorization) = authorization {
+        let bundle = hydra.verify_authorization(&authorization).await?;
+        if bundle.intent.artifact != expected.id {
+            return Err(err(
+                "authorization graph does not describe the reviewed artifact",
+            ));
+        }
+    }
+    let actual: Artifact = serde_json::from_str(&hydra.get(&graph).await?)?;
+    if actual != expected {
+        return Err(err("live HydraDB evidence no longer matches the review"));
+    }
+    Ok(())
+}
+fn preflight(w: &Workspace, id: &str) -> Result<ArtifactId> {
+    let j = w
+        .saved
+        .jobs
+        .iter()
+        .find(|j| j.id == id)
+        .ok_or_else(|| err("work item missing"))?;
+    let change = j
+        .change
+        .as_ref()
+        .ok_or_else(|| err("checked change missing"))?;
+    if change.policy != w.saved.policy {
+        return Err(err(
+            "policy changed; run this task again under the active policy",
+        ));
+    }
+    let failures = w
+        .saved
+        .policy
+        .violations(&change.files, Some(&change.checks));
+    if !failures.is_empty() {
+        return Err(err(&failures.join("; ")));
+    }
+    if change.base_commit != git_head(&w.config.target_repository)? {
+        return Err(err(
+            "local repository base changed; regenerate before review",
+        ));
+    }
+    j.artifact.clone().ok_or_else(|| err("artifact missing"))
+}
+async fn approve(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    RoutePath(id): RoutePath<String>,
+    Json(body): Json<Review>,
+) -> WebResult {
+    {
+        let w = lock(&s)?;
+        authorized(&h, &w, true)?;
+        preflight(&w, &id)?;
+    }
+    graph_check(&s, &id).await?;
+    let (hydra, approval, policy, parent) = {
+        let mut w = lock(&s)?;
+        authorized(&h, &w, true)?;
+        let artifact = preflight(&w, &id)?;
+        let intent = w.intent(&artifact, "owner");
+        let aid = w.gate.approve(
+            &"owner".into(),
+            &intent,
+            &body.context_digest,
+            &format!(
+                "{id}-{}",
+                body.context_digest
+                    .0
+                    .get(..12)
+                    .ok_or_else(|| err("invalid context fingerprint"))?
+            ),
+            now(),
+        )?;
+        let j = w
+            .saved
+            .jobs
+            .iter()
+            .find(|j| j.id == id)
+            .ok_or_else(|| err("work missing"))?;
+        (
+            w.hydra.clone(),
+            w.gate.state().evidence.approvals[&aid].clone(),
+            w.gate.state().evidence.policy.clone(),
+            j.graph_id.clone().ok_or_else(|| err("graph missing"))?,
+        )
+    };
+    let pg = hydra.put("engine-policy", &policy, &[]).await?;
+    let ag = hydra.put("approval", &approval, &[parent, pg]).await?;
+    let bundle = {
+        let w = lock(&s)?;
+        let artifact = preflight(&w, &id)?;
+        trustgraph_core::bundle::VerifiedBundle::check(
+            &w.gate.state().evidence,
+            &w.intent(&artifact, "owner"),
+            now(),
+        )
+        .map_err(|_| err("approval no longer authorizes this context"))?
+        .export()
+        .clone()
+    };
+    let authorization = hydra
+        .store_authorization(&bundle, std::slice::from_ref(&ag))
+        .await?;
+    let mut w = lock(&s)?;
+    if w.gate.state().evidence.policy != policy {
+        return Err(WebError("policy changed during approval".into()));
+    }
+    let j = w
+        .saved
+        .jobs
+        .iter_mut()
+        .find(|j| j.id == id)
+        .ok_or_else(|| err("work missing"))?;
+    j.status = "approved".into();
+    j.approval_graph = Some(ag);
+    j.authorization_graph = Some(authorization);
+    j.events.push(json!({"at":now(),"stage":"approval","message":"Exact operator approval recorded and read back from HydraDB"}));
+    w.save()?;
+    Ok(Json(json!({"approved":true})))
+}
+async fn publish(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    RoutePath(id): RoutePath<String>,
+    Json(body): Json<Review>,
+) -> WebResult {
+    {
+        let w = lock(&s)?;
+        authorized(&h, &w, true)?;
+        preflight(&w, &id)?;
+    }
+    {
+        let w = lock(&s)?;
+        if w.saved
+            .jobs
+            .iter()
+            .find(|j| j.id == id)
+            .filter(|j| j.approval_graph.is_some() && j.authorization_graph.is_some())
+            .is_none()
+        {
+            return Err(WebError(
+                "approval must be recorded in HydraDB before publication".into(),
+            ));
+        }
+    }
+    graph_check(&s, &id).await?;
+    let result = tokio::task::spawn_blocking(move || -> Result<Value> {
+        let mut w = lock(&s)?;
+        authorized(&h, &w, true)?;
+        let artifact = preflight(&w, &id)?;
+        let intent = w.intent(&artifact, "owner");
+        let key = format!(
+            "{id}-{}",
+            body.context_digest
+                .0
+                .get(..12)
+                .ok_or_else(|| err("invalid context fingerprint"))?
+        );
+        let result = w.gate.publish(&intent, &body.context_digest, &key, now())?;
+        if let trustgraph_runtime::PublishResult::Operation { operation } = &result {
+            let j = w
+                .saved
+                .jobs
+                .iter_mut()
+                .find(|j| j.id == id)
+                .ok_or_else(|| err("run missing"))?;
+            j.operation = Some(key);
+            j.status = match operation.state {
+                trustgraph_runtime::OperationState::Published => "published",
+                trustgraph_runtime::OperationState::OutcomeUnknown => "outcome_unknown",
+                _ => "publication_stopped",
+            }
+            .into();
+            w.save()?;
+        }
+        Ok(serde_json::to_value(result)?)
+    })
+    .await??;
+    Ok(Json(result))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyInput {
+    policy: WorkPolicy,
+    activate: bool,
+    expected_revision: u64,
+}
+async fn policy(State(s): State<Shared>, h: HeaderMap, Json(body): Json<PolicyInput>) -> WebResult {
+    body.policy.validate()?;
+    let hydra = {
+        let w = lock(&s)?;
+        authorized(&h, &w, true)?;
+        w.hydra.clone()
+    };
+    if body.activate {
+        hydra.put("policy", &body.policy, &[]).await?;
+    }
+    let mut w = lock(&s)?;
+    authorized(&h, &w, true)?;
+    if body.expected_revision != w.gate.state().evidence.policy.revision {
+        return Err(WebError("policy changed; reload before saving".into()));
+    }
+    let cases:Vec<_>=w.saved.jobs.iter().filter_map(|j|j.change.as_ref().map(|c|json!({"work":j.id,"violations":body.policy.violations(&c.files,Some(&c.checks))}))).collect();
+    if body.activate {
+        let hash = digest::structured("work-policy", &body.policy);
+        w.gate.set_policy_configuration(
+            &"owner".into(),
+            hash,
+            body.policy.approval_minutes * 60,
+        )?;
+        w.saved.policy = body.policy;
+        w.save()?;
+    }
+    Ok(Json(json!({"activated":body.activate,"cases":cases})))
+}
+async fn connections(State(s): State<Shared>, h: HeaderMap) -> WebResult {
+    let (hydra, repo, config) = {
+        let w = lock(&s)?;
+        authorized(&h, &w, true)?;
+        (
+            w.hydra.clone(),
+            w.config.github_repository.clone(),
+            w.config.clone(),
+        )
+    };
+    let graph = hydra.check().await.is_ok();
+    let checks = tokio::task::spawn_blocking(move || {
+        let codex = std::process::Command::new("codex")
+            .args(["login", "status"])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        let github = github::GitHub::new(
+            &config.github_repository,
+            config.directory.join("publisher"),
+        )
+        .is_ok_and(|p| p.check_readers().is_ok());
+        (codex, github)
+    })
+    .await?;
+    Ok(Json(
+        json!({"hydra":{"connected":graph,"database":hydra.database},"agent":{"connected":checks.0,"name":"Codex"},"github":{"connected":checks.1,"repository":repo},"agent_token_file":lock(&s)?.config.directory.join("agent-token"),"agent_api":"POST /api/work with a goal; Bearer agent token; no agent approval or publication authority"}),
+    ))
+}
+
+fn activity(s: &Shared, id: &str, stage: &str, message: &str) -> Result<()> {
+    let mut w = lock(s)?;
+    let j = w
+        .saved
+        .jobs
+        .iter_mut()
+        .find(|j| j.id == id)
+        .ok_or_else(|| err("work item missing"))?;
+    j.events
+        .push(json!({"at":now(),"stage":stage,"message":message}));
+    w.save()
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ApprovalAssumption {
+    Missing,
+    Valid,
+    Stale,
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Simulation {
+    paths: Vec<String>,
+    tests_passed: bool,
+    lineage_complete: bool,
+    approval: ApprovalAssumption,
+    #[serde(default)]
+    policy: Option<WorkPolicy>,
+}
+fn evaluate_simulation(
+    e: &Evidence,
+    policy: &WorkPolicy,
+    inputs: Vec<ArtifactId>,
+    case: &Simulation,
+) -> Result<Value> {
+    use trustgraph_runtime::{journal::MemoryJournal, publisher::LocalPublisher};
+    let mut evidence = e.clone();
+    evidence.approvals.clear();
+    evidence.revoked.clear();
+    evidence.policy.configuration = Some(digest::structured("work-policy", policy));
+    evidence.policy.max_approval_lifetime = policy.approval_minutes * 60;
+    let mut w = Coordinator::open_with_evidence(
+        MemoryJournal::default(),
+        LocalPublisher::default(),
+        evidence,
+    )?;
+    let id = ArtifactId(format!("simulation-{}", Uuid::new_v4().simple()));
+    w.record_broker_output(
+        &"agent".into(),
+        id.clone(),
+        inputs,
+        json!({"paths":case.paths,"assumed_tests":case.tests_passed}).to_string(),
+        "hypothetical-policy-simulator",
+    )?;
+    let mut intent = Intent {
+        artifact: id.clone(),
+        audience: "repository".into(),
+        requester: "owner".into(),
+    };
+    if !matches!(case.approval, ApprovalAssumption::Missing) {
+        let context = verify(&w.state().evidence, &intent, now())
+            .context()
+            .ok_or_else(|| err("simulated input permission blocked"))?
+            .digest();
+        w.approve(&"owner".into(), &intent, &context, "assumed-review", now())?;
+    }
+    if matches!(case.approval, ApprovalAssumption::Stale) {
+        intent.artifact = w.edit(
+            &"agent".into(),
+            &id,
+            "changed hypothetical patch",
+            &format!("simulation-{}", Uuid::new_v4().simple()),
+        )?;
+    }
+    let mut evidence = w.state().evidence.clone();
+    if !case.lineage_complete
+        && let Origin::Transformation(t) = &evidence.artifacts[&intent.artifact].origin
+    {
+        let t = evidence
+            .transformations
+            .get_mut(t)
+            .ok_or_else(|| err("simulation manifest missing"))?;
+        t.manifest.complete = false;
+        t.manifest_hash = digest::structured("context-manifest", &t.manifest);
+    }
+    let decision = verify(&evidence, &intent, now());
+    let mut permitted = evidence.clone();
+    permitted.approvals.clear();
+    let information_permitted = matches!(
+        verify(&permitted, &intent, now()),
+        Decision::PendingApproval { .. }
+    );
+    let files: Vec<_> = case
+        .paths
+        .iter()
+        .map(|p| ChangedFile {
+            path: p.clone(),
+            content: "hypothetical change".into(),
+        })
+        .collect();
+    let check = CheckReceipt {
+        patch_digest: digest::content(b"hypothesis"),
+        passed: case.tests_passed,
+        command: "assumed test outcome; not executed".into(),
+        output: String::new(),
+    };
+    let violations = policy.violations(&files, Some(&check));
+    let status = if !violations.is_empty() || matches!(decision, Decision::Blocked { .. }) {
+        "blocked"
+    } else if matches!(decision, Decision::Ready { .. }) {
+        "allowed"
+    } else {
+        "needs_approval"
+    };
+    let counterexample = if !violations.is_empty() {
+        Some(
+            json!({"rule":"business policy","explanation":violations[0],"path":["Proposed file", "Active policy", "Publication gate"]}),
+        )
+    } else if let Decision::Blocked { violations } = &decision {
+        Some(
+            json!({"rule":violations[0].code,"explanation":if !case.lineage_complete{"An input manifest is incomplete. The artifact cannot be authorized."}else{"The saved approval covers a different artifact version."},"path":["Recorded inputs", "Generated artifact", "Exact approval", "Publication gate"]}),
+        )
+    } else {
+        None
+    };
+    Ok(
+        json!({"hypothetical":true,"action_effects":0,"status":status,"information_permitted":information_permitted,"policy_passed":violations.is_empty(),"approval_matched":matches!(decision,Decision::Ready{..}),"violations":violations,"counterexample":counterexample,"decision":decision,"assumptions":case}),
+    )
+}
+async fn simulate(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    Json(case): Json<Simulation>,
+) -> WebResult {
+    if case.paths.len() > 16 || case.paths.iter().any(|p| p.len() > 160) {
+        return Err(WebError("bounded file list required".into()));
+    }
+    let (hydra, sources, e, policy) = {
+        let w = lock(&s)?;
+        authorized(&h, &w, true)?;
+        (
+            w.hydra.clone(),
+            w.saved.sources.clone(),
+            w.gate.state().evidence.clone(),
+            case.policy
+                .clone()
+                .unwrap_or_else(|| w.saved.policy.clone()),
+        )
+    };
+    policy.validate()?;
+    for source in &sources {
+        let a: Artifact = serde_json::from_str(&hydra.get(&source.graph_id).await?)?;
+        if a.id != source.id || a.hash != source.hash {
+            return Err(WebError(
+                "live source no longer matches captured evidence".into(),
+            ));
+        }
+    }
+    let mut result = evaluate_simulation(
+        &e,
+        &policy,
+        sources.iter().map(|s| s.id.clone()).collect(),
+        &case,
+    )?;
+    let graph = hydra
+        .put(
+            "simulation",
+            &result,
+            &sources
+                .iter()
+                .map(|s| s.graph_id.clone())
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+    result["graph_id"] = json!(graph);
+    Ok(Json(result))
+}
+async fn graph(State(s): State<Shared>, h: HeaderMap) -> WebResult {
+    let (hydra, source_ids) = {
+        let w = lock(&s)?;
+        authorized(&h, &w, false)?;
+        (
+            w.hydra.clone(),
+            w.saved
+                .sources
+                .iter()
+                .map(|s| s.id.0.clone())
+                .collect::<Vec<_>>(),
+        )
+    };
+    let records = hydra
+        .query(
+            "MATCH (n:TrustGraphRecord) RETURN n.kind AS kind,count(n) AS records",
+            json!({}),
+        )
+        .await?;
+    let links=hydra.query("MATCH (:TrustGraphRecord)-[r:USED_AS_INPUT]->(:TrustGraphRecord) RETURN count(r) AS links",json!({})).await?;
+    let knowledge_result = hydra.knowledge_progress(&source_ids).await;
+    let knowledge_error = knowledge_result.as_ref().err().map(ToString::to_string);
+    let knowledge = knowledge_result.unwrap_or_default();
+    Ok(Json(
+        json!({"database":hydra.database,"collection":"trustgraph-governance","records":records,"links":links,"connected":true,"knowledge":knowledge,"knowledge_error":knowledge_error}),
+    ))
+}
+async fn publication_gate(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    RoutePath(id): RoutePath<String>,
+    Json(body): Json<Review>,
+) -> WebResult {
+    {
+        let w = lock(&s)?;
+        authorized(&h, &w, true)?;
+        preflight(&w, &id)?;
+    }
+    graph_check(&s, &id).await?;
+    let (hydra, result, parents) = {
+        let w = lock(&s)?;
+        let artifact = preflight(&w, &id)?;
+        let intent = w.intent(&artifact, "owner");
+        let decision = verify(&w.gate.state().evidence, &intent, now());
+        if decision.context().map(Context::digest) != Some(body.context_digest.clone())
+            || !matches!(decision, Decision::Ready { .. })
+        {
+            return Err(WebError("an exact current approval is required".into()));
+        }
+        let j = w
+            .saved
+            .jobs
+            .iter()
+            .find(|j| j.id == id)
+            .ok_or_else(|| err("work missing"))?;
+        if j.operation.is_some() {
+            return Err(WebError(
+                "a real publication was already attempted; inspect its outcome".into(),
+            ));
+        }
+        if j.authorization_graph.is_none() {
+            return Err(WebError(
+                "authorization graph must be verified in HydraDB".into(),
+            ));
+        }
+        let approval = j
+            .approval_graph
+            .clone()
+            .ok_or_else(|| err("approval has not been verified in HydraDB"))?;
+        (
+            w.hydra.clone(),
+            json!({"work":id,"decision":decision,"simulated_action":true,"effect":"none","at":now()}),
+            vec![
+                j.graph_id
+                    .clone()
+                    .ok_or_else(|| err("graph evidence missing"))?,
+                approval,
+            ],
+        )
+    };
+    let record = hydra.put("publication-gate", &result, &parents).await?;
+    activity(
+        &s,
+        &id,
+        "publication_gate",
+        "Publication gate passed; action simulated, no branch or PR created",
+    )?;
+    {
+        let mut w = lock(&s)?;
+        let artifact = preflight(&w, &id)?;
+        let current = verify(
+            &w.gate.state().evidence,
+            &w.intent(&artifact, "owner"),
+            now(),
+        );
+        if !matches!(current, Decision::Ready { .. })
+            || current.context().map(Context::digest) != Some(body.context_digest.clone())
+        {
+            return Err(WebError(
+                "context changed while the gate result was recorded; recheck required".into(),
+            ));
+        }
+        if let Some(j) = w.saved.jobs.iter_mut().find(|j| j.id == id) {
+            j.status = "gate_passed".into();
+        }
+        w.save()?;
+    }
+    Ok(Json(
+        json!({"allowed":true,"simulated_action":true,"graph_id":record}),
+    ))
+}
+
+#[cfg(test)]
+mod simulator_tests {
+    use super::*;
+    #[test]
+    fn actual_rust_simulator_distinguishes_business_rules_stale_approval_and_unknown_inputs() {
+        let mut w = Coordinator::open_with_evidence(
+            trustgraph_runtime::journal::MemoryJournal::default(),
+            trustgraph_runtime::publisher::LocalPublisher::default(),
+            genesis("owner/repo"),
+        )
+        .unwrap();
+        let id = w
+            .import_source(
+                &"owner".into(),
+                "source".into(),
+                "real source snapshot".into(),
+                BTreeSet::from(["owner".into(), "agent".into()]),
+            )
+            .unwrap();
+        let p = WorkPolicy::default();
+        let mut case = Simulation {
+            paths: vec!["src/lib.rs".into()],
+            tests_passed: true,
+            lineage_complete: true,
+            approval: ApprovalAssumption::Valid,
+            policy: None,
+        };
+        let evaluate = |case: &Simulation| {
+            evaluate_simulation(&w.state().evidence, &p, vec![id.clone()], case).unwrap()
+        };
+        assert_eq!(evaluate(&case)["status"], "allowed");
+        case.paths = vec!["Cargo.toml".into()];
+        assert_eq!(evaluate(&case)["counterexample"]["rule"], "business policy");
+        case.paths = vec!["src/lib.rs".into()];
+        case.approval = ApprovalAssumption::Stale;
+        let stale = evaluate(&case);
+        assert_eq!(stale["information_permitted"], true);
+        assert_eq!(stale["counterexample"]["rule"], "STALE_APPROVAL");
+        case.approval = ApprovalAssumption::Valid;
+        case.lineage_complete = false;
+        assert_eq!(
+            evaluate(&case)["counterexample"]["rule"],
+            "INCOMPLETE_LINEAGE"
+        );
+        case.lineage_complete = true;
+        case.approval = ApprovalAssumption::Missing;
+        assert_eq!(evaluate(&case)["status"], "needs_approval");
+        case.approval = ApprovalAssumption::Valid;
+        case.tests_passed = false;
+        assert_eq!(evaluate(&case)["status"], "blocked");
+        assert_eq!(w.publisher.sends, 0);
+    }
+}

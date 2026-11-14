@@ -1,0 +1,12 @@
+{
+  "checked_at": "2026-11-14T14:09:24.829090+00:00",
+  "run": "job-ddc202b730b4498aba6b68be45bb8630",
+  "repository": "skishore23/trustgraph-agent-workbench",
+  "status": "awaiting_review",
+  "captured_sources": 5,
+  "agent": "codex-cli",
+  "executed_rust_tests_passed": 3,
+  "approval": "awaiting operator",
+  "publication_effects": 0,
+  "artifact_graph_record": "change-3e0f5f81fcf5dd082713aefe84129f500cbe99261d202f51fb9047def1352190"
+}

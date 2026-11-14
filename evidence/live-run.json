@@ -1,0 +1,14 @@
+{
+  "checked_at": "2026-11-14T13:53:58.779473+00:00",
+  "run": "job-cb1c340b278c4cd1b258e76b9da336cb",
+  "status": "gate_passed",
+  "sources": 5,
+  "checks_passed": true,
+  "actual_test_count": 3,
+  "graph_approval_verified": true,
+  "publication_effect": "simulated",
+  "github_pull_requests": 0,
+  "github_branches": [
+    "main"
+  ]
+}

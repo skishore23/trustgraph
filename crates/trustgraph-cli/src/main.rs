@@ -11,7 +11,7 @@ use trustgraph_sim::{Scenario, Trace};
 #[command(
     name = "trustgraph",
     version,
-    about = "A Rust governance gateway for synthetic agent work"
+    about = "A Rust governance gateway for agent work"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -19,6 +19,22 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Submit real work through the restricted agent HTTP API and stream its activity.
+    Run {
+        #[arg(long)]
+        goal: String,
+        #[arg(long, default_value = "http://127.0.0.1:9080")]
+        url: String,
+        #[arg(long, default_value = ".trustgraph-live/state/agent-token")]
+        token_file: PathBuf,
+    },
+    /// Start the live repository workspace with HydraDB and an authenticated coding agent.
+    Start {
+        #[arg(long, default_value = "trustgraph.local.json")]
+        config: PathBuf,
+        #[arg(long, default_value_t = 9080)]
+        port: u16,
+    },
     /// Compile a typed plan against the synthetic Northstar source snapshot.
     CompilePlan { file: Option<PathBuf> },
     /// Validate a small bank policy and run five isolated authorization cases.
@@ -120,6 +136,109 @@ fn save(path: &Path, value: &impl serde::Serialize) -> Result<(), Box<dyn Error>
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     match Cli::parse().command {
+        Command::Run {
+            goal,
+            url,
+            token_file,
+        } => {
+            let parsed = reqwest::Url::parse(&url)?;
+            if parsed.scheme() != "http"
+                || !matches!(parsed.host_str(), Some("127.0.0.1" | "localhost"))
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || parsed.query().is_some()
+                || parsed.fragment().is_some()
+            {
+                return Err("agent API must be a local HTTP URL".into());
+            }
+            let token = std::fs::read_to_string(token_file)?;
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?;
+            let response = client
+                .post(format!("{}/api/work", url.trim_end_matches('/')))
+                .bearer_auth(token.trim())
+                .json(&serde_json::json!({"goal":goal}))
+                .send()
+                .await?;
+            let status = response.status();
+            let body: serde_json::Value = response.json().await?;
+            if !status.is_success() {
+                return Err(body["error"]
+                    .as_str()
+                    .unwrap_or("work submission failed")
+                    .to_owned()
+                    .into());
+            }
+            let id = body["id"].as_str().ok_or("work ID missing")?.to_owned();
+            println!("Work accepted: {id}");
+            let mut seen = 0;
+            for _ in 0..360 {
+                let response = client
+                    .get(format!("{}/api/work", url.trim_end_matches('/')))
+                    .bearer_auth(token.trim())
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                let state: serde_json::Value = response.json().await?;
+                let job = state["jobs"]
+                    .as_array()
+                    .and_then(|jobs| jobs.iter().find(|j| j["id"] == id))
+                    .ok_or("work item missing")?;
+                if let Some(events) = job["events"].as_array() {
+                    for event in events.iter().skip(seen) {
+                        println!(
+                            "[{}] {}",
+                            event["stage"].as_str().unwrap_or("work"),
+                            event["message"].as_str().unwrap_or("")
+                        );
+                    }
+                    seen = events.len();
+                }
+                let stage = job["status"].as_str().unwrap_or("");
+                if !["queued", "running"].contains(&stage) {
+                    println!(
+                        "Status: {stage}\nReview: {}/#/agent/{id}",
+                        url.trim_end_matches('/')
+                    );
+                    if stage == "blocked" || stage == "interrupted" {
+                        return Err(job["error"]
+                            .as_str()
+                            .unwrap_or("work stopped")
+                            .to_owned()
+                            .into());
+                    }
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            return Err("work is still running; inspect its status without resubmitting".into());
+        }
+        Command::Start { config, port } => {
+            let config: trustgraph_live::Config = serde_json::from_slice(&std::fs::read(config)?)?;
+            let state_directory = config.directory.clone();
+            let app = trustgraph_live::router(config)
+                .await
+                .map_err(|e| e.to_string())?;
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+            let operator_token = std::fs::read_to_string(state_directory.join("owner-token"))?;
+            let operator_link = state_directory.join("operator.html");
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            use std::io::Write;
+            options.open(&operator_link)?.write_all(format!("<!doctype html><meta http-equiv=refresh content=\"0;url=http://127.0.0.1:{port}/#/connect/{}\">",operator_token.trim()).as_bytes())?;
+            println!(
+                "TrustGraph workspace: http://127.0.0.1:{port}\nOperator sign-in: {}",
+                operator_link.display()
+            );
+            axum::serve(listener, app).await?;
+        }
         Command::PolicyCheck { file } => {
             let yaml = std::fs::read_to_string(file)?;
             let mut w = trustgraph_runtime::Coordinator::open_with_evidence(
