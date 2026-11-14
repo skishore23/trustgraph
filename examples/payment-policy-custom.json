@@ -1,0 +1,10 @@
+{
+  "name": "Reconciliation change trial",
+  "allowed_paths": [
+    "payments/reconcile.rs",
+    "tests/reconcile.rs"
+  ],
+  "max_changed_files": 2,
+  "require_tests": true,
+  "approval_minutes": 30
+}

@@ -83,7 +83,7 @@ pub async fn router(config: Config) -> Result<Router> {
     } else {
         Saved::default()
     };
-    saved.policy.validate()?;
+    saved.policy.validate_live()?;
     for job in &mut saved.jobs {
         if ["queued", "running"].contains(&job.status.as_str()) {
             job.status = "interrupted".into();
@@ -252,7 +252,16 @@ fn job_view(w: &Workspace, j: &Job) -> Value {
     let context = decision
         .as_ref()
         .and_then(Decision::context)
-        .map(Context::digest);
+        .map(Context::digest)
+        .or_else(|| {
+            j.artifact.as_ref().and_then(|id| {
+                let mut evidence = w.gate.state().evidence.clone();
+                evidence.approvals.clear();
+                verify(&evidence, &w.intent(id, "owner"), now())
+                    .context()
+                    .map(Context::digest)
+            })
+        });
     let operation = j
         .operation
         .as_ref()
@@ -351,7 +360,8 @@ async fn work(s: &Shared, id: &str) -> Result<()> {
         "Loading exact source bytes from HydraDB",
     )?;
     let policy_graph = hydra.put("policy", &policy, &[]).await?;
-    let plan = json!({"goal":goal,"input_manifest":sources,"policy_fingerprint":digest::structured("work-policy",&policy),"repository":config.github_repository,"base_commit":base,"steps":["load registered inputs","generate changed files","run isolated Rust checks","require exact human approval","check publication gate"]});
+    let manifest: Vec<_> = sources.iter().map(|source| json!({"id":source.id,"path":source.path,"hash":source.hash,"graph_id":source.graph_id})).collect();
+    let plan = json!({"goal":goal,"input_manifest":manifest,"policy_fingerprint":digest::structured("work-policy",&policy),"repository":config.github_repository,"base_commit":base,"steps":["load registered inputs","generate changed files","run isolated Rust checks","require exact human approval","check publication gate"]});
     let plan_graph = hydra
         .put(
             "plan",
@@ -677,6 +687,28 @@ fn preflight(w: &Workspace, id: &str) -> Result<ArtifactId> {
     }
     j.artifact.clone().ok_or_else(|| err("artifact missing"))
 }
+fn approval_key(
+    evidence: &Evidence,
+    intent: &Intent,
+    id: &str,
+    context: &Digest,
+    timestamp: u64,
+) -> Result<String> {
+    match verify(evidence, intent, timestamp) {
+        Decision::Ready { approval, .. } => Ok(approval
+            .0
+            .strip_prefix("approval-")
+            .ok_or_else(|| err("invalid approval key"))?
+            .to_owned()),
+        _ => Ok(format!(
+            "{id}-{}-{timestamp}",
+            context
+                .0
+                .get(..12)
+                .ok_or_else(|| err("invalid context fingerprint"))?
+        )),
+    }
+}
 async fn approve(
     State(s): State<Shared>,
     h: HeaderMap,
@@ -694,18 +726,20 @@ async fn approve(
         authorized(&h, &w, true)?;
         let artifact = preflight(&w, &id)?;
         let intent = w.intent(&artifact, "owner");
+        let timestamp = now();
+        let key = approval_key(
+            &w.gate.state().evidence,
+            &intent,
+            &id,
+            &body.context_digest,
+            timestamp,
+        )?;
         let aid = w.gate.approve(
             &"owner".into(),
             &intent,
             &body.context_digest,
-            &format!(
-                "{id}-{}",
-                body.context_digest
-                    .0
-                    .get(..12)
-                    .ok_or_else(|| err("invalid context fingerprint"))?
-            ),
-            now(),
+            &key,
+            timestamp,
         )?;
         let j = w
             .saved
@@ -823,6 +857,9 @@ struct PolicyInput {
 }
 async fn policy(State(s): State<Shared>, h: HeaderMap, Json(body): Json<PolicyInput>) -> WebResult {
     body.policy.validate()?;
+    if body.activate {
+        body.policy.validate_live()?;
+    }
     let hydra = {
         let w = lock(&s)?;
         authorized(&h, &w, true)?;
@@ -896,6 +933,8 @@ enum ApprovalAssumption {
     Missing,
     Valid,
     Stale,
+    PreviousPolicy,
+    Expired,
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -904,6 +943,8 @@ struct Simulation {
     tests_passed: bool,
     lineage_complete: bool,
     approval: ApprovalAssumption,
+    #[serde(default)]
+    approval_age_minutes: u64,
     #[serde(default)]
     policy: Option<WorkPolicy>,
 }
@@ -914,6 +955,7 @@ fn evaluate_simulation(
     case: &Simulation,
 ) -> Result<Value> {
     use trustgraph_runtime::{journal::MemoryJournal, publisher::LocalPublisher};
+    let timestamp = now();
     let mut evidence = e.clone();
     evidence.approvals.clear();
     evidence.revoked.clear();
@@ -938,11 +980,25 @@ fn evaluate_simulation(
         requester: "owner".into(),
     };
     if !matches!(case.approval, ApprovalAssumption::Missing) {
-        let context = verify(&w.state().evidence, &intent, now())
+        let age_minutes = if matches!(case.approval, ApprovalAssumption::Expired)
+            && case.approval_age_minutes == 0
+        {
+            1441
+        } else {
+            case.approval_age_minutes
+        };
+        let reviewed_at = timestamp.saturating_sub(age_minutes * 60);
+        let context = verify(&w.state().evidence, &intent, reviewed_at)
             .context()
             .ok_or_else(|| err("simulated input permission blocked"))?
             .digest();
-        w.approve(&"owner".into(), &intent, &context, "assumed-review", now())?;
+        w.approve(
+            &"owner".into(),
+            &intent,
+            &context,
+            "assumed-review",
+            reviewed_at,
+        )?;
     }
     if matches!(case.approval, ApprovalAssumption::Stale) {
         intent.artifact = w.edit(
@@ -953,6 +1009,9 @@ fn evaluate_simulation(
         )?;
     }
     let mut evidence = w.state().evidence.clone();
+    if matches!(case.approval, ApprovalAssumption::PreviousPolicy) {
+        evidence.policy.revision += 1;
+    }
     if !case.lineage_complete
         && let Origin::Transformation(t) = &evidence.artifacts[&intent.artifact].origin
     {
@@ -963,11 +1022,11 @@ fn evaluate_simulation(
         t.manifest.complete = false;
         t.manifest_hash = digest::structured("context-manifest", &t.manifest);
     }
-    let decision = verify(&evidence, &intent, now());
+    let decision = verify(&evidence, &intent, timestamp);
     let mut permitted = evidence.clone();
     permitted.approvals.clear();
     let information_permitted = matches!(
-        verify(&permitted, &intent, now()),
+        verify(&permitted, &intent, timestamp),
         Decision::PendingApproval { .. }
     );
     let files: Vec<_> = case
@@ -994,11 +1053,29 @@ fn evaluate_simulation(
     };
     let counterexample = if !violations.is_empty() {
         Some(
-            json!({"rule":"business policy","explanation":violations[0],"path":["Proposed file", "Active policy", "Publication gate"]}),
+            json!({"rule":"business policy","explanation":violations[0],"path":[case.paths.first().map(String::as_str).unwrap_or("No proposed files"), policy.name.as_str(), "Publication gate"]}),
         )
     } else if let Decision::Blocked { violations } = &decision {
+        let explanation = match violations[0].code {
+            trustgraph_core::Code::IncompleteLineage => {
+                "An input manifest is incomplete. The artifact cannot be authorized."
+            }
+            trustgraph_core::Code::ApprovalExpired => {
+                "The approval expired before the proposed action. Obtain a new approval."
+            }
+            trustgraph_core::Code::StaleApproval
+                if matches!(case.approval, ApprovalAssumption::PreviousPolicy) =>
+            {
+                "Policy changed after approval. The previous approval does not authorize the new policy context."
+            }
+            _ => "The saved approval covers a different artifact version.",
+        };
         Some(
-            json!({"rule":violations[0].code,"explanation":if !case.lineage_complete{"An input manifest is incomplete. The artifact cannot be authorized."}else{"The saved approval covers a different artifact version."},"path":["Recorded inputs", "Generated artifact", "Exact approval", "Publication gate"]}),
+            json!({"rule":violations[0].code,"explanation":explanation,"path":["Recorded inputs", "Generated artifact", "Exact approval", "Publication gate"]}),
+        )
+    } else if matches!(decision, Decision::PendingApproval { .. }) {
+        Some(
+            json!({"rule":"APPROVAL_REQUIRED","explanation":"The proposed change is permitted but still requires exact operator approval.","path":["Proposed change", "Operator approval", "Publication gate"]}),
         )
     } else {
         None
@@ -1007,27 +1084,65 @@ fn evaluate_simulation(
         json!({"hypothetical":true,"action_effects":0,"status":status,"information_permitted":information_permitted,"policy_passed":violations.is_empty(),"approval_matched":matches!(decision,Decision::Ready{..}),"violations":violations,"counterexample":counterexample,"decision":decision,"assumptions":case}),
     )
 }
+fn compare_simulation(
+    evidence: &Evidence,
+    active: &WorkPolicy,
+    candidate: &WorkPolicy,
+    inputs: Vec<ArtifactId>,
+    case: &Simulation,
+) -> Result<Value> {
+    active.validate()?;
+    candidate.validate()?;
+    let mut result = evaluate_simulation(evidence, candidate, inputs.clone(), case)?;
+    let baseline = evaluate_simulation(evidence, active, inputs, case)?;
+    result["baseline"] = baseline;
+    result["active_policy"] = json!(active);
+    result["candidate_policy"] = json!(candidate);
+    result["policy_changed"] = json!(active != candidate);
+    result["active_policy_fingerprint"] = json!(digest::structured("work-policy", active));
+    result["candidate_policy_fingerprint"] = json!(digest::structured("work-policy", candidate));
+    result["active_policy_revision"] = json!(evidence.policy.revision);
+    result["policy_activated"] = json!(false);
+    result["code_executed"] = json!(false);
+    Ok(result)
+}
 async fn simulate(
     State(s): State<Shared>,
     h: HeaderMap,
     Json(case): Json<Simulation>,
 ) -> WebResult {
-    if case.paths.len() > 16 || case.paths.iter().any(|p| p.len() > 160) {
+    if case.paths.len() > 16
+        || case.paths.iter().any(|p| p.len() > 160)
+        || case.approval_age_minutes > 10080
+    {
         return Err(WebError("bounded file list required".into()));
     }
-    let (hydra, sources, e, policy) = {
+    let (hydra, sources, evidence, active, impacts) = {
         let w = lock(&s)?;
-        authorized(&h, &w, true)?;
+        authorized(&h, &w, false)?;
+        let candidate = case.policy.as_ref().unwrap_or(&w.saved.policy);
+        candidate.validate()?;
+        let impacts: Vec<_> = w
+            .saved
+            .jobs
+            .iter()
+            .rev()
+            .filter_map(|j| {
+                j.change.as_ref().map(|c| json!({
+            "work":j.id,"goal":j.goal,"violations":candidate.violations(&c.files,Some(&c.checks)),
+            "requires_fresh_run":c.policy != *candidate
+        }))
+            })
+            .take(10)
+            .collect();
         (
             w.hydra.clone(),
             w.saved.sources.clone(),
             w.gate.state().evidence.clone(),
-            case.policy
-                .clone()
-                .unwrap_or_else(|| w.saved.policy.clone()),
+            w.saved.policy.clone(),
+            impacts,
         )
     };
-    policy.validate()?;
     for source in &sources {
         let a: Artifact = serde_json::from_str(&hydra.get(&source.graph_id).await?)?;
         if a.id != source.id || a.hash != source.hash {
@@ -1036,25 +1151,27 @@ async fn simulate(
             ));
         }
     }
-    let mut result = evaluate_simulation(
-        &e,
-        &policy,
+    let candidate = case.policy.as_ref().unwrap_or(&active);
+    let mut result = compare_simulation(
+        &evidence,
+        &active,
+        candidate,
         sources.iter().map(|s| s.id.clone()).collect(),
         &case,
     )?;
-    let graph = hydra
-        .put(
-            "simulation",
-            &result,
-            &sources
-                .iter()
-                .map(|s| s.graph_id.clone())
-                .collect::<Vec<_>>(),
-        )
-        .await?;
+    result["impact"] = json!(impacts);
+    let candidate_graph = hydra.put("policy-candidate", candidate, &[]).await?;
+    let mut parents: Vec<_> = sources.iter().map(|s| s.graph_id.clone()).collect();
+    parents.push(candidate_graph.clone());
+    let graph = hydra.put("simulation", &result, &parents).await?;
     result["graph_id"] = json!(graph);
+    result["candidate_policy_graph_id"] = json!(candidate_graph);
+    let current_revision = lock(&s)?.gate.state().evidence.policy.revision;
+    result["active_policy_changed_during_check"] =
+        json!(current_revision != evidence.policy.revision);
     Ok(Json(result))
 }
+
 async fn graph(State(s): State<Shared>, h: HeaderMap) -> WebResult {
     let (hydra, source_ids) = {
         let w = lock(&s)?;
@@ -1171,6 +1288,181 @@ async fn publication_gate(
 mod simulator_tests {
     use super::*;
     #[test]
+    fn expired_review_can_be_renewed_and_retries_reuse_current_approval() {
+        let mut w = Coordinator::open_with_evidence(
+            trustgraph_runtime::journal::MemoryJournal::default(),
+            trustgraph_runtime::publisher::LocalPublisher::default(),
+            genesis("owner/repo"),
+        )
+        .unwrap();
+        let source = w
+            .import_source(
+                &"owner".into(),
+                "source".into(),
+                "input".into(),
+                BTreeSet::from(["owner".into(), "agent".into()]),
+            )
+            .unwrap();
+        let patch = w
+            .record_broker_output(
+                &"agent".into(),
+                "patch".into(),
+                vec![source.clone()],
+                "patch bytes".into(),
+                "test",
+            )
+            .unwrap();
+        let intent = Intent {
+            artifact: patch,
+            audience: "repository".into(),
+            requester: "owner".into(),
+        };
+        let context = verify(&w.state().evidence, &intent, 100)
+            .context()
+            .unwrap()
+            .digest();
+        let old = w
+            .approve(&"owner".into(), &intent, &context, "old", 100)
+            .unwrap();
+        let later = 100 + w.state().evidence.policy.max_approval_lifetime;
+        assert!(matches!(
+            verify(&w.state().evidence, &intent, later),
+            Decision::Blocked { .. }
+        ));
+        let key = approval_key(&w.state().evidence, &intent, "job-renew", &context, later).unwrap();
+        let renewed = w
+            .approve(&"owner".into(), &intent, &context, &key, later)
+            .unwrap();
+        assert_ne!(old, renewed);
+        assert_eq!(
+            approval_key(
+                &w.state().evidence,
+                &intent,
+                "job-renew",
+                &context,
+                later + 1
+            )
+            .unwrap(),
+            key
+        );
+        assert!(matches!(
+            verify(&w.state().evidence, &intent, later + 1),
+            Decision::Ready { .. }
+        ));
+        assert!(
+            w.approve(&"agent".into(), &intent, &context, "forged", later + 1)
+                .is_err()
+        );
+        assert_eq!(w.publisher.sends, 0);
+    }
+    #[test]
+    fn candidate_comparison_is_bounded_supports_custom_paths_and_never_mutates_live_state() {
+        let mut w = Coordinator::open_with_evidence(
+            trustgraph_runtime::journal::MemoryJournal::default(),
+            trustgraph_runtime::publisher::LocalPublisher::default(),
+            genesis("owner/repo"),
+        )
+        .unwrap();
+        let source = w
+            .import_source(
+                &"owner".into(),
+                "source".into(),
+                "input".into(),
+                BTreeSet::from(["owner".into(), "agent".into()]),
+            )
+            .unwrap();
+        let active = WorkPolicy::default();
+        let mut candidate = active.clone();
+        candidate.allowed_paths = vec!["src/lib.rs".into(), "README.md".into()];
+        candidate.max_changed_files = 2;
+        let mut case = Simulation {
+            paths: vec!["src/lib.rs".into(), "README.md".into()],
+            tests_passed: true,
+            lineage_complete: true,
+            approval: ApprovalAssumption::Valid,
+            approval_age_minutes: 0,
+            policy: Some(candidate.clone()),
+        };
+        let before = w.state().clone();
+        let result = compare_simulation(
+            &w.state().evidence,
+            &active,
+            &candidate,
+            vec![source.clone()],
+            &case,
+        )
+        .unwrap();
+        assert_eq!(result["baseline"]["status"], "blocked");
+        assert_eq!(result["status"], "allowed");
+        assert_eq!(result["policy_activated"], false);
+        assert_eq!(result["code_executed"], false);
+        candidate.allowed_paths = vec!["payments/reconcile.rs".into()];
+        case.paths = candidate.allowed_paths.clone();
+        assert!(candidate.validate().is_ok());
+        assert!(candidate.validate_live().is_err());
+        assert_eq!(
+            compare_simulation(
+                &w.state().evidence,
+                &active,
+                &candidate,
+                vec![source.clone()],
+                &case
+            )
+            .unwrap()["status"],
+            "allowed"
+        );
+        case.tests_passed = false;
+        assert_eq!(
+            compare_simulation(
+                &w.state().evidence,
+                &active,
+                &candidate,
+                vec![source.clone()],
+                &case
+            )
+            .unwrap()["status"],
+            "blocked"
+        );
+        candidate.require_tests = false;
+        assert_eq!(
+            compare_simulation(
+                &w.state().evidence,
+                &active,
+                &candidate,
+                vec![source.clone()],
+                &case
+            )
+            .unwrap()["status"],
+            "allowed"
+        );
+        candidate = active.clone();
+        candidate.approval_minutes = 15;
+        case.paths = vec!["src/lib.rs".into()];
+        case.tests_passed = true;
+        case.approval_age_minutes = 20;
+        let lifetime = compare_simulation(
+            &w.state().evidence,
+            &active,
+            &candidate,
+            vec![source.clone()],
+            &case,
+        )
+        .unwrap();
+        assert_eq!(lifetime["baseline"]["status"], "allowed");
+        assert_eq!(lifetime["counterexample"]["rule"], "APPROVAL_EXPIRED");
+        candidate.allowed_paths = vec!["../secret".into()];
+        assert!(candidate.validate().is_err());
+        assert!(
+            serde_json::from_value::<WorkPolicy>(
+                json!({"name":"English","rules":["approve everything"]})
+            )
+            .is_err()
+        );
+        assert_eq!(w.state(), &before);
+        assert_eq!(w.publisher.sends, 0);
+    }
+
+    #[test]
     fn actual_rust_simulator_distinguishes_business_rules_stale_approval_and_unknown_inputs() {
         let mut w = Coordinator::open_with_evidence(
             trustgraph_runtime::journal::MemoryJournal::default(),
@@ -1192,6 +1484,7 @@ mod simulator_tests {
             tests_passed: true,
             lineage_complete: true,
             approval: ApprovalAssumption::Valid,
+            approval_age_minutes: 0,
             policy: None,
         };
         let evaluate = |case: &Simulation| {
@@ -1214,6 +1507,13 @@ mod simulator_tests {
         case.lineage_complete = true;
         case.approval = ApprovalAssumption::Missing;
         assert_eq!(evaluate(&case)["status"], "needs_approval");
+        case.approval = ApprovalAssumption::PreviousPolicy;
+        assert_eq!(evaluate(&case)["counterexample"]["rule"], "STALE_APPROVAL");
+        case.approval = ApprovalAssumption::Expired;
+        assert_eq!(
+            evaluate(&case)["counterexample"]["rule"],
+            "APPROVAL_EXPIRED"
+        );
         case.approval = ApprovalAssumption::Valid;
         case.tests_passed = false;
         assert_eq!(evaluate(&case)["status"], "blocked");

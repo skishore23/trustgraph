@@ -19,6 +19,23 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Compare a proposed change against active and candidate policies without activating either.
+    PolicySimulate {
+        #[arg(long)]
+        case: PathBuf,
+        #[arg(long)]
+        policy: Option<PathBuf>,
+        #[arg(long, default_value = "http://127.0.0.1:9080")]
+        url: String,
+        #[arg(long, default_value = ".trustgraph-live/state/agent-token")]
+        token_file: PathBuf,
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, value_parser = ["allowed", "blocked", "needs_approval"])]
+        expect: Option<String>,
+    },
     /// Submit real work through the restricted agent HTTP API and stream its activity.
     Run {
         #[arg(long)]
@@ -136,6 +153,84 @@ fn save(path: &Path, value: &impl serde::Serialize) -> Result<(), Box<dyn Error>
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     match Cli::parse().command {
+        Command::PolicySimulate {
+            case,
+            policy,
+            url,
+            token_file,
+            output,
+            json,
+            expect,
+        } => {
+            let parsed = reqwest::Url::parse(&url)?;
+            if parsed.scheme() != "http"
+                || !matches!(parsed.host_str(), Some("127.0.0.1" | "localhost"))
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || parsed.query().is_some()
+                || parsed.fragment().is_some()
+            {
+                return Err("agent API must be a local HTTP URL".into());
+            }
+            let mut request: serde_json::Value = serde_json::from_slice(&std::fs::read(case)?)?;
+            if !request.is_object() {
+                return Err("simulation case must be a JSON object".into());
+            }
+            if let Some(policy) = policy {
+                request["policy"] = serde_json::from_slice(&std::fs::read(policy)?)?;
+            }
+            let token = std::fs::read_to_string(token_file)?;
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?;
+            let response = client
+                .post(format!("{}/api/simulate", url.trim_end_matches('/')))
+                .bearer_auth(token.trim())
+                .json(&request)
+                .send()
+                .await?;
+            let status = response.status();
+            let bytes = response.bytes().await?;
+            let result: serde_json::Value = serde_json::from_slice(&bytes).map_err(
+                |_| "simulation request was rejected; check the case and supported policy schema",
+            )?;
+            if !status.is_success() {
+                return Err(result["error"]
+                    .as_str()
+                    .unwrap_or("simulation failed")
+                    .to_owned()
+                    .into());
+            }
+            if let Some(path) = output {
+                save(&path, &result)?;
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "Active policy: {} → {}\nCandidate policy: {} → {}",
+                    result["active_policy"]["name"].as_str().unwrap_or("active"),
+                    result["baseline"]["status"].as_str().unwrap_or("unknown"),
+                    result["candidate_policy"]["name"]
+                        .as_str()
+                        .unwrap_or("candidate"),
+                    result["status"].as_str().unwrap_or("unknown")
+                );
+                if let Some(reason) = result["counterexample"]["explanation"].as_str() {
+                    println!("Reason: {reason}");
+                }
+                println!(
+                    "Hypothetical assumptions only · policy not activated · code not executed · publication effects: 0\nHydraDB evidence: {}",
+                    result["graph_id"].as_str().unwrap_or("missing")
+                );
+            }
+            if let Some(expected) = expect
+                && result["status"].as_str() != Some(expected.as_str())
+            {
+                return Err(format!("expected {expected}, got {}", result["status"]).into());
+            }
+        }
         Command::Run {
             goal,
             url,

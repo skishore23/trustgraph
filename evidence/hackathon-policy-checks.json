@@ -1,0 +1,104 @@
+{
+  "started_at": "2026-11-14T14:48:20.095311+00:00",
+  "database": "trustgraph",
+  "collection": "trustgraph-governance",
+  "active_policy_revision": 1,
+  "cases": [
+    {
+      "name": "allowed fix",
+      "active": "allowed",
+      "candidate": "allowed",
+      "reason": null,
+      "graph_id": "simulation-684e788f22163f7006fa6c490079241d223bdb758c718e1d04b32a111c8a673a"
+    },
+    {
+      "name": "two files exceed policy",
+      "active": "blocked",
+      "candidate": "blocked",
+      "reason": "business policy",
+      "graph_id": "simulation-238020862dc4eaf8cc03803fd24d0ee3239abe98074e824527ec80f0fc5ea52a"
+    },
+    {
+      "name": "expanded candidate permits two files",
+      "active": "blocked",
+      "candidate": "allowed",
+      "reason": null,
+      "graph_id": "simulation-16f2356d3d891b99aa04fb412de6a42d68fd9eb2bb56c572505265e00f57f982"
+    },
+    {
+      "name": "documentation-only candidate blocks code",
+      "active": "allowed",
+      "candidate": "blocked",
+      "reason": "business policy",
+      "graph_id": "simulation-7dcc36f9f8593d8fd1626d81be6a5a7934179e52ea16e2dda971e3ae35c51735"
+    },
+    {
+      "name": "patch changed after approval",
+      "active": "blocked",
+      "candidate": "blocked",
+      "reason": "STALE_APPROVAL",
+      "graph_id": "simulation-0184ea1de5aa50e8b4e5eea4eceb9c6ca45f2060e271772dd1a6384e575a741c"
+    },
+    {
+      "name": "policy changed after approval",
+      "active": "blocked",
+      "candidate": "blocked",
+      "reason": "STALE_APPROVAL",
+      "graph_id": "simulation-8551029d4fb8c89b10604548395275495a7bba8f9419174982d1f8472f02a090"
+    },
+    {
+      "name": "missing input manifest",
+      "active": "blocked",
+      "candidate": "blocked",
+      "reason": "INCOMPLETE_LINEAGE",
+      "graph_id": "simulation-66ad89f4e0d7cafe9f1bb8e1e3d82b44909871b712731afdb8981052bacfc115"
+    },
+    {
+      "name": "approval expired",
+      "active": "blocked",
+      "candidate": "blocked",
+      "reason": "APPROVAL_EXPIRED",
+      "graph_id": "simulation-eae471a287b28d9cce5710e9fdb88c3dc8a5b9a8f9a6a5383eadd44c71c6910b"
+    },
+    {
+      "name": "required tests fail",
+      "active": "blocked",
+      "candidate": "blocked",
+      "reason": "business policy",
+      "graph_id": "simulation-e2949e2a3116234ba654d2aaeac422bb080c52889cdc3d8c5b0f3f9d92d4736a"
+    },
+    {
+      "name": "optional tests change the decision",
+      "active": "blocked",
+      "candidate": "allowed",
+      "reason": null,
+      "graph_id": "simulation-52185fa63d089aaa96bb03af8baf6b17fc2764be524d1acc68d411e527aed713"
+    },
+    {
+      "name": "custom relative paths",
+      "active": "blocked",
+      "candidate": "allowed",
+      "reason": null,
+      "graph_id": "simulation-b1bc15fc73313f7764c074818fd7e5a5b6d7324fcd08c975bcebcf404c1c0364"
+    },
+    {
+      "name": "missing approval",
+      "active": "needs_approval",
+      "candidate": "needs_approval",
+      "reason": "APPROVAL_REQUIRED",
+      "graph_id": "simulation-f80d5bf2b6fc1c8f5ede48aa85d2eda1290a84e7fd4accc7a55a4c843b2d5f57"
+    },
+    {
+      "name": "shorter lifetime expires the same approval",
+      "active": "allowed",
+      "candidate": "blocked",
+      "reason": "APPROVAL_EXPIRED",
+      "graph_id": "simulation-59e97af1860a21aa8774cff39d016979eee1f2e644bc82757ae7c2bd2b735849"
+    }
+  ],
+  "passed": 14,
+  "active_policy_unchanged": true,
+  "existing_work_unchanged": true,
+  "publication_effects": 0,
+  "completed_at": "2026-11-14T14:48:40.685916+00:00"
+}

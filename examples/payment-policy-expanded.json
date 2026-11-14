@@ -1,0 +1,10 @@
+{
+  "name": "Reviewed code and documentation",
+  "allowed_paths": [
+    "src/lib.rs",
+    "README.md"
+  ],
+  "max_changed_files": 2,
+  "require_tests": true,
+  "approval_minutes": 30
+}

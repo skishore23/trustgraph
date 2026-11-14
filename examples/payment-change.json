@@ -1,0 +1,9 @@
+{
+  "paths": [
+    "src/lib.rs",
+    "README.md"
+  ],
+  "tests_passed": true,
+  "lineage_complete": true,
+  "approval": "valid"
+}

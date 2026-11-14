@@ -1,0 +1,9 @@
+{
+  "name": "Documentation only",
+  "allowed_paths": [
+    "README.md"
+  ],
+  "max_changed_files": 1,
+  "require_tests": true,
+  "approval_minutes": 30
+}

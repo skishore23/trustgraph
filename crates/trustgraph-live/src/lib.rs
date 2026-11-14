@@ -65,13 +65,25 @@ impl WorkPolicy {
             || !(1..=10).contains(&self.max_changed_files)
             || !(1..=1440).contains(&self.approval_minutes)
             || self.allowed_paths.is_empty()
-            || self
-                .allowed_paths
-                .iter()
-                .any(|p| !["src/lib.rs", "README.md"].contains(&p.as_str()))
+            || self.allowed_paths.len() > 16
+            || self.allowed_paths.iter().any(|p| !safe_path(p))
+            || self.allowed_paths.iter().collect::<BTreeSet<_>>().len() != self.allowed_paths.len()
         {
             return Err(err(
                 "policy needs explicit relative paths, 1..10 files and 1..1440 approval minutes",
+            ));
+        }
+        Ok(())
+    }
+    fn validate_live(&self) -> Result<()> {
+        self.validate()?;
+        if self
+            .allowed_paths
+            .iter()
+            .any(|p| !["src/lib.rs", "README.md"].contains(&p.as_str()))
+        {
+            return Err(err(
+                "the live workbench supports src/lib.rs and README.md; other relative paths can be tested in the simulator",
             ));
         }
         Ok(())

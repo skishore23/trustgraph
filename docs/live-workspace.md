@@ -3,6 +3,9 @@
 Open `http://127.0.0.1:9080/`. The three views are **Policy**, **Simulator** and
 **Agent**. A policy is a set of business rules and settings. Allowed files,
 maximum changed files, required test results and approval lifetime are editable.
+The [hackathon walkthrough](hackathon-walkthrough.md) provides a five-minute
+story, exact screen actions, a 14-case rehearsal suite and a Codex trial prompt.
+
 Source restrictions, captured lineage and exact approval binding are always
 enforced by the Rust engine; they are not repeated in each policy.
 
@@ -48,8 +51,8 @@ cargo run --locked -p trustgraph-cli -- run \
 ```
 
 The CLI uses `.trustgraph-live/state/agent-token`, streams actual activity and
-stops when review is required. The agent token can submit/read work, not approve,
-activate policy or publish. Another agent or 8090 can call the same HTTP intake:
+stops when review is required. The agent token can submit/read work and compare candidate policies in the
+simulator. It cannot approve, activate policy or publish. Another agent or 8090 can call the same HTTP intake:
 `POST /api/work` with `Authorization: Bearer <agent token>` and a JSON `goal`.
 This delegates generation to the controlled fresh Codex broker. It does not
 accept a caller's claim that an arbitrary patch has trustworthy provenance. The
@@ -60,11 +63,12 @@ MCP integration.
 
 1. **Policy:** allow only `src/lib.rs`, one changed file, passing tests and a
    30-minute approval. Test an unsaved candidate or save a new active version.
-2. **Simulator:** run Allowed change, Forbidden file, Stale approval and Missing
-   input. These use the Rust evaluator with explicit hypothetical assumptions.
-   They show separate information-flow, business-policy and approval results,
-   a concrete failure path and zero publication effects. Changing assumptions
-   clears the old verdict.
+2. **Simulator:** edit a candidate policy or import supported JSON. Compare the
+   same proposed change against active and candidate policies. Presets cover code
+   + docs, failed tests, changed patches/policies, missing inputs and expiry.
+   Results separate information flow, business rules and approval, with concrete
+   failure paths and zero publication effects. Nothing is activated. Custom safe
+   relative paths are supported here; the live runner retains its two-file scope.
 3. **Agent:** submit the work order. See the actual code before/after, captured
    plan/input manifest, provider metadata, isolated test output and live activity.
 4. Review the exact patch, then **Approve exact change**. **Run publication gate**
@@ -131,3 +135,20 @@ records an attempt before writes and never blindly retries an uncertain effect.
 The default walkthrough does not invoke it. Composio is not configured or
 live-qualified. The standalone Hydra protocol adapter and its separately ignored
 contract test remain independent from this hosted integration.
+
+## Test policies from Codex
+
+```sh
+python3 scripts/hackathon-check.py
+cargo run --locked -p trustgraph-cli -- policy-simulate \
+  --case examples/payment-change.json \
+  --policy examples/payment-policy-expanded.json \
+  --expect allowed
+```
+
+The CLI uses the restricted agent token and prints active/candidate outcomes.
+`--json` returns full evidence; `--output FILE` writes it; `--expect` verifies a
+verdict for scripts. Supported policy fields are `name`, `allowed_paths`,
+`max_changed_files`, `require_tests` and `approval_minutes`. Approval assumptions
+are `valid`, `missing`, `stale`, `previous_policy` and `expired`. This is a typed
+policy experiment, not an arbitrary English policy interpreter or code runner.

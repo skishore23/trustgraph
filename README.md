@@ -8,6 +8,7 @@ It uses the authenticated hosted HydraDB graph, actual captured Codex generation
 and isolated Rust tests against a private workbench repository. Its default
 publication action is simulated. See [setup, walkthrough and scope](docs/live-workspace.md).
 The fixture workflow described below remains available through `serve`.
+For a rehearsable presentation, follow the [hackathon story and Codex trial](docs/hackathon-walkthrough.md).
 
 A Rust compiler for safe agent plans. Before an agent acts, TrustGraph checks how
 its proposed reads, generation, approval and publication compose. It identifies a

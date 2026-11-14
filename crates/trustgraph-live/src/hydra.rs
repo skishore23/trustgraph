@@ -77,7 +77,11 @@ impl Hydra {
             return Err(err("HydraDB Knowledge status check failed"));
         }
         let v: Value = response.json().await?;
-        Ok(knowledge_rows(&v).to_vec())
+        Ok(knowledge_rows(&v)
+            .iter()
+            .cloned()
+            .map(normalize_knowledge_status)
+            .collect())
     }
     pub async fn knowledge_status(&self, id: &str) -> Result<String> {
         let rows = self.knowledge_progress(&[id.to_owned()]).await?;
@@ -333,6 +337,14 @@ impl Hydra {
     }
 }
 
+fn normalize_knowledge_status(mut row: Value) -> Value {
+    // The hosted API reports an unregistered optional Knowledge ID as FILE_NOT_FOUND,
+    // not as an indexing attempt that failed. Preserve its diagnostic, distinguish the state.
+    if row["success"] == false && row["error_code"] == "FILE_NOT_FOUND" {
+        row["indexing_status"] = json!("not_registered");
+    }
+    row
+}
 fn knowledge_rows(v: &Value) -> &[Value] {
     let v = v.get("data").unwrap_or(v);
     v["statuses"].as_array().map(Vec::as_slice).unwrap_or(&[])
@@ -353,5 +365,13 @@ mod knowledge_tests {
         assert_eq!(rows[1]["indexing_status"], "completed");
         assert_eq!(rows[2]["error_message"], "indexing failed");
         assert!(knowledge_rows(&json!({"success":false})).is_empty());
+        let absent = normalize_knowledge_status(
+            json!({"id":"absent","success":false,"error_code":"FILE_NOT_FOUND","indexing_status":"errored"}),
+        );
+        assert_eq!(absent["indexing_status"], "not_registered");
+        assert_eq!(
+            normalize_knowledge_status(rows[2].clone())["indexing_status"],
+            "errored"
+        );
     }
 }
