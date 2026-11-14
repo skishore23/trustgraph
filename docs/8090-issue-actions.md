@@ -5,6 +5,11 @@ of its exact title, body, repository, connected account and tool binding.
 Composio creates the approved issue. This path starts no Codex process and
 generates no patch.
 
+For the short live grant/revoke presentation and manual 8090 handoff, use the
+[issue demo runbook](one-hour-issue-demo.md). The operator controls a durable
+gateway publication permission independently of exact-issue review. Revoking
+or restoring permission changes the policy context and requires fresh approval.
+
 8090 supplies the Work Order and project skill; its native workspace runs the
 [restricted client](../scripts/trustgraph_actions.py). TrustGraph owns the review
 UI, publishing credential and durable journal. This example approves a submitted

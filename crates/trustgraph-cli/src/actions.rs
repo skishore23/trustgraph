@@ -143,6 +143,18 @@ impl Config {
             self.github_repository
         )
     }
+    fn permission_scope(&self, granted: bool) -> digest::Digest {
+        if granted {
+            self.scope()
+        } else {
+            digest::structured(
+                "issue-publication-permission",
+                &json!({
+                    "configuration": self.scope(), "granted": false
+                }),
+            )
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -515,8 +527,9 @@ fn open(config: Config) -> Result<Shared> {
         IssuePublisher::new(config.clone())?,
         genesis(&config),
     )?;
-    if gate.state().evidence.policy.configuration != Some(config.scope())
-        || gate.state().evidence.workspace.0 != "8090-issue-actions"
+    if ![true, false].into_iter().any(|granted| {
+        gate.state().evidence.policy.configuration == Some(config.permission_scope(granted))
+    }) || gate.state().evidence.workspace.0 != "8090-issue-actions"
     {
         return Err(invalid(
             "saved state belongs to another action configuration; use a separate state directory",
@@ -567,11 +580,83 @@ fn view(app: &App, key: &str) -> Result<Value> {
         .operation
         .as_ref()
         .and_then(|id| app.gate.state().operations.get(id));
+    let permission = permission_granted(app)?;
+    let approved = matches!(decision, Decision::Ready { .. });
+    let prior_approval = app
+        .gate
+        .state()
+        .evidence
+        .approvals
+        .values()
+        .any(|approval| approval.context.artifact == *request.artifact());
+    let status = if operation.is_some() {
+        "RELEASE_RECORDED"
+    } else if !permission {
+        "PERMISSION_REVOKED"
+    } else if approved {
+        "READY_TO_CREATE"
+    } else if prior_approval {
+        "FRESH_APPROVAL_REQUIRED"
+    } else {
+        "NEEDS_APPROVAL"
+    };
     Ok(
         json!({"id":key,"revision":request.revision(),"action":action,"context_digest":context,"decision":decision,
-        "operation":operation,"approved":matches!(decision,Decision::Ready{..}),"mode":app.config.mode,
+        "operation":operation,"approved":approved,"can_execute":permission && approved && operation.is_none(),
+        "publication_allowed":permission,"status":status,"mode":app.config.mode,
         "evidence_scope":"Exact submitted action only. Native-agent context and source lineage are not captured."}),
     )
+}
+
+fn permission_granted(app: &App) -> Result<bool> {
+    let saved = &app.gate.state().evidence.policy.configuration;
+    if *saved == Some(app.config.permission_scope(true)) {
+        Ok(true)
+    } else if *saved == Some(app.config.permission_scope(false)) {
+        Ok(false)
+    } else {
+        Err(invalid(
+            "publication permission configuration is unrecognized",
+        ))
+    }
+}
+
+fn permission_value(app: &App) -> Result<Value> {
+    Ok(json!({"granted":permission_granted(app)?,
+        "revision":app.gate.state().evidence.policy.revision,
+        "repository":app.config.github_repository,"tool":TOOL,
+        "scope":"TrustGraph gateway permission to create GitHub issues; GitHub account permissions are unchanged"}))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PermissionChange {
+    granted: bool,
+    revision: u64,
+}
+
+async fn change_permission(
+    State(shared): State<Shared>,
+    headers: HeaderMap,
+    Json(input): Json<PermissionChange>,
+) -> WebResult {
+    locked(shared, move |app| {
+        auth(&headers, app, true)?;
+        if input.revision != app.gate.state().evidence.policy.revision {
+            return Err(Error::Conflict);
+        }
+        if input.granted != permission_granted(app)? {
+            // The same durable policy journal binds permission changes into the
+            // approval context. Regranting cannot revive a pre-revocation approval.
+            app.gate.set_policy_configuration(
+                &"owner".into(),
+                app.config.permission_scope(input.granted),
+                1800,
+            )?;
+        }
+        list_value(app)
+    })
+    .await
 }
 
 struct WebError(Error);
@@ -625,7 +710,7 @@ fn auth(headers: &HeaderMap, app: &App, owner: bool) -> Result<()> {
         .and_then(|s| {
             s.split(';')
                 .map(str::trim)
-                .find_map(|s| s.strip_prefix("trustgraph_actions="))
+                .find_map(|s| s.strip_prefix(&format!("{}=", cookie_name(app))))
         });
     if (owner && (bearer == Some(app.owner.as_str()) || cookie == Some(app.owner.as_str())))
         || (!owner && bearer == Some(app.agent.as_str()))
@@ -634,6 +719,17 @@ fn auth(headers: &HeaderMap, app: &App, owner: bool) -> Result<()> {
     } else {
         Err(Error::Unauthorized)
     }
+}
+fn cookie_name(app: &App) -> String {
+    // Cookies are shared across ports. Keep live and preview sessions separate.
+    format!(
+        "trustgraph_actions_{}",
+        &digest::structured(
+            "issue-operator-session",
+            &(&app.config.directory, app.config.scope())
+        )
+        .0[..16]
+    )
 }
 async fn locked<F>(shared: Shared, operation: F) -> WebResult
 where
@@ -661,14 +757,15 @@ async fn list(State(shared): State<Shared>, headers: HeaderMap) -> WebResult {
     .await
 }
 fn list_value(app: &App) -> Result<Value> {
-    let items = app
-        .gate
-        .visible_requests(&"agent".into())
+    let mut requests = app.gate.visible_requests(&"agent".into());
+    requests.sort_by_key(|request| std::cmp::Reverse(request.created_at));
+    let items = requests
         .iter()
         .map(|r| view(app, &r.id))
         .collect::<Result<Vec<_>>>()?;
     Ok(
-        json!({"mode":app.config.mode,"repository":app.config.github_repository,"tool":TOOL,"items":items}),
+        json!({"mode":app.config.mode,"repository":app.config.github_repository,"tool":TOOL,
+            "publication_permission":permission_value(app)?,"items":items}),
     )
 }
 async fn owner_list(State(shared): State<Shared>, headers: HeaderMap) -> WebResult {
@@ -696,19 +793,38 @@ async fn propose(
 ) -> WebResult {
     locked(shared, move |app| {
         auth(&headers, app, false)?;
-        let artifact = capture(app, input.clone())?;
-        app.gate.submit_request(
-            &"agent".into(),
-            Submission {
-                key: input.key.clone(),
-                title: input.title,
-                summary: "8090 proposal for exact GitHub issue approval".into(),
-                artifact,
-                audience: "issue".into(),
-            },
-            now(),
-        )?;
-        view(app, &input.key)
+        submit(app, input)
+    })
+    .await
+}
+
+fn submit(app: &mut App, input: Proposal) -> Result<Value> {
+    let artifact = capture(app, input.clone())?;
+    app.gate.submit_request(
+        &"agent".into(),
+        Submission {
+            key: input.key.clone(),
+            title: input.title,
+            summary: "8090 proposal for exact GitHub issue approval".into(),
+            artifact,
+            audience: "issue".into(),
+        },
+        now(),
+    )?;
+    view(app, &input.key)
+}
+
+// Operator-mediated handoff for demos without an exposed agent endpoint.
+// The received JSON is an unverified proposal, never an approval or a claim
+// that native 8090 transport/source context was captured.
+async fn import_proposal(
+    State(shared): State<Shared>,
+    headers: HeaderMap,
+    Json(input): Json<Proposal>,
+) -> WebResult {
+    locked(shared, move |app| {
+        auth(&headers, app, true)?;
+        submit(app, input)
     })
     .await
 }
@@ -764,6 +880,9 @@ async fn approve(
 ) -> WebResult {
     locked(shared, move |app| {
         auth(&headers, app, true)?;
+        if !permission_granted(app)? {
+            return Err(invalid("Publication permission is revoked. Restore permission, then review and approve the current issue."));
+        }
         let artifact = current(app, &id, &input)?;
         let key = format!(
             "review-{}",
@@ -792,6 +911,13 @@ async fn execute(
 ) -> WebResult {
     locked(shared, move |app| {
         auth(&headers, app, true)?;
+        // Check the owner-controlled publication grant on every execution,
+        // before reservation or any provider call, even for an old browser tab.
+        if !permission_granted(app)? {
+            return Err(invalid(
+                "Publication permission is revoked. No GitHub issue was created.",
+            ));
+        }
         let artifact = current(app, &id, &input)?;
         let released = app
             .gate
@@ -830,7 +956,8 @@ async fn session(
             (
                 header::SET_COOKIE,
                 format!(
-                    "trustgraph_actions={}; HttpOnly; SameSite=Strict; Path=/",
+                    "{}={}; HttpOnly; SameSite=Strict; Path=/",
+                    cookie_name(&app),
                     app.owner
                 ),
             ),
@@ -847,6 +974,8 @@ fn routers(shared: Shared) -> (Router, Router) {
     })).route("/actions.js",get(|| async { ([(header::CONTENT_TYPE,"text/javascript")],include_str!("../../../web/actions.js")) }))
         .route("/actions.css",get(|| async { ([(header::CONTENT_TYPE,"text/css")],include_str!("../../../web/actions.css")) }))
         .route("/api/session",post(session)).route("/api/actions",get(owner_list))
+        .route("/api/publication-permission",post(change_permission))
+        .route("/api/proposals/import",post(import_proposal))
         .route("/api/actions/{id}/approve",post(approve)).route("/api/actions/{id}/execute",post(execute))
         .layer(DefaultBodyLimit::max(65_536)).with_state(shared.clone());
     let agent = Router::new()
@@ -1167,6 +1296,304 @@ mod tests {
             assert_eq!(calls.lock().unwrap().len(), writes);
             server.abort();
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publication_permission_revocation_is_durable_and_regrant_needs_fresh_approval() {
+        let directory = tempfile::tempdir().unwrap();
+        let schema = json!({"type":"object"});
+        let hash = digest::content(&serde_json::to_vec(&schema).unwrap()).0;
+        let (url, calls, server) = connect_provider(schema, true, false, false).await;
+        let shared = configured_transport(directory.path(), &url, Some(&hash));
+        let (owner, agent) = routers(shared.clone());
+        let first = request(&agent, AGENT, "POST", "/api/actions", proposal())
+            .await
+            .1;
+        let endpoint = "/api/publication-permission";
+        assert_eq!(
+            request(
+                &agent,
+                AGENT,
+                "POST",
+                endpoint,
+                json!({"granted":false,"revision":1})
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            request(
+                &owner,
+                AGENT,
+                "POST",
+                endpoint,
+                json!({"granted":false,"revision":1})
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        let approved = request(
+            &owner,
+            OWNER,
+            "POST",
+            "/api/actions/wo-2-issue/approve",
+            binding(&first),
+        )
+        .await
+        .1;
+        assert_eq!(approved["can_execute"], true);
+        let revoked = request(
+            &owner,
+            OWNER,
+            "POST",
+            endpoint,
+            json!({"granted":false,"revision":1}),
+        )
+        .await;
+        assert_eq!(revoked.0, StatusCode::OK);
+        assert_eq!(revoked.1["publication_permission"]["revision"], 2);
+        let blocked = &revoked.1["items"][0];
+        assert_eq!(blocked["status"], "PERMISSION_REVOKED");
+        assert_eq!(blocked["can_execute"], false);
+        for snapshot in [&first, blocked] {
+            assert_eq!(
+                request(
+                    &owner,
+                    OWNER,
+                    "POST",
+                    "/api/actions/wo-2-issue/execute",
+                    binding(snapshot)
+                )
+                .await
+                .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        assert_eq!(
+            request(
+                &owner,
+                OWNER,
+                "POST",
+                "/api/actions/wo-2-issue/approve",
+                binding(blocked)
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(
+            request(
+                &owner,
+                OWNER,
+                "POST",
+                endpoint,
+                json!({"granted":true,"revision":1})
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        // A repeated desired state at the current revision does not increment it.
+        assert_eq!(
+            request(
+                &owner,
+                OWNER,
+                "POST",
+                endpoint,
+                json!({"granted":false,"revision":2})
+            )
+            .await
+            .1["publication_permission"]["revision"],
+            2
+        );
+        drop(owner);
+        drop(agent);
+        drop(shared);
+        let shared = configured_transport(directory.path(), &url, Some(&hash));
+        let (owner, agent) = routers(shared.clone());
+        let saved = request(&owner, OWNER, "GET", "/api/actions", Value::Null)
+            .await
+            .1;
+        assert_eq!(saved["publication_permission"]["granted"], false);
+        assert_eq!(saved["items"][0]["status"], "PERMISSION_REVOKED");
+        let restored = request(
+            &owner,
+            OWNER,
+            "POST",
+            endpoint,
+            json!({"granted":true,"revision":2}),
+        )
+        .await
+        .1;
+        assert_eq!(restored["publication_permission"]["revision"], 3);
+        let current = &restored["items"][0];
+        assert_eq!(current["status"], "FRESH_APPROVAL_REQUIRED");
+        assert_eq!(current["approved"], false);
+        for verb in ["approve", "execute"] {
+            assert_eq!(
+                request(
+                    &owner,
+                    OWNER,
+                    "POST",
+                    &format!("/api/actions/wo-2-issue/{verb}"),
+                    binding(&first)
+                )
+                .await
+                .0,
+                StatusCode::CONFLICT
+            );
+        }
+        assert_eq!(
+            request(
+                &owner,
+                OWNER,
+                "POST",
+                "/api/actions/wo-2-issue/execute",
+                binding(current)
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(calls.lock().unwrap().is_empty());
+        let reviewed = request(
+            &owner,
+            OWNER,
+            "POST",
+            "/api/actions/wo-2-issue/approve",
+            binding(current),
+        )
+        .await
+        .1;
+        assert_eq!(reviewed["status"], "READY_TO_CREATE");
+        let published = request(
+            &owner,
+            OWNER,
+            "POST",
+            "/api/actions/wo-2-issue/execute",
+            binding(&reviewed),
+        )
+        .await
+        .1;
+        assert_eq!(published["operation"]["state"], "PUBLISHED");
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        let after = request(
+            &owner,
+            OWNER,
+            "POST",
+            endpoint,
+            json!({"granted":false,"revision":3}),
+        )
+        .await
+        .1;
+        assert_eq!(after["items"][0]["operation"], published["operation"]);
+        drop(owner);
+        drop(agent);
+        drop(shared);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn operator_import_stages_unapproved_proposal_and_cannot_be_used_by_agent() {
+        let directory = tempfile::tempdir().unwrap();
+        let (url, calls, server) = provider(true).await;
+        let shared = configured(directory.path(), &url);
+        let (owner, agent) = routers(shared);
+        assert_eq!(
+            request(&owner, AGENT, "POST", "/api/proposals/import", proposal())
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            request(&agent, AGENT, "POST", "/api/proposals/import", proposal())
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        let imported = request(&owner, OWNER, "POST", "/api/proposals/import", proposal()).await;
+        assert_eq!(imported.0, StatusCode::OK);
+        assert_eq!(imported.1["status"], "NEEDS_APPROVAL");
+        assert_eq!(imported.1["can_execute"], false);
+        assert!(imported.1["operation"].is_null());
+        let repeated = request(&owner, OWNER, "POST", "/api/proposals/import", proposal())
+            .await
+            .1;
+        assert_eq!(repeated, imported.1);
+        assert!(calls.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn preview_and_live_operator_cookies_do_not_overwrite_each_other() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let mut cookies = Vec::new();
+        let mut routers_to_check = Vec::new();
+        for directory in [first.path(), second.path()] {
+            let (owner, _) = routers(configured(directory, "http://127.0.0.1:1"));
+            let response = owner
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/session")
+                        .header(header::HOST, "127.0.0.1:18084")
+                        .header(header::AUTHORIZATION, format!("Bearer {OWNER}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            cookies.push(
+                response.headers()[header::SET_COOKIE]
+                    .to_str()
+                    .unwrap()
+                    .split(';')
+                    .next()
+                    .unwrap()
+                    .to_owned(),
+            );
+            routers_to_check.push(owner);
+        }
+        assert_ne!(cookies[0].split('=').next(), cookies[1].split('=').next());
+        for owner in routers_to_check {
+            let response = owner
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/actions")
+                        .header(header::HOST, "127.0.0.1:18084")
+                        .header(header::COOKIE, cookies.join("; "))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    #[test]
+    fn actual_workspace_reopens_with_revoked_publication_permission() {
+        let directory = tempfile::tempdir().unwrap();
+        let config: Config = serde_json::from_value(json!({
+            "directory":directory.path(),"github_repository":"example/demo","mode":"preview"
+        }))
+        .unwrap();
+        let app = open(config.clone()).unwrap();
+        {
+            let mut app = app.lock().unwrap();
+            app.gate
+                .set_policy_configuration(&"owner".into(), config.permission_scope(false), 1800)
+                .unwrap();
+        }
+        drop(app);
+        let app = open(config).unwrap();
+        assert!(!permission_granted(&app.lock().unwrap()).unwrap());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

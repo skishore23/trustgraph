@@ -43,6 +43,8 @@ for Mermaid component, sequence, evidence-flow and recovery diagrams.
 For a native 8090 agent proposing a GitHub issue through human approval and
 Composio, see the [issue-action demo](docs/8090-issue-actions.md). It has a preview
 mode and does not use a patch generator.
+For a short presentation with publication grant/revoke controls, follow the
+[live issue demo runbook](docs/one-hour-issue-demo.md).
 
 The live gateway uses authenticated Codex, HydraDB and GitHub integrations,
 macOS for isolated Rust checks, and a dedicated private personal repository.
