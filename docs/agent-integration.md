@@ -3,7 +3,8 @@
 Connect the calling agent to a running TrustGraph workspace. The caller delegates
 a protected task; TrustGraph owns the fresh generation and publication boundary.
 The MCP server is a local stdio adapter to the same HTTP API used by the live UI.
-It does not run a separate fixture workspace.
+See the [architecture sequence](architecture.md#from-task-to-publication) for
+the full generation, review and publication flow.
 
 ## 1. Start TrustGraph
 
@@ -43,6 +44,10 @@ Codex shares MCP configuration across its CLI and editor integrations. See the
 Other MCP clients can launch the same command and arguments as a stdio server.
 The adapter accepts only a loopback HTTP origin, disables proxies and redirects,
 and does not retry HTTP requests automatically.
+
+The two paths in this example serve different purposes: `command` points to the
+built binary, while `--token-file` points to `agent-token` inside the configured
+state directory. Replace both placeholders with actual absolute paths.
 
 ## 3. Give the agent a workflow
 
@@ -126,4 +131,6 @@ not create remote connectivity.
 Submit work/repair once. If a transport reply is lost, inspect workspace/status
 before resubmitting: task intake has no idempotency-key contract. The adapter
 never silently retries a mutation. The runtime’s publication journal separately
-handles stable operation keys and uncertain external outcomes.
+handles stable operation keys and uncertain external outcomes. See
+[publication recovery](architecture.md#storage-publication-and-recovery) for the
+current GitHub adapter's receipt lookup limits.

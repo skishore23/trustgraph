@@ -4,10 +4,14 @@ TrustGraph separates source access from approval. A reviewer must be allowed to
 access the work, and review cannot grant a department access to restricted
 information. Derived artifacts retain their recorded input restrictions.
 
+The [architecture guide](architecture.md#evidence-and-inherited-access) explains
+how Rust derives those restrictions from the evidence graph.
+
 ## Company policy: YAML
 
-The guided company workspace uses the strict Rust `PolicySpec` format. A complete
-example is [company-policy.yaml](../examples/company-policy.yaml).
+The guided company workspace compiles its structured policy controls into the
+strict Rust `PolicySpec` format and displays the resulting YAML. A complete
+schema example is [company-policy.yaml](../examples/company-policy.yaml).
 
 ```yaml
 groups:
@@ -37,8 +41,8 @@ is not an exception to that boundary.
 
 ## Live coding workspace: JSON
 
-The repository runner exposes a smaller `WorkPolicy` contract. This is **not** a
-YAML upload endpoint. Its fields reflect the currently supported code executor:
+The live repository runner accepts a smaller JSON `WorkPolicy` contract. Its
+fields reflect the currently supported code executor:
 
 ```json
 {
@@ -63,6 +67,9 @@ supported for the personal-workbench mode. Live execution currently supports
 Use the guided simulator without services, or the live Simulator/MCP/CLI with
 a configured Hydra workspace. Both use the Rust verifier; the live wrapper also
 checks file scope and actual-run test requirements.
+
+For the following command, first complete [live setup](development.md), start
+the workspace and run from the repository root:
 
 ```sh
 ./target/debug/trustgraph policy-simulate \
@@ -89,6 +96,8 @@ Approval assumptions are `missing`, `valid`, `stale`, `previous_policy`,
 | Missing lineage or failed required tests | Blocks |
 | Change proposed source readers | Recompute inherited access; does not activate the grant |
 
+`tests_passed` and approval fields are scenario assumptions in a simulation.
+They do not attest that actual work has passed tests or received human review.
 Simulation does not generate a patch, execute code, activate policy or publish.
 The live API records its assumptions and comparison in HydraDB. The guided story
 fixes its clock and evidence for identical result fingerprints; live requests use

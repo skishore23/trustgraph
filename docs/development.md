@@ -1,5 +1,9 @@
 # Build and live setup
 
+Run commands from the repository root. For the component and data-flow diagrams,
+see [architecture](architecture.md); for a service-free introduction, use the
+[guided demo](demo.md).
+
 ## Local checks
 
 ```sh
@@ -16,20 +20,29 @@ and the live MCP adapter over a real stdio client with a mock HTTP backend.
 An opt-in standalone-Hydra contract test is ignored unless explicitly configured.
 No external publishing is performed by the normal test suite.
 
-Useful advanced commands: `compile-plan examples/launch-plan.json` analyzes a
-typed fixture plan;
-`simulate --output /tmp/campaign.json` saves virtual schedules;
-`replay /tmp/campaign.json` verifies them. `check-model --broken-rule` deliberately
-finds a stale-approval counterexample within the finite model. These are bounded
-checks, not a proof about every possible deployment.
+Compile the typed fixture plan or save and replay a virtual campaign:
+
+```sh
+cargo run --locked -p trustgraph-cli -- compile-plan examples/launch-plan.json
+cargo run --locked -p trustgraph-cli -- simulate --seed 0 --count 64 --output /tmp/trustgraph-campaign.json
+cargo run --locked -p trustgraph-cli -- replay /tmp/trustgraph-campaign.json
+```
+
+`check-model --broken-rule` deliberately finds a stale-approval counterexample
+within the finite model. These checks cover the declared bounds and scenarios.
 
 ## Start the live workspace
 
-Requirements: Rust 1.90 or newer; authenticated `codex`, `hydradb` and `gh` CLIs; macOS
-`sandbox-exec` for isolated Rust checks; and a dedicated private GitHub repository
-owned by the signed-in personal account. The publisher verifies repository
-privacy and collaborators. The current runner is intentionally a small Rust
-workbench, not an executor for arbitrary projects or build scripts.
+Requirements:
+
+- Rust 1.90 or newer, managed by `rustup` for the live check runner.
+- Authenticated `codex`, `hydradb` and `gh` CLIs.
+- macOS with `sandbox-exec` for isolated Rust checks.
+- A dedicated private personal GitHub repository with a `main` branch and the
+  signed-in owner as its sole collaborator.
+
+The publisher verifies repository privacy, collaborators and the base commit.
+The runner executes a small Rust workbench with a direct `rustc --test` harness.
 
 Copy the [configuration template](../trustgraph.example.json), then replace the
 absolute paths and GitHub repository name in the local copy:
@@ -41,11 +54,16 @@ cp trustgraph.example.json trustgraph.local.json
 `trustgraph.local.json` is ignored by Git. Keep machine-specific paths and
 configuration in that file; the checked-in template contains only placeholders.
 
-The target must be a clean Git checkout of that private repository, with the small
-Rust fixture in `src/lib.rs`. Source imports read **committed Git bytes** from
+The target must be a clean Git checkout of that private repository with committed
+`src/lib.rs`, `README.md` and `Cargo.toml` files. The Rust fixture and its tests
+belong in `src/lib.rs`. Source imports read **committed Git bytes** from
 `context_repository`. Commit controlled inputs before importing them. Use a new
 state directory for a different repository or audience; only one server may own
 it. Department-mode evidence uses the `bank-departments` namespace.
+
+The hosted Hydra adapter reads the authenticated CLI configuration from
+`~/.hydradb/config.json`, or the path in `TRUSTGRAPH_HYDRA_CONFIG`. It requires
+an API key and database and currently accepts the official hosted service.
 
 ```sh
 cargo build --locked -p trustgraph-cli
@@ -85,11 +103,8 @@ and tool calls over stdio against a mock HTTP backend, including a lost mutation
 reply. Those tests do not re-run Codex, Hydra or GitHub. The no-service story is
 separately tested through its full policy/release/revision lifecycle.
 
-Permissions are configured department identities, not enterprise IAM. The local
-operator can read restricted sources and admit work orders. There is no SSO,
-multitenancy, remote hosted-agent deployment or Composio adapter. The runner
-supports `src/lib.rs` and `README.md`; dependency installation and arbitrary build
-scripts are unsupported. Test execution restricts filesystem and network access.
-These controls establish modeled provenance/access and exact review, not an
-absolute guarantee of correct code or absence of secrets. See
-[the architecture boundary](architecture.md#scope).
+The operator can read restricted sources and admit work orders. Live changes
+are limited to `src/lib.rs` and `README.md`; test execution restricts filesystem
+and network access. For configured identity boundaries and execution limits, see
+[scope](architecture.md#scope). For uncertain publication outcomes and receipt
+synchronization, see [recovery](architecture.md#storage-publication-and-recovery).
