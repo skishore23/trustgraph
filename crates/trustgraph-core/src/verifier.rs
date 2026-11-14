@@ -54,23 +54,7 @@ pub fn verify(e: &Evidence, intent: &Intent, now: u64) -> Decision {
         return block(Code::RestrictedSource, witness);
     }
     let artifact = e.artifacts.get(&intent.artifact).expect("validated root");
-    let context = Context {
-        workspace: e.workspace.clone(),
-        artifact: intent.artifact.clone(),
-        artifact_hash: artifact.hash.clone(),
-        audience: audience.clone(),
-        action: "publish".into(),
-        policy_hash: digest::structured("policy", &e.policy),
-        lineage_hash: digest::structured(
-            "lineage",
-            &(
-                &closure.artifacts,
-                &closure.transformations,
-                &closure.sources,
-            ),
-        ),
-        acl_hash: digest::structured("source-acls", &closure.acls),
-    };
+    let context = bind_context(e, intent, &closure, audience);
     let mut failure = None;
     let mut stale = false;
     for (id, approval) in &e.approvals {
@@ -120,4 +104,51 @@ pub fn verify(e: &Evidence, intent: &Intent, now: u64) -> Decision {
         return block(Code::StaleApproval, None);
     }
     Decision::PendingApproval { context }
+}
+
+/// Describe the exact publication binding for diagnostics, including when the
+/// permission check fails. This is not authorization: only `verify` can return
+/// Ready. Callers must separately authorize access to this metadata.
+pub fn publication_binding(e: &Evidence, intent: &Intent) -> Result<Context, Code> {
+    if !e.complete {
+        return Err(Code::IncompleteLineage);
+    }
+    let closure = lineage::load(e, &intent.artifact)?;
+    let audience = e
+        .audiences
+        .get(&intent.audience)
+        .ok_or(Code::AudienceUnresolved)?;
+    if e.policy.workspace != e.workspace || audience.workspace != e.workspace {
+        return Err(Code::CrossWorkspace);
+    }
+    if audience.id != intent.audience || audience.revision == 0 || !audience.resolved {
+        return Err(Code::AudienceUnresolved);
+    }
+    Ok(bind_context(e, intent, &closure, audience))
+}
+
+fn bind_context(
+    e: &Evidence,
+    intent: &Intent,
+    closure: &lineage::Closure<'_>,
+    audience: &Audience,
+) -> Context {
+    let artifact = e.artifacts.get(&intent.artifact).expect("validated root");
+    Context {
+        workspace: e.workspace.clone(),
+        artifact: intent.artifact.clone(),
+        artifact_hash: artifact.hash.clone(),
+        audience: audience.clone(),
+        action: "publish".into(),
+        policy_hash: digest::structured("policy", &e.policy),
+        lineage_hash: digest::structured(
+            "lineage",
+            &(
+                &closure.artifacts,
+                &closure.transformations,
+                &closure.sources,
+            ),
+        ),
+        acl_hash: digest::structured("source-acls", &closure.acls),
+    }
 }

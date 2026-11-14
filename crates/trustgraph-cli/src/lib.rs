@@ -4,3 +4,4 @@ pub mod mcp;
 mod planner;
 mod policies;
 mod scenario;
+mod showcase;

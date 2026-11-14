@@ -13,7 +13,10 @@ repair and requires approval of the actual artifact and destination.
 The [small explicit policy layer](docs/policies.md) lets you author versioned YAML,
 run five deterministic cases and activate a reviewed policy atomically. A coding
 agent can propose and test policies through MCP, but cannot activate or approve.
-See the [bank walkthrough](docs/bank-demo.md) and [policy examples](examples/bank-policy.yaml).
+The [three-chapter guided demo](docs/bank-story-demo.md) shows restricted inputs,
+exact approval binding and a hypothetical access change across a five-level
+release graph. The [agent workflow](docs/bank-demo.md) and
+[policy examples](examples/bank-policy.yaml) cover the persistent workspace.
 
 The app uses synthetic documents, fixture patch generation and local simulated
 delivery. **Real isolated coding-agent input capture and the gated Composio branch/PR
@@ -36,13 +39,20 @@ cargo run --locked -p trustgraph-cli -- policy-check examples/bank-policy.yaml
 cargo run --locked -p trustgraph-cli -- serve
 ```
 
-Open [the permission simulator](http://127.0.0.1:8080/#/simulator) as Arun for the
-Risk view, or Maya for Engineering. Select evidence and choose Engineering’s
+Open [the bank walkthrough](http://127.0.0.1:8080/#/demo). Click **Reset demo**
+for the rehearsable three-chapter story. Preview as **Ravi** (internal ID `arun`)
+for restricted work, then **Maya** for the approval chapter. The walkthrough uses
+a fixed fictional policy and separate in-memory history; it never mutates the
+persistent workspace or calls a publisher. Reports are fixtures, not executed-test
+attestations.
+
+For the configurable agent workflow, open [the permission simulator](http://127.0.0.1:8080/#/simulator)
+as Ravi for Risk or Maya for Engineering. Select evidence and choose Engineering’s
 repository or the Risk review room. The real
 Rust compiler powers the verdict and document/recipient permission matrix.
 
 Keep the audience and omit unshareable evidence, or keep the evidence and restrict
-the audience. A passing selection can **Prepare memo for review**. The broker
+the audience. A passing selection can **Prepare patch for review**. The broker
 records the actual inputs and content, then requires a human to **Approve & release**
 the exact version and destination. Reviews, Deliveries and Sources support this
 workflow. Typed Agent plans and bounded Verification remain under Advanced.
@@ -86,7 +96,7 @@ Real 8090 documents and ACLs are not imported by this synthetic integration.
 
 | Stage | Deliverable | Status |
 | --- | --- | --- |
-| Product demo | Bank Engineering/Risk patch, source/audience simulator and guarded review | Implemented with synthetic data |
+| Product demo | Three-chapter bank walkthrough, source/audience simulator, scoped release impact and guarded review | Implemented with synthetic data and a resettable isolated sandbox |
 | Policy layer | Explicit YAML, immutable versions, five-case suite, atomic human activation and MCP proposal/testing | Implemented |
 | 1. Typed compiler | Read/Generate/Approve/Publish contracts, ordered references, explicit input manifests and runtime approval obligation | Implemented |
 | 2. Counterexample and repairs | Concrete forbidden recipient/source/path; narrower audience or fresh permitted context; no ACL changes | Implemented and tested |

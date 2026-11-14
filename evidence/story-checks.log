@@ -1,0 +1,248 @@
+    Checking trustgraph-core v0.1.0 (/Users/kishore/TrustGraph/crates/trustgraph-core)
+    Checking trustgraph-runtime v0.1.0 (/Users/kishore/TrustGraph/crates/trustgraph-runtime)
+    Checking trustgraph-sim v0.1.0 (/Users/kishore/TrustGraph/crates/trustgraph-sim)
+    Checking trustgraph-cli v0.1.0 (/Users/kishore/TrustGraph/crates/trustgraph-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.22s
+   Compiling trustgraph-core v0.1.0 (/Users/kishore/TrustGraph/crates/trustgraph-core)
+   Compiling trustgraph-runtime v0.1.0 (/Users/kishore/TrustGraph/crates/trustgraph-runtime)
+   Compiling trustgraph-sim v0.1.0 (/Users/kishore/TrustGraph/crates/trustgraph-sim)
+   Compiling trustgraph-cli v0.1.0 (/Users/kishore/TrustGraph/crates/trustgraph-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.44s
+     Running unittests src/lib.rs (target/debug/deps/trustgraph_cli-ffa0ebb2f897d20d)
+
+running 1 test
+test scenario::tests::permission_snapshot_drift_rejects_stale_prepare_and_creates_a_distinct_fresh_run ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+
+     Running unittests src/main.rs (target/debug/deps/trustgraph-19544046c6544059)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/bank_policy_workflow.rs (target/debug/deps/bank_policy_workflow-9b1b22ab6fc82355)
+
+running 1 test
+test bank_scopes_policy_tests_and_human_activation_are_connected ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running tests/consulting_workflow.rs (target/debug/deps/consulting_workflow-d0e99226900cbcba)
+
+running 1 test
+test consulting_simulation_enforces_evidence_scope_and_prepares_reviewable_memos ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+     Running tests/http_workflow.rs (target/debug/deps/http_workflow-040aff3ea71cf6f1)
+
+running 1 test
+test review_http_flow_enforces_roles_and_serves_exact_receipt ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+
+     Running tests/inbox_workflow.rs (target/debug/deps/inbox_workflow-92d7f69d135d4146)
+
+running 1 test
+test agent_handoff_feedback_revision_and_release_work_through_http ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+
+     Running tests/mcp_workflow.rs (target/debug/deps/mcp_workflow-5324451433aa32d2)
+
+running 6 tests
+test bridge_rejects_nonlocal_urls_and_credential_bearing_destinations ... ok
+test mcp_requires_a_scoped_capability_and_lists_no_human_authority ... ok
+test private_agent_capability_is_reused_when_the_workspace_reopens ... ok
+test actual_mcp_tools_connect_blocked_plan_repairs_human_review_and_receipt ... ok
+test real_stdio_child_uses_the_running_app_without_a_second_journal_owner ... ok
+test stdio_bridge_does_not_resend_when_a_prepare_reply_is_lost_after_commit ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.47s
+
+     Running tests/plan_workflow.rs (target/debug/deps/plan_workflow-9647e02a8acf005b)
+
+running 1 test
+test unsafe_plan_repair_generation_human_review_and_release_are_connected ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+
+     Running tests/showcase_workflow.rs (target/debug/deps/showcase_workflow-9a7bff2d462cc6a8)
+
+running 1 test
+test bank_walkthrough_uses_role_gates_and_never_mutates_the_workspace_journal ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+
+     Running unittests src/lib.rs (target/debug/deps/trustgraph_core-f34fe1db8aeb6b18)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/governance.rs (target/debug/deps/governance-f5f5d9ffbb4711ca)
+
+running 16 tests
+test broad_audience_is_blocked_by_transitive_private_source ... ok
+test human_approval_cannot_override_source_permissions ... ok
+test repeated_input_occurrences_are_valid_but_duplicate_occurrence_identity_is_not ... ok
+test editing_one_byte_creates_a_different_binding ... ok
+test schema_equations_cycles_and_tampered_bytes_fail_closed ... ok
+test exact_bytes_and_structured_domains_have_distinct_hashes ... ok
+test public_rewrite_with_private_previous_draft_stays_restricted ... ok
+test missing_or_untrusted_provenance_blocks ... ok
+test safe_generation_waits_for_human_approval_then_becomes_ready ... ok
+test unauthorized_actor_gets_no_restricted_metadata ... ok
+test unknown_audiences_and_cross_workspace_recipients_block ... ok
+test revoked_expired_future_or_ineligible_approval_never_authorizes ... ok
+test every_publication_binding_field_matters ... ok
+test traversal_limit_is_unknown_instead_of_assuming_no_restricted_ancestors ... ok
+test shared_subtree_cache_cannot_hide_an_over_limit_path ... ok
+test readership_meet_is_associative_commutative_idempotent_and_never_widens ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+     Running unittests src/lib.rs (target/debug/deps/trustgraph_runtime-0edb24dd8aadd24f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/compiler.rs (target/debug/deps/compiler-62561348dc1740ba)
+
+running 5 tests
+test every_fresh_generation_records_its_prompt_as_a_direct_input ... ok
+test compiler_names_a_concrete_unauthorized_recipient_and_dependency_path ... ok
+test approval_is_an_obligation_after_generation_and_must_match_publication ... ok
+test bad_references_missing_prompt_and_private_metadata_fail_closed ... ok
+test both_repairs_recompile_without_changing_acl_or_claiming_equal_content ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/hydra_contract.rs (target/debug/deps/hydra_contract-5910900fc06d9454)
+
+running 2 tests
+test real_hydra_projection_roundtrip_is_idempotent_and_complete ... ignored, requires an actual Hydra server, token and an explicitly owned numeric ID range
+test connected_projection_has_distinct_incidence_records_and_no_unrelated_private_data ... ok
+
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/hydra_protocol.rs (target/debug/deps/hydra_protocol-e630b2524fd6eca1)
+
+running 6 tests
+test failed_consuming_page_discards_all_rows_without_retry ... ok
+test write_bookmark_is_propagated_and_a_later_missing_ack_is_rejected ... ok
+test remote_bundle_load_requires_one_well_formed_root_and_valid_body ... ok
+test consuming_cursor_keeps_full_request_and_accepts_constant_handle ... ok
+test null_optional_row_is_not_an_identity_and_malformed_envelopes_fail ... ok
+test reconstructed_hydra_bundle_requires_every_record_relation_and_completion ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/plan_runs.rs (target/debug/deps/plan_runs-e818117a1722a077)
+
+running 6 tests
+test malformed_plan_cannot_hide_an_unreadable_source_after_an_earlier_error ... ok
+test run_reservation_recovers_without_duplicate_generation_or_review ... ok
+test a_long_unicode_goal_can_prepare_a_bounded_review_title ... ok
+test a_review_cannot_substitute_the_plan_output_or_publish_after_acl_drift ... ok
+test unsafe_plan_has_no_generation_effect_and_repairs_prepare_a_real_review ... ok
+test every_prepare_commit_boundary_resumes_once_and_partial_outputs_cannot_bypass_review ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/policy_layer.rs (target/debug/deps/policy_layer-35356bb9236fbb14)
+
+running 2 tests
+test unsupported_rules_missing_evidence_and_disabled_approval_are_rejected ... ok
+test policy_versions_are_explicit_atomic_and_cannot_expand_source_authority ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/showcase.rs (target/debug/deps/showcase-74409fe03a5df1e9)
+
+running 4 tests
+test restricted_generation_blocks_and_fresh_generation_has_no_old_context ... ok
+test forward_impact_distinguishes_forbidden_stale_and_independent_ready_work ... ok
+test changing_the_other_source_traverses_a_different_branch_and_expiry_is_real ... ok
+test exact_approval_is_preserved_but_cannot_authorize_an_edit_or_new_destination ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests/submissions.rs (target/debug/deps/submissions-cddfa392550a88c6)
+
+running 5 tests
+test intake_retry_cannot_return_an_unreadable_later_revision ... ok
+test agent_intake_is_persistent_idempotent_and_scoped_to_reviewers ... ok
+test release_is_fenced_idempotent_and_agent_cannot_approve ... ok
+test returning_work_records_feedback_revokes_old_approval_and_requires_agent_revision ... ok
+test release_linkage_survives_loss_of_a_separate_post_dispatch_write ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/workflow.rs (target/debug/deps/workflow-52968d9a6ca5d947)
+
+running 12 tests
+test agent_cannot_approve_or_change_acl_and_sales_cannot_read_private_draft ... ok
+test editing_an_older_version_creates_a_new_version_without_overwriting ... ok
+test verification_is_repeated_after_acl_change_before_dispatch ... ok
+test timeout_without_acceptance_stays_unknown_and_is_not_retried ... ok
+test idempotency_keys_cannot_change_payload_and_never_dispatch_twice ... ok
+test timeout_after_acceptance_reconciles_same_operation_without_resending ... ok
+test demo_uses_exact_approved_bytes_and_refuses_changed_draft ... ok
+test uncertain_journal_write_poisons_coordinator_until_recovery ... ok
+test restart_after_send_before_outcome_commit_reconciles_without_second_send ... ok
+test torn_or_modified_journal_never_allows_new_publication ... ok
+test content_store_uses_exact_hashes_and_detects_modified_blob_bytes ... ok
+test durable_state_and_provider_ledger_survive_real_disk_reopen ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running unittests src/lib.rs (target/debug/deps/trustgraph_sim-cc9840a2108f4f45)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/bounded_checker.rs (target/debug/deps/bounded_checker-d7943bef2d9f547a)
+
+running 2 tests
+test deliberate_approval_reuse_produces_a_shortest_replayable_counterexample ... ok
+test production_gate_passes_every_reachable_state_within_declared_bounds ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+     Running tests/scenarios.rs (target/debug/deps/scenarios-d37cfa07850dea71)
+
+running 4 tests
+test expired_approval_and_changed_audience_or_policy_cannot_publish ... ok
+test full_demo_contains_permission_block_stale_approval_and_one_exact_publication ... ok
+test crash_and_provider_recovery_observe_original_operation_only ... ok
+test seeded_races_cover_both_orders_without_unauthorized_publication ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.12s
+
+   Doc-tests trustgraph_cli
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests trustgraph_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests trustgraph_runtime
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests trustgraph_sim
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

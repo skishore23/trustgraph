@@ -72,6 +72,25 @@ fn build_router(directory: &FilePath, scenario: &str) -> Result<Router, Error> {
         .merge(crate::planner::routes())
         .merge(crate::scenario::routes())
         .merge(crate::policies::routes())
+        .merge(crate::showcase::routes()?)
+        .route(
+            "/showcase.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../../../web/showcase.js"),
+                )
+            }),
+        )
+        .route(
+            "/showcase.css",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+                    include_str!("../../../web/showcase.css"),
+                )
+            }),
+        )
         .route(
             "/policies.js",
             get(|| async {
