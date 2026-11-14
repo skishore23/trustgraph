@@ -22,6 +22,9 @@ Simulator → Enforce → Revision**. The demo uses fictional data, a fixed cloc
 and in-memory state. It needs no sign-in or external services and records
 releases locally. See the [demo walkthrough](docs/demo.md).
 
+The same fictional story can be hosted on Vercel with the Rust policy engine.
+See [public demo deployment](docs/vercel.md) for setup and visitor-state behavior.
+
 ## Architecture
 
 TrustGraph combines three responsibilities:

@@ -1,5 +1,7 @@
 # Build output and local runtime state
 /target/
+/.vercel/
+/public/
 /.trustgraph*/
 /trustgraph.local.json
 /trustgraph-actions*.local.json

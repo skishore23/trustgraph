@@ -1,4 +1,13 @@
 const main = document.querySelector('#main');
+const hostedDemo = document.querySelector('meta[name="trustgraph-mode"]')?.content === 'hosted';
+const historyKey = 'trustgraph:demo:v1';
+let demoHistory = [];
+if (hostedDemo) {
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(historyKey) || '[]');
+    if (Array.isArray(saved) && saved.length <= 64) demoHistory = saved;
+  } catch { /* Storage is optional; this tab can still run the demo. */ }
+}
 const clone = value => JSON.parse(JSON.stringify(value));
 const escape = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const chapters = [
@@ -27,6 +36,18 @@ const footer = (takeaway, next, nextLabel) => `<div class="chapter-footer"><p cl
 const checkRow = (title,value,tone='') => `<div class="check-row"><dt>${escape(title)}</dt><dd class="${tone}">${escape(value)}</dd></div>`;
 const evidence = (label,value) => `<details class="evidence"><summary>${escape(label)}</summary><pre>${pretty(value)}</pre></details>`;
 async function api(path='', body) {
+  if (hostedDemo) {
+    const history = path === '/reset' ? [] : demoHistory;
+    const request = {history};
+    if (path === '/compare') request.comparison = body;
+    else if (body !== undefined && path !== '/reset') request.command = body;
+    const response = await fetch('/api/demo', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(request)});
+    const value = await response.json();
+    if (!response.ok) throw Error(value.error || 'The demo could not complete this step.');
+    demoHistory = request.command ? [...history, request.command] : history;
+    try { sessionStorage.setItem(historyKey, JSON.stringify(demoHistory)); } catch { /* Keep progress in memory. */ }
+    return value;
+  }
   const response = await fetch('/api/story'+path, {method:body===undefined?'GET':'POST',headers:body===undefined?{}:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body)});
   const value = await response.json();
   if (!response.ok) throw Error(value.error || 'The request could not be completed.');

@@ -1,0 +1,10 @@
+.git
+.trustgraph*
+.env*
+trustgraph.local.json
+trustgraph-actions*.local.json
+target
+node_modules
+media
+public
+__pycache__
