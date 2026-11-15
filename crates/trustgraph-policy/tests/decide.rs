@@ -178,3 +178,37 @@ fn lints_fire() {
     p.agents.insert("idle".into());
     find(&p, "unused_agent", "agents.idle", Severity::Warning);
 }
+
+fn assert_audience_denied(p: &Policy) {
+    let out = decide(p, &query(["roadmap"], "planner", "post_to_slack"));
+    assert_eq!(out.verdict, Verdict::Deny, "{out:?}");
+    assert_eq!(out.code, "recipients_outside_audience");
+}
+
+#[test]
+fn audience_resolving_to_nobody_is_denied() {
+    let mut p = spec();
+    p.actions.get_mut("post_to_slack").unwrap().audience.clear();
+    assert_audience_denied(&p);
+
+    let mut p = spec();
+    p.actions
+        .get_mut("post_to_slack")
+        .unwrap()
+        .audience
+        .insert("bogus".into());
+    assert_audience_denied(&p);
+
+    let mut p = spec();
+    p.groups.get_mut("engineering").unwrap().clear();
+    assert_audience_denied(&p);
+}
+
+#[test]
+fn source_with_no_readers_never_allows() {
+    let mut p = spec();
+    p.sources.get_mut("roadmap").unwrap().readers.clear();
+    let out = decide(&p, &query(["roadmap"], "planner", "post_to_slack"));
+    assert_eq!(out.verdict, Verdict::Deny);
+    assert_eq!(out.code, "audience_outside_readers");
+}

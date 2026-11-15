@@ -58,9 +58,11 @@ pub fn decide(policy: &Policy, query: &Query) -> Outcome {
     let has_sources = !query.output_from.is_empty();
     let resolved = action_known && agent_known && sources_known;
 
-    let agent_listed = action.is_some_and(|a| a.agents.contains(&query.agent));
+    let agent_listed =
+        resolved && has_sources && action.is_some_and(|a| a.agents.contains(&query.agent));
     let agent_may_use_inputs = resolved
         && has_sources
+        && agent_listed
         && query
             .output_from
             .iter()
@@ -83,27 +85,25 @@ pub fn decide(policy: &Policy, query: &Query) -> Outcome {
     let mut recipients: BTreeSet<String> = BTreeSet::new();
     let mut recipients_in_audience = false;
     let mut recipient_names: BTreeSet<String> = BTreeSet::new();
-    if let Some(action) = action {
+    if let (Some(action), true) = (action, agent_listed && agent_may_use_inputs) {
         let audience = policy.people(&action.audience);
+        let audience_ok = resolves_to_people(policy, &action.audience);
         match &query.recipients {
             None => {
                 recipient_names = action.audience.clone();
                 recipients = audience;
-                recipients_in_audience = true;
+                recipients_in_audience = audience_ok;
             }
             Some(explicit) => {
                 recipient_names = explicit.clone();
                 recipients = policy.people(explicit);
-                // Names that resolve to nobody must never pass vacuously.
-                let all_resolve = explicit
-                    .iter()
-                    .all(|n| !policy.people(&BTreeSet::from([n.clone()])).is_empty());
-                recipients_in_audience =
-                    !explicit.is_empty() && all_resolve && can_flow(&audience, &recipients);
+                recipients_in_audience = audience_ok
+                    && resolves_to_people(policy, explicit)
+                    && can_flow(&audience, &recipients);
             }
         }
     }
-    let audience_in_readers = resolved && can_flow(&readers, &recipients);
+    let audience_in_readers = recipients_in_audience && can_flow(&readers, &recipients);
 
     let facts = Facts {
         action_known,
@@ -148,6 +148,15 @@ pub fn decide(policy: &Policy, query: &Query) -> Outcome {
         blocking,
         readers: if resolved { readers } else { BTreeSet::new() },
     }
+}
+
+/// True when `names` is non-empty and every name is a group with members or a
+/// person, so a subset check against it can never pass vacuously.
+fn resolves_to_people(policy: &Policy, names: &BTreeSet<String>) -> bool {
+    !names.is_empty()
+        && names
+            .iter()
+            .all(|n| !policy.people(&BTreeSet::from([n.clone()])).is_empty())
 }
 
 fn first_missing<'a>(
