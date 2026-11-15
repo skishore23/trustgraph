@@ -76,8 +76,8 @@ Requests are limited to 128 KiB and 64 commands. Restart the story to begin
 another walkthrough. Failed commands are not added to browser history.
 
 Client history is editable hypothetical demo input. These simulated approvals
-never authorize a live publisher. The local `story`, live `start`, and issue
-`actions` workflows retain their existing access controls and storage.
+never authorize a live publisher. The local `story`, live `start`, and [Composio issue example](../examples/integrations/composio-github-issues/README.md)
+workflows retain their existing access controls and storage.
 
 ## Remote MCP
 

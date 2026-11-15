@@ -18,18 +18,6 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
-    /// Review native-agent GitHub issue proposals, then execute through Composio.
-    Actions {
-        #[arg(long, default_value = "trustgraph-actions.local.json")]
-        config: PathBuf,
-        #[arg(long, default_value_t = 8084)]
-        port: u16,
-        #[arg(long, default_value_t = 8085)]
-        agent_port: u16,
-        /// Verify Connect MCP credentials, account and schema without starting or writing an issue.
-        #[arg(long)]
-        check: bool,
-    },
     /// Open the guided, deterministic company-governance demo. No sign-in or external effects.
     Story {
         #[arg(long, default_value_t = 9081)]
@@ -152,19 +140,6 @@ fn save(path: &Path, value: &impl serde::Serialize) -> Result<(), Box<dyn Error>
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     match Cli::parse().command {
-        Command::Actions {
-            config,
-            port,
-            agent_port,
-            check,
-        } => {
-            if check {
-                tokio::task::spawn_blocking(move || trustgraph_cli::actions::check(&config))
-                    .await??;
-            } else {
-                trustgraph_cli::actions::serve(&config, port, agent_port).await?;
-            }
-        }
         Command::Story { port } => {
             let app = trustgraph_cli::story::router()?;
             let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;

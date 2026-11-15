@@ -2,9 +2,9 @@
 /target/
 /.vercel/
 /public/
-/.trustgraph*/
+.trustgraph*/
 /trustgraph.local.json
-/trustgraph-actions*.local.json
+trustgraph-actions*.local.json
 
 # Credentials
 /.env

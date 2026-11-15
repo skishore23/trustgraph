@@ -2,7 +2,7 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
-const source = fs.readFileSync('web/actions.js', 'utf8').replace(/start\(\);\s*$/, '');
+const source = fs.readFileSync(require('node:path').join(__dirname, '..', 'web', 'actions.js'), 'utf8').replace(/start\(\);\s*$/, '');
 const context = vm.createContext({ document: {}, localStorage: { getItem: () => null, setItem: () => {} } });
 vm.runInContext(source, context);
 const base = { context_digest: 'current', revision: 1, publication_allowed: true, approved: true, review_history: [{ current: true }], operation: null };

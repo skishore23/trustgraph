@@ -1008,9 +1008,9 @@ async fn session(
 fn routers(shared: Shared) -> (Router, Router) {
     let owner = Router::new().route("/",get(|| async {
         ([(header::CONTENT_SECURITY_POLICY,"default-src 'self'; script-src 'self'; style-src 'self'; frame-ancestors 'none'; base-uri 'none'"),
-          (header::CACHE_CONTROL,"no-store")],Html(include_str!("../../../web/actions.html")))
-    })).route("/actions.js",get(|| async { ([(header::CONTENT_TYPE,"text/javascript")],include_str!("../../../web/actions.js")) }))
-        .route("/actions.css",get(|| async { ([(header::CONTENT_TYPE,"text/css")],include_str!("../../../web/actions.css")) }))
+          (header::CACHE_CONTROL,"no-store")],Html(include_str!("../web/actions.html")))
+    })).route("/actions.js",get(|| async { ([(header::CONTENT_TYPE,"text/javascript")],include_str!("../web/actions.js")) }))
+        .route("/actions.css",get(|| async { ([(header::CONTENT_TYPE,"text/css")],include_str!("../web/actions.css")) }))
         .route("/api/session",post(session)).route("/api/actions",get(owner_list))
         .route("/api/publication-permission",post(change_permission))
         .route("/api/proposals/import",post(import_proposal))

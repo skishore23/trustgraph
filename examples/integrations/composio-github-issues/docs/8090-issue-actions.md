@@ -20,9 +20,8 @@ permissions. Work-order identifiers are caller-supplied references, not verified
 ## Preview
 
 ```sh
-cargo build --locked -p trustgraph-cli
 cp trustgraph-actions.example.json trustgraph-actions.local.json
-./target/debug/trustgraph actions
+cargo run -p trustgraph-composio-example --
 ```
 
 Set `github_repository` in the ignored local config to your demo repository.
@@ -32,12 +31,12 @@ API is on port 8085; it has no approval or execution routes. The owner and agent
 `composio_dashboard_url` and `source_url` config fields set the dashboard and
 source links shown in the walkthrough.
 
-Set the real project and Work Order IDs in the [example](../examples/8090/github-issue.json), then submit:
+Set the real project and Work Order IDs in the [example](../8090/github-issue.json), then submit:
 
 ```sh
 python3 scripts/trustgraph_actions.py \
   --token-file .trustgraph-live/issue-actions-preview/agent-token \
-  propose --file examples/8090/github-issue.json
+  propose --file 8090/github-issue.json
 ```
 
 Approve the displayed issue, then select **Record approved preview**. The receipt
@@ -57,7 +56,7 @@ execution outcome never triggers an automatic resend, including after restart.
 
 ## Native 8090 integration
 
-Add [TrustGraph issue approval](../examples/8090/trustgraph-issue-skill.md) as a
+Add [TrustGraph issue approval](../8090/trustgraph-issue-skill.md) as a
 General skill in the 8090 project. Its native workspace needs this branch checked
 out in a connected setup repository. Follow 8090's built-in **Workspace Setup**
 skill to configure and reload the environment.
@@ -91,8 +90,8 @@ mkdir -m 700 -p .trustgraph-live/issue-actions-live
 # Save composio-key here with owner-only permissions (chmod 600).
 python3 scripts/check_composio_github.py \
   --repository your-account/demo-repository
-./target/debug/trustgraph actions --config trustgraph-actions-live.local.json --check
-./target/debug/trustgraph actions --config trustgraph-actions-live.local.json
+cargo run -p trustgraph-composio-example -- --config trustgraph-actions-live.local.json --check
+cargo run -p trustgraph-composio-example -- --config trustgraph-actions-live.local.json
 ```
 
 The read-only preflight selects the correct credential scope:

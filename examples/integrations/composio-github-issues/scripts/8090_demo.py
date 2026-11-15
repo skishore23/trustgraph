@@ -16,7 +16,7 @@ import subprocess
 import sys
 import time
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[4]
 DIRECTORY = ROOT / ".trustgraph-live/8090"
 ACTIVE = {"queued", "running", "revising"}
 

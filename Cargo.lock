@@ -2010,6 +2010,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "trustgraph-composio-example"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "clap",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tower",
+ "trustgraph-core",
+ "trustgraph-live",
+ "trustgraph-runtime",
+ "uuid",
+]
+
+[[package]]
 name = "trustgraph-core"
 version = "0.1.0"
 dependencies = [

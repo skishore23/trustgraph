@@ -65,10 +65,8 @@ pub(super) async fn start(
                 1800,
             )?;
         }
-        let mut proposal: Proposal = serde_json::from_str(include_str!(
-            "../../../../examples/8090/live-demo-issue.json"
-        ))
-        .map_err(storage)?;
+        let mut proposal: Proposal =
+            serde_json::from_str(include_str!("../8090/live-demo-issue.json")).map_err(storage)?;
         proposal.key = key.clone();
         let artifact = capture(app, proposal.clone())?;
         app.gate.submit_request(
