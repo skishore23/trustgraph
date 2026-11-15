@@ -8,57 +8,91 @@ use axum::{
 };
 
 #[derive(Debug)]
-struct WebError(String);
+struct WebError(StatusCode, String);
 impl<E: std::fmt::Display> From<E> for WebError {
     fn from(e: E) -> Self {
-        Self(e.to_string())
+        Self(StatusCode::BAD_REQUEST, e.to_string())
+    }
+}
+impl WebError {
+    fn bad(message: String) -> Self {
+        Self(StatusCode::BAD_REQUEST, message)
+    }
+    fn unauthorized(message: &str) -> Self {
+        Self(StatusCode::UNAUTHORIZED, message.into())
     }
 }
 impl IntoResponse for WebError {
     fn into_response(self) -> Response {
-        (StatusCode::BAD_REQUEST, Json(json!({"error":self.0}))).into_response()
+        (self.0, Json(json!({"error":self.1}))).into_response()
     }
 }
 type WebResult = std::result::Result<Json<Value>, WebError>;
 fn lock(s: &Shared) -> Result<std::sync::MutexGuard<'_, Workspace>> {
     s.lock().map_err(|_| err("workspace requires restart"))
 }
-fn authorized(h: &HeaderMap, w: &Workspace, owner: bool) -> Result<()> {
-    let host = h
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if !(host.starts_with("127.0.0.1:") || host.starts_with("localhost:")) {
-        return Err(err("loopback host required"));
+/// Loopback Host for this server's port plus a same-origin browser Origin.
+fn local_request<'a>(h: &'a HeaderMap, w: &Workspace) -> std::result::Result<&'a str, WebError> {
+    let host = auth::loopback_host(h, w.port)
+        .ok_or_else(|| WebError(StatusCode::FORBIDDEN, "loopback host required".into()))?;
+    if !auth::same_origin(h, host) {
+        return Err(WebError(
+            StatusCode::FORBIDDEN,
+            "same-origin request required".into(),
+        ));
     }
-    if let Some(origin) = h.get(header::ORIGIN)
-        && origin.to_str().ok() != Some(format!("http://{host}").as_str())
-    {
-        return Err(err("same-origin request required"));
+    Ok(host)
+}
+/// Owner routes accept only a current operator session cookie. Agent routes
+/// accept the agent bearer token or an operator session. The owner launch
+/// secret is never accepted as a bearer credential for any route.
+fn authorized(h: &HeaderMap, w: &Workspace, owner: bool) -> std::result::Result<(), WebError> {
+    local_request(h, w)?;
+    if w.owner.valid(h) {
+        return Ok(());
     }
-    let bearer = h
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    let cookie = h
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| {
-            s.split(';')
-                .map(str::trim)
-                .find_map(|c| c.strip_prefix("trustgraph_owner="))
-        });
-    if bearer == Some(w.owner_token.as_str())
-        || cookie == Some(w.owner_token.as_str())
-        || (!owner && bearer == Some(w.agent_token.as_str()))
+    if !owner
+        && auth::bearer(h)
+            .is_some_and(|t| auth::constant_time_eq(t.as_bytes(), w.agent_token.as_bytes()))
     {
-        Ok(())
+        return Ok(());
+    }
+    Err(WebError::unauthorized(if owner {
+        "operator session required"
     } else {
-        Err(err("workspace authentication required"))
+        "workspace authentication required"
+    }))
+}
+/// After a restart no worker owns an in-progress job. Leaving it active would
+/// block new work forever, so it becomes `interrupted` (never resumed).
+fn recover_jobs(saved: &mut Saved) {
+    for job in &mut saved.jobs {
+        if ["queued", "running", "revising"].contains(&job.status.as_str()) {
+            job.error = Some(if job.status == "revising" {
+                "Application restarted during a revision. Submit the work again; this item cannot be approved or published.".into()
+            } else {
+                "Application restarted. This run was not retried.".into()
+            });
+            job.status = "interrupted".into();
+        }
     }
 }
 
-pub async fn router(config: Config) -> Result<Router> {
+/// Startup options for the live workspace server.
+#[derive(Debug, Clone)]
+pub struct Options {
+    /// Loopback port the server is bound to; requests must name it in Host.
+    pub port: u16,
+    /// Permit, with a warning, a state directory inside the target or context repository.
+    pub allow_state_in_repository: bool,
+}
+/// A ready router plus the private, single-use operator launch file.
+pub struct Started {
+    pub router: Router,
+    pub launch_file: PathBuf,
+}
+
+pub async fn router(config: Config, options: Options) -> Result<Started> {
     if !config.github_repository.contains('/')
         || config
             .github_repository
@@ -75,7 +109,17 @@ pub async fn router(config: Config) -> Result<Router> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&config.directory, fs::Permissions::from_mode(0o700))?;
     }
-    let owner_token = token(&config.directory.join("owner-token"))?;
+    auth::state_outside_repositories(
+        &config.directory,
+        &[&config.target_repository, &config.context_repository],
+        options.allow_state_in_repository,
+    )?;
+    // Earlier versions kept a reusable owner token on disk. Remove it: operator
+    // authority is now a per-start, single-use launch secret held in memory.
+    let legacy = config.directory.join("owner-token");
+    if fs::symlink_metadata(&legacy).is_ok() {
+        fs::remove_file(&legacy)?;
+    }
     let agent_token = token(&config.directory.join("agent-token"))?;
     let saved_path = config.directory.join("work.json");
     let mut saved: Saved = if saved_path.exists() {
@@ -96,12 +140,7 @@ pub async fn router(config: Config) -> Result<Router> {
             "use a separate state directory for the department workspace",
         ));
     }
-    for job in &mut saved.jobs {
-        if ["queued", "running"].contains(&job.status.as_str()) {
-            job.status = "interrupted".into();
-            job.error = Some("Application restarted. This run was not retried.".into());
-        }
-    }
+    recover_jobs(&mut saved);
     let gate = Coordinator::open_with_evidence(
         DiskJournal::open(&config.directory.join("journal"))?,
         github::GitHub::new(
@@ -132,8 +171,10 @@ pub async fn router(config: Config) -> Result<Router> {
         gate,
         saved,
         hydra,
-        owner_token,
+        owner: auth::OwnerSessions::new(&options.port.to_string(), auth::SESSION_LIFETIME),
         agent_token,
+        port: options.port,
+        simulations: Default::default(),
     };
     let base = git_head(&w.config.target_repository)?;
     let context_base = git_head(&w.config.context_repository)?;
@@ -185,8 +226,25 @@ pub async fn router(config: Config) -> Result<Router> {
     w.hydra.put("policy", &w.saved.policy, &[]).await?;
     w.saved.sources = sources;
     w.save()?;
-    let shared = Arc::new(Mutex::new(w));
-    Ok(Router::new()
+    let launch_file = w.config.directory.join("operator.html");
+    let secret = w
+        .owner
+        .launch_secret()
+        .ok_or_else(|| err("operator launch secret unavailable"))?;
+    w.owner.write_launch_file(
+        &launch_file,
+        &format!(
+            "<!doctype html><meta name=referrer content=no-referrer><meta http-equiv=refresh content=\"0;url=http://127.0.0.1:{}/#/connect/{secret}\">",
+            w.port
+        ),
+    )?;
+    Ok(Started {
+        router: routes(Arc::new(Mutex::new(w))),
+        launch_file,
+    })
+}
+fn routes(shared: Shared) -> Router {
+    Router::new()
         .route("/", get(index))
         .route("/agent", get(index))
         .route("/policy", get(index))
@@ -221,42 +279,43 @@ pub async fn router(config: Config) -> Result<Router> {
         .route("/api/graph", get(graph))
         .route("/api/work/{id}/gate", post(publication_gate))
         .route("/api/connections", get(connections))
-        .with_state(shared))
+        .with_state(shared)
 }
 async fn index(State(s): State<Shared>, h: HeaderMap) -> Response {
-    let host = h
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if !(host.starts_with("127.0.0.1:") || host.starts_with("localhost:")) {
+    let Ok(w) = lock(&s) else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    if local_request(&h, &w).is_err() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    if lock(&s).is_err() {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    }
-    ([(header::CACHE_CONTROL,"no-store"),(header::CONTENT_SECURITY_POLICY,"default-src 'self'; script-src 'self'; style-src 'self'; frame-ancestors 'none'; base-uri 'none'")],Html(include_str!("../../../web/workspace.html"))).into_response()
+    ([(header::CACHE_CONTROL,"no-store"),(header::CONTENT_SECURITY_POLICY,"default-src 'self'; script-src 'self'; style-src 'self'; frame-ancestors 'none'; base-uri 'none'"),(header::REFERRER_POLICY,"no-referrer")],Html(include_str!("../../../web/workspace.html"))).into_response()
 }
+/// Exchange the single-use launch secret (sent once as a bearer by the launch
+/// page) for a short-lived HttpOnly, SameSite=Strict session cookie.
 async fn session(State(s): State<Shared>, h: HeaderMap) -> Response {
     let w = match lock(&s) {
         Ok(w) => w,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    if authorized(&h, &w, true).is_err() {
+    if let Err(e) = local_request(&h, &w) {
+        return e.into_response();
+    }
+    if w.owner.valid(&h) {
         return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error":"operator authentication required"})),
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(json!({"authenticated":true})),
         )
             .into_response();
     }
+    let Some(cookie) = auth::bearer(&h).and_then(|secret| w.owner.exchange(secret)) else {
+        return WebError::unauthorized(
+            "operator launch link is invalid or already used; restart TrustGraph for a new one",
+        )
+        .into_response();
+    };
     (
         [
-            (
-                header::SET_COOKIE,
-                format!(
-                    "trustgraph_owner={}; HttpOnly; SameSite=Strict; Path=/",
-                    w.owner_token
-                ),
-            ),
+            (header::SET_COOKIE, cookie),
             (header::CACHE_CONTROL, "no-store".into()),
         ],
         Json(json!({"authenticated":true})),
@@ -324,7 +383,7 @@ struct NewWork {
 }
 async fn create(State(s): State<Shared>, h: HeaderMap, Json(body): Json<NewWork>) -> WebResult {
     if body.goal.trim().is_empty() || body.goal.len() > 4000 {
-        return Err(WebError("task needs 1..4000 bytes".into()));
+        return Err(WebError::bad("task needs 1..4000 bytes".into()));
     }
     let id = format!("job-{}", Uuid::new_v4().simple());
     {
@@ -337,7 +396,7 @@ async fn create(State(s): State<Shared>, h: HeaderMap, Json(body): Json<NewWork>
                 && body.goal != predefined
                 && !w.saved.admitted_work_orders.contains(&body.goal)
             {
-                return Err(WebError("Agent work orders must match an operator-admitted task. Use examples/bankcase/work-order.txt, or submit the new task as the operator in Workspace first. An agent cannot declare new input text public.".into()));
+                return Err(WebError::bad("Agent work orders must match an operator-admitted task. Use examples/bankcase/work-order.txt, or submit the new task as the operator in Workspace first. An agent cannot declare new input text public.".into()));
             }
             if owner {
                 w.saved.admitted_work_orders.insert(body.goal.clone());
@@ -348,7 +407,7 @@ async fn create(State(s): State<Shared>, h: HeaderMap, Json(body): Json<NewWork>
             .iter()
             .any(|j| ["queued", "running", "revising"].contains(&j.status.as_str()))
         {
-            return Err(WebError("one agent run is already active".into()));
+            return Err(WebError::bad("one agent run is already active".into()));
         }
         w.saved.jobs.push(Job {
             id: id.clone(),
@@ -376,18 +435,37 @@ async fn create(State(s): State<Shared>, h: HeaderMap, Json(body): Json<NewWork>
         w.save()?;
     }
     let run_id = id.clone();
-    tokio::spawn(async move {
-        if let Err(e) = work(&s, &run_id).await
-            && let Ok(mut w) = lock(&s)
-        {
-            if let Some(j) = w.saved.jobs.iter_mut().find(|j| j.id == run_id) {
-                j.status = "blocked".into();
-                j.error = Some(e.to_string());
-            }
-            let _ = w.save();
-        }
-    });
+    tokio::spawn(supervise(s, run_id));
     Ok(Json(json!({"id":id})))
+}
+/// Run one job and record any failure, including a panic in the worker task.
+/// A poisoned workspace lock is never written through: the server then reports
+/// that it requires a restart, and restart marks the job interrupted.
+async fn supervise(s: Shared, id: String) {
+    let worker_state = s.clone();
+    let worker_id = id.clone();
+    let outcome = tokio::spawn(async move { work(&worker_state, &worker_id).await }).await;
+    let error = match outcome {
+        Ok(Ok(())) => return,
+        Ok(Err(e)) => e.to_string(),
+        Err(_) => "The run stopped unexpectedly. It was not retried; submit it again.".into(),
+    };
+    fail_job(&s, &id, error);
+}
+fn fail_job(s: &Shared, id: &str, error: String) {
+    let Ok(mut w) = lock(s) else {
+        return;
+    };
+    if let Some(j) = w
+        .saved
+        .jobs
+        .iter_mut()
+        .find(|j| j.id == id && ["queued", "running"].contains(&j.status.as_str()))
+    {
+        j.status = "blocked".into();
+        j.error = Some(error);
+    }
+    let _ = w.save();
 }
 async fn work(s: &Shared, id: &str) -> Result<()> {
     let (hydra, sources, config, policy, goal, base) = {
@@ -717,7 +795,7 @@ async fn repair(
             .find(|j| j.id == id)
             .ok_or_else(|| err("work missing"))?;
         if !old.include_risk {
-            return Err(WebError(
+            return Err(WebError::bad(
                 "this run already used approved inputs only".into(),
             ));
         }
@@ -752,7 +830,7 @@ async fn revise(
         if !matches!(decision, Decision::Ready { .. })
             || decision.context().map(Context::digest) != Some(body.context_digest)
         {
-            return Err(WebError(
+            return Err(WebError::bad(
                 "approve the exact current patch before testing a revision".into(),
             ));
         }
@@ -763,7 +841,7 @@ async fn revise(
             .find(|j| j.id == id)
             .ok_or_else(|| err("work missing"))?;
         if j.operation.is_some() {
-            return Err(WebError(
+            return Err(WebError::bad(
                 "published or uncertain work cannot be revised in place".into(),
             ));
         }
@@ -814,11 +892,61 @@ async fn revise(
             }
             let _ = w.save();
         }
-        return Err(WebError(error.to_string()));
+        return Err(WebError::bad(error.to_string()));
     }
     Ok(Json(json!({"revised":true,"requires_new_approval":true})))
 }
-async fn graph_check(s: &Shared, id: &str) -> Result<()> {
+/// Fingerprint of every local value [`graph_check`] validates against HydraDB.
+/// Comparing it under the lock right before approval or reservation closes the
+/// window between the asynchronous evidence check and the state change.
+fn evidence_fingerprint(w: &Workspace, id: &str) -> Result<Digest> {
+    let j = w
+        .saved
+        .jobs
+        .iter()
+        .find(|j| j.id == id)
+        .ok_or_else(|| err("work item missing"))?;
+    let permissions = w
+        .saved
+        .sources
+        .iter()
+        .filter_map(|source| {
+            source
+                .permissions_graph
+                .as_ref()
+                .map(|graph| Ok((graph.clone(), source_permission(&w.gate, &source.id)?)))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let artifact = j
+        .artifact
+        .as_ref()
+        .and_then(|a| w.gate.state().evidence.artifacts.get(a));
+    Ok(digest::structured(
+        "publication-evidence",
+        &(
+            artifact,
+            &j.graph_id,
+            &j.graph_edges,
+            &j.approval_graph,
+            &j.authorization_graph,
+            &j.status,
+            &w.gate.state().evidence.policy,
+            &w.saved.policy,
+            permissions,
+        ),
+    ))
+}
+async fn graph_check(s: &Shared, id: &str) -> Result<Digest> {
+    let fingerprint = evidence_fingerprint(&*lock(s)?, id)?;
+    graph_check_values(s, id).await?;
+    if evidence_fingerprint(&*lock(s)?, id)? != fingerprint {
+        return Err(err(
+            "workspace evidence changed during the HydraDB check; retry",
+        ));
+    }
+    Ok(fingerprint)
+}
+async fn graph_check_values(s: &Shared, id: &str) -> Result<()> {
     let (hydra, graph, expected, edges) = {
         let w = lock(s)?;
         let j = w
@@ -910,6 +1038,11 @@ fn preflight(w: &Workspace, id: &str) -> Result<ArtifactId> {
             "a patch revision must finish before review or publication",
         ));
     }
+    if j.status == "interrupted" {
+        return Err(err(
+            "this work was interrupted by a restart; submit it again",
+        ));
+    }
     let change = j
         .change
         .as_ref()
@@ -966,11 +1099,16 @@ async fn approve(
         authorized(&h, &w, true)?;
         preflight(&w, &id)?;
     }
-    graph_check(&s, &id).await?;
+    let checked = graph_check(&s, &id).await?;
     let (hydra, approval, policy, parent) = {
         let mut w = lock(&s)?;
         authorized(&h, &w, true)?;
         let artifact = preflight(&w, &id)?;
+        if evidence_fingerprint(&w, &id)? != checked {
+            return Err(WebError::bad(
+                "workspace evidence changed after the HydraDB check; review again".into(),
+            ));
+        }
         let intent = w.intent(&artifact, "owner");
         let timestamp = now();
         let key = approval_key(
@@ -1019,7 +1157,7 @@ async fn approve(
         .await?;
     let mut w = lock(&s)?;
     if w.gate.state().evidence.policy != policy {
-        return Err(WebError("policy changed during approval".into()));
+        return Err(WebError::bad("policy changed during approval".into()));
     }
     let j = w
         .saved
@@ -1033,6 +1171,29 @@ async fn approve(
     j.events.push(json!({"at":now(),"stage":"approval","message":"Exact operator approval recorded and read back from HydraDB"}));
     w.save()?;
     Ok(Json(json!({"approved":true})))
+}
+fn record_operation(
+    w: &mut Workspace,
+    id: &str,
+    key: &str,
+    state: trustgraph_runtime::OperationState,
+) -> Result<()> {
+    let j = w
+        .saved
+        .jobs
+        .iter_mut()
+        .find(|j| j.id == id)
+        .ok_or_else(|| err("run missing"))?;
+    j.operation = Some(key.into());
+    j.status = match state {
+        trustgraph_runtime::OperationState::Published => "published",
+        trustgraph_runtime::OperationState::OutcomeUnknown
+        | trustgraph_runtime::OperationState::Reserved
+        | trustgraph_runtime::OperationState::Dispatching => "outcome_unknown",
+        _ => "publication_stopped",
+    }
+    .into();
+    w.save()
 }
 async fn publish(
     State(s): State<Shared>,
@@ -1061,7 +1222,7 @@ async fn publish(
                 }
                 _ => "Current policy or lineage blocks publication.",
             };
-            return Err(WebError(format!(
+            return Err(WebError::bad(format!(
                 "Policy blocks this action: {:?}. {reason}",
                 violations[0].code
             )));
@@ -1076,46 +1237,100 @@ async fn publish(
             .filter(|j| j.approval_graph.is_some() && j.authorization_graph.is_some())
             .is_none()
         {
-            return Err(WebError(
+            return Err(WebError::bad(
                 "approval must be recorded in HydraDB before publication".into(),
             ));
         }
     }
-    graph_check(&s, &id).await?;
-    let work_id = id.clone();
-    let publish_state = s.clone();
-    let result = tokio::task::spawn_blocking(move || -> Result<Value> {
-        let mut w = lock(&publish_state)?;
-        authorized(&h, &w, true)?;
-        let artifact = preflight(&w, &id)?;
-        let intent = w.intent(&artifact, "owner");
-        let key = format!(
-            "{id}-{}",
-            body.context_digest
-                .0
-                .get(..12)
-                .ok_or_else(|| err("invalid context fingerprint"))?
-        );
-        let result = w.gate.publish(&intent, &body.context_digest, &key, now())?;
-        if let trustgraph_runtime::PublishResult::Operation { operation } = &result {
-            let j = w
-                .saved
-                .jobs
-                .iter_mut()
-                .find(|j| j.id == id)
-                .ok_or_else(|| err("run missing"))?;
-            j.operation = Some(key);
-            j.status = match operation.state {
-                trustgraph_runtime::OperationState::Published => "published",
-                trustgraph_runtime::OperationState::OutcomeUnknown => "outcome_unknown",
-                _ => "publication_stopped",
+    let checked = graph_check(&s, &id).await?;
+    let key = format!(
+        "{id}-{}",
+        body.context_digest
+            .0
+            .get(..12)
+            .ok_or_else(|| err("invalid context fingerprint"))?
+    );
+    let (repository, publisher_directory, base_commit) = {
+        let w = lock(&s)?;
+        let base = w
+            .saved
+            .jobs
+            .iter()
+            .find(|j| j.id == id)
+            .and_then(|j| j.change.as_ref())
+            .map(|c| c.base_commit.clone())
+            .ok_or_else(|| err("checked change missing"))?;
+        (
+            w.config.github_repository.clone(),
+            w.config.directory.join("publisher"),
+            base,
+        )
+    };
+    // Read-only GitHub audience and base checks, outside the workspace lock and
+    // before anything is reserved, so a definite refusal leaves no operation.
+    let github = Arc::new(github::GitHub::new(&repository, publisher_directory)?);
+    let precheck = github.clone();
+    tokio::task::spawn_blocking(move || precheck.precheck(&base_commit)).await??;
+    // Reserve under the lock: re-run every local check, require the evidence the
+    // HydraDB check saw, then let the engine verify and stage the exact payload.
+    let reserve_state = s.clone();
+    let reserve_id = id.clone();
+    let reserve_key = key.clone();
+    let reserved =
+        tokio::task::spawn_blocking(move || -> std::result::Result<(Value, bool), WebError> {
+            let mut w = lock(&reserve_state)?;
+            authorized(&h, &w, true)?;
+            let artifact = preflight(&w, &reserve_id)?;
+            if evidence_fingerprint(&w, &reserve_id)? != checked {
+                return Err(WebError::bad(
+                    "workspace evidence changed after the HydraDB check; review again".into(),
+                ));
             }
-            .into();
-            w.save()?;
+            let intent = w.intent(&artifact, "owner");
+            let result = w
+                .gate
+                .publish(&intent, &body.context_digest, &reserve_key, now())?;
+            let mut deliver = false;
+            if let trustgraph_runtime::PublishResult::Operation { operation } = &result {
+                deliver = operation.state == trustgraph_runtime::OperationState::OutcomeUnknown;
+                record_operation(&mut w, &reserve_id, &reserve_key, operation.state)?;
+            }
+            Ok((serde_json::to_value(result)?, deliver))
+        })
+        .await?;
+    let (mut result, deliver) = reserved?;
+    if deliver {
+        // Network writes run without the workspace lock. The publisher refuses
+        // a second delivery once a write may have started.
+        let delivery = github.clone();
+        let delivery_key = key.clone();
+        let delivered = tokio::task::spawn_blocking(move || {
+            if delivery.deliverable(&delivery_key) {
+                delivery.deliver(&delivery_key).map(|_| ())
+            } else {
+                Ok(())
+            }
+        })
+        .await?;
+        let record_state = s.clone();
+        let record_id = id.clone();
+        let record_key = key.clone();
+        result = tokio::task::spawn_blocking(move || -> Result<Value> {
+            let mut w = lock(&record_state)?;
+            let operation = w.gate.reconcile(&"owner".into(), &record_key, now())?;
+            record_operation(&mut w, &record_id, &record_key, operation.state)?;
+            Ok(serde_json::to_value(
+                trustgraph_runtime::PublishResult::Operation {
+                    operation: Box::new(operation),
+                },
+            )?)
+        })
+        .await??;
+        if let Err(error) = delivered {
+            result["delivery_error"] = json!(error.to_string());
         }
-        Ok(serde_json::to_value(result)?)
-    })
-    .await??;
+    }
+    let work_id = id.clone();
     let (hydra, parents) = {
         let w = lock(&s)?;
         let job = w
@@ -1202,15 +1417,15 @@ async fn sync_source_permissions(s: &Shared) -> Result<()> {
     Ok(())
 }
 async fn policy(State(s): State<Shared>, h: HeaderMap, Json(body): Json<PolicyInput>) -> WebResult {
-    body.policy.validate()?;
-    if body.activate {
-        body.policy.validate_live()?;
-    }
     let hydra = {
         let w = lock(&s)?;
         authorized(&h, &w, true)?;
+        body.policy.validate()?;
+        if body.activate {
+            body.policy.validate_live()?;
+        }
         if w.config.departments && body.policy.departments.is_none() {
-            return Err(WebError(
+            return Err(WebError::bad(
                 "department policy must explicitly specify investigation readers".into(),
             ));
         }
@@ -1223,7 +1438,7 @@ async fn policy(State(s): State<Shared>, h: HeaderMap, Json(body): Json<PolicyIn
         let mut w = lock(&s)?;
         authorized(&h, &w, true)?;
         if body.expected_revision != w.gate.state().evidence.policy.revision {
-            return Err(WebError("policy changed; reload before saving".into()));
+            return Err(WebError::bad("policy changed; reload before saving".into()));
         }
         let cases: Vec<_> = w.saved.jobs.iter().filter_map(|j|j.change.as_ref().map(|c|json!({"work":j.id,"violations":body.policy.violations(&c.files,Some(&c.checks))}))).collect();
         if body.activate {
@@ -1260,10 +1475,13 @@ async fn connections(State(s): State<Shared>, h: HeaderMap) -> WebResult {
     };
     let graph = hydra.check().await.is_ok();
     let checks = tokio::task::spawn_blocking(move || {
-        let codex = std::process::Command::new("codex")
-            .args(["login", "status"])
-            .output()
-            .is_ok_and(|o| o.status.success());
+        let codex = runner::bounded(
+            std::process::Command::new("codex").args(["login", "status"]),
+            None,
+            Duration::from_secs(15),
+            65_536,
+        )
+        .is_ok_and(|(code, _)| code == 0);
         let github = github::GitHub::new(
             &config.github_repository,
             config.directory.join("publisher"),
@@ -1515,6 +1733,24 @@ fn compare_simulation(
     result["code_executed"] = json!(false);
     Ok(result)
 }
+const SIMULATIONS_PER_WINDOW: usize = 20;
+const SIMULATION_WINDOW: Duration = Duration::from_secs(60);
+fn admit_simulation(
+    recent: &mut std::collections::VecDeque<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    while recent
+        .front()
+        .is_some_and(|t| now.duration_since(*t) >= SIMULATION_WINDOW)
+    {
+        recent.pop_front();
+    }
+    if recent.len() >= SIMULATIONS_PER_WINDOW {
+        return false;
+    }
+    recent.push_back(now);
+    true
+}
 async fn simulate(
     State(s): State<Shared>,
     h: HeaderMap,
@@ -1525,11 +1761,18 @@ async fn simulate(
         || case.approval_age_minutes > 10080
         || !["engineering", "risk"].contains(&case.audience.as_str())
     {
-        return Err(WebError("bounded file list required".into()));
+        return Err(WebError::bad("bounded file list required".into()));
     }
     let (hydra, sources, evidence, active, impacts) = {
-        let w = lock(&s)?;
+        let mut w = lock(&s)?;
         authorized(&h, &w, false)?;
+        // Every simulation writes candidate-policy evidence to HydraDB; bound it.
+        if !admit_simulation(&mut w.simulations, std::time::Instant::now()) {
+            return Err(WebError(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("at most {SIMULATIONS_PER_WINDOW} simulations per minute; retry shortly"),
+            ));
+        }
         let candidate = case.policy.as_ref().unwrap_or(&w.saved.policy);
         candidate.validate()?;
         let impacts: Vec<_> = w
@@ -1561,7 +1804,7 @@ async fn simulate(
     for source in &sources {
         let a: Artifact = serde_json::from_str(&hydra.get(&source.graph_id).await?)?;
         if a.id != source.id || a.hash != source.hash {
-            return Err(WebError(
+            return Err(WebError::bad(
                 "live source no longer matches captured evidence".into(),
             ));
         }
@@ -2016,5 +2259,386 @@ mod simulator_tests {
         case.tests_passed = false;
         assert_eq!(evaluate(&case)["status"], "blocked");
         assert_eq!(w.publisher.sends, 0);
+    }
+}
+
+/// Drives the real live router over loopback HTTP without HydraDB, Codex or
+/// GitHub: every request here is decided before any evidence or network I/O.
+#[cfg(test)]
+mod router_tests {
+    use super::*;
+    use reqwest::{Method, header as h};
+
+    const AGENT: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    struct Server {
+        base: String,
+        host: String,
+        launch: String,
+        client: reqwest::Client,
+        shared: Shared,
+        _dir: tempfile::TempDir,
+    }
+    async fn server() -> Server {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = Config {
+            directory: dir.path().into(),
+            context_repository: dir.path().into(),
+            context_files: vec!["README.md".into()],
+            target_repository: dir.path().into(),
+            github_repository: "owner/repo".into(),
+            departments: false,
+        };
+        let gate = Coordinator::open_with_evidence(
+            DiskJournal::open(&dir.path().join("journal")).unwrap(),
+            github::GitHub::new("owner/repo", dir.path().join("publisher")).unwrap(),
+            genesis_for("owner/repo", false),
+        )
+        .unwrap();
+        let owner = auth::OwnerSessions::new(&port.to_string(), auth::SESSION_LIFETIME);
+        let launch = owner.launch_secret().unwrap();
+        let shared = Arc::new(Mutex::new(Workspace {
+            config,
+            gate,
+            saved: Saved {
+                policy: WorkPolicy::default(),
+                ..Saved::default()
+            },
+            hydra: hydra::Hydra::unreachable(),
+            owner,
+            agent_token: AGENT.into(),
+            port,
+            simulations: Default::default(),
+        }));
+        let app = routes(shared.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Server {
+            base: format!("http://127.0.0.1:{port}"),
+            host: format!("127.0.0.1:{port}"),
+            launch,
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            shared,
+            _dir: dir,
+        }
+    }
+    impl Server {
+        async fn call(
+            &self,
+            method: Method,
+            path: &str,
+            headers: &[(h::HeaderName, String)],
+            body: Option<Value>,
+        ) -> (u16, Option<String>, Value) {
+            let mut request = self.client.request(method, format!("{}{path}", self.base));
+            for (k, v) in headers {
+                request = request.header(k.clone(), v);
+            }
+            if let Some(body) = body {
+                request = request.json(&body);
+            }
+            let response = request.send().await.unwrap();
+            let status = response.status().as_u16();
+            let cookie = response
+                .headers()
+                .get(h::SET_COOKIE)
+                .map(|v| v.to_str().unwrap().to_owned());
+            let value = response.json().await.unwrap_or(Value::Null);
+            (status, cookie, value)
+        }
+    }
+    fn bearer(token: &str) -> Vec<(h::HeaderName, String)> {
+        vec![(h::AUTHORIZATION, format!("Bearer {token}"))]
+    }
+    fn owner_routes() -> Vec<(Method, &'static str, Option<Value>)> {
+        let review = json!({"context_digest":"0123456789abcdef0123"});
+        vec![
+            (
+                Method::POST,
+                "/api/work/job-1/approve",
+                Some(review.clone()),
+            ),
+            (
+                Method::POST,
+                "/api/work/job-1/publish",
+                Some(review.clone()),
+            ),
+            (Method::POST, "/api/work/job-1/gate", Some(review.clone())),
+            (Method::POST, "/api/work/job-1/revise", Some(review)),
+            (
+                Method::POST,
+                "/api/policy",
+                Some(json!({"policy":WorkPolicy::default(),"activate":true,"expected_revision":1})),
+            ),
+            (Method::GET, "/api/connections", None),
+        ]
+    }
+
+    #[tokio::test]
+    async fn agent_and_launch_bearers_cannot_use_owner_routes() {
+        let server = server().await;
+        for (method, path, body) in owner_routes() {
+            for token in [AGENT, server.launch.as_str()] {
+                let (status, cookie, _) = server
+                    .call(method.clone(), path, &bearer(token), body.clone())
+                    .await;
+                assert_eq!(status, 401, "{method} {path}");
+                assert!(cookie.is_none());
+            }
+            let (status, _, _) = server.call(method.clone(), path, &[], body.clone()).await;
+            assert_eq!(status, 401, "{method} {path} without credentials");
+        }
+        // The agent bearer still reaches agent routes.
+        let (status, _, _) = server
+            .call(Method::GET, "/api/work", &bearer(AGENT), None)
+            .await;
+        assert_eq!(status, 200);
+        // Probing owner routes did not consume the launch secret.
+        assert!(
+            lock(&server.shared)
+                .unwrap()
+                .owner
+                .launch_secret()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_secret_is_exchanged_once_for_a_cookie_only_session() {
+        let server = server().await;
+        let (status, cookie, _) = server
+            .call(Method::POST, "/api/session", &bearer(AGENT), None)
+            .await;
+        assert_eq!(
+            (status, cookie),
+            (401, None),
+            "agent token is not a launch secret"
+        );
+        let (status, cookie, _) = server
+            .call(Method::POST, "/api/session", &bearer(&server.launch), None)
+            .await;
+        assert_eq!(status, 200);
+        let cookie = cookie.unwrap();
+        assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict"));
+        assert!(cookie.contains("Max-Age="));
+        let port = server.host.rsplit(':').next().unwrap();
+        assert!(cookie.starts_with(&format!("trustgraph_owner_{port}=")));
+        assert!(!cookie.contains(&server.launch));
+        let session = vec![(h::COOKIE, cookie.split(';').next().unwrap().to_owned())];
+        let (status, again, _) = server
+            .call(Method::POST, "/api/session", &bearer(&server.launch), None)
+            .await;
+        assert_eq!((status, again), (401, None), "launch secret is single-use");
+        assert!(
+            lock(&server.shared)
+                .unwrap()
+                .owner
+                .launch_secret()
+                .is_none()
+        );
+        // The session cookie authorizes owner and agent routes.
+        let (status, _, _) = server.call(Method::GET, "/api/work", &session, None).await;
+        assert_eq!(status, 200);
+        let (status, _, value) = server
+            .call(
+                Method::POST,
+                "/api/policy",
+                &session,
+                Some(
+                    json!({"policy":WorkPolicy::default(),"activate":false,"expected_revision":1}),
+                ),
+            )
+            .await;
+        assert_eq!(status, 200, "{value}");
+        let (status, _, _) = server
+            .call(
+                Method::POST,
+                "/api/work/job-1/approve",
+                &session,
+                Some(json!({"context_digest":"0123456789abcdef0123"})),
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "authenticated, then refused because the work is missing"
+        );
+        // A forged or replayed launch value in the cookie is rejected.
+        let forged = vec![(
+            h::COOKIE,
+            format!("trustgraph_owner_{port}={}", server.launch),
+        )];
+        let (status, _, _) = server
+            .call(Method::GET, "/api/connections", &forged, None)
+            .await;
+        assert_eq!(status, 401);
+    }
+
+    #[tokio::test]
+    async fn host_and_origin_checks_reject_other_sites_and_ports() {
+        let server = server().await;
+        let port: u16 = server.host.rsplit(':').next().unwrap().parse().unwrap();
+        for (host, origin) in [
+            (format!("127.0.0.1:{}", port.wrapping_add(1)), None),
+            (format!("evil.test:{port}"), None),
+            (format!("127.0.0.1.evil.test:{port}"), None),
+            ("127.0.0.1".to_owned(), None),
+            (server.host.clone(), Some("http://evil.test".to_owned())),
+            (
+                server.host.clone(),
+                Some(format!("https://{}", server.host)),
+            ),
+        ] {
+            let mut headers = bearer(AGENT);
+            headers.push((h::HOST, host.clone()));
+            if let Some(origin) = &origin {
+                headers.push((h::ORIGIN, origin.clone()));
+            }
+            let (status, _, _) = server.call(Method::GET, "/api/work", &headers, None).await;
+            assert_eq!(status, 403, "{host} {origin:?}");
+            let (status, cookie, _) = server
+                .call(
+                    Method::POST,
+                    "/api/session",
+                    &{
+                        let mut h = headers.clone();
+                        h[0] = (h::AUTHORIZATION, format!("Bearer {}", server.launch));
+                        h
+                    },
+                    None,
+                )
+                .await;
+            assert_eq!((status, cookie), (403, None));
+            let (status, _, _) = server.call(Method::GET, "/", &headers, None).await;
+            assert_eq!(status, 403);
+        }
+        let mut same = bearer(AGENT);
+        same.push((h::ORIGIN, format!("http://{}", server.host)));
+        let (status, _, _) = server.call(Method::GET, "/api/work", &same, None).await;
+        assert_eq!(status, 200);
+        let mut localhost = bearer(AGENT);
+        localhost.push((h::HOST, format!("localhost:{port}")));
+        let (status, _, _) = server
+            .call(Method::GET, "/api/work", &localhost, None)
+            .await;
+        assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn restart_interrupts_queued_running_and_revising_work() {
+        let job = |id: &str, status: &str| Job {
+            id: id.into(),
+            goal: "goal".into(),
+            status: status.into(),
+            created_at: 0,
+            artifact: None,
+            change: None,
+            error: None,
+            provider: Value::Null,
+            graph_id: None,
+            graph_edges: BTreeMap::new(),
+            base_files: vec![],
+            input_ids: vec![],
+            operation: None,
+            events: vec![],
+            plan: Value::Null,
+            approval_graph: None,
+            authorization_graph: None,
+            include_risk: false,
+            repair_of: None,
+        };
+        let mut saved = Saved {
+            jobs: vec![
+                job("a", "queued"),
+                job("b", "running"),
+                job("c", "revising"),
+                job("d", "awaiting_review"),
+                job("e", "published"),
+            ],
+            ..Saved::default()
+        };
+        recover_jobs(&mut saved);
+        let states: Vec<_> = saved.jobs.iter().map(|j| j.status.as_str()).collect();
+        assert_eq!(
+            states,
+            [
+                "interrupted",
+                "interrupted",
+                "interrupted",
+                "awaiting_review",
+                "published"
+            ]
+        );
+        assert!(
+            !saved
+                .jobs
+                .iter()
+                .any(|j| ["queued", "running", "revising"].contains(&j.status.as_str())),
+            "a new run is no longer blocked"
+        );
+        assert!(saved.jobs[2].error.as_deref().unwrap().contains("revision"));
+    }
+
+    #[tokio::test]
+    async fn interrupted_revision_cannot_be_reviewed_and_a_worker_panic_is_recorded() {
+        let server = server().await;
+        {
+            let mut w = lock(&server.shared).unwrap();
+            let mut saved = Saved::default();
+            for (id, status) in [("job-r", "revising"), ("job-p", "running")] {
+                saved.jobs.push(Job {
+                    id: id.into(),
+                    goal: "goal".into(),
+                    status: status.into(),
+                    created_at: 0,
+                    artifact: None,
+                    change: None,
+                    error: None,
+                    provider: Value::Null,
+                    graph_id: None,
+                    graph_edges: BTreeMap::new(),
+                    base_files: vec![],
+                    input_ids: vec![],
+                    operation: None,
+                    events: vec![],
+                    plan: Value::Null,
+                    approval_graph: None,
+                    authorization_graph: None,
+                    include_risk: false,
+                    repair_of: None,
+                });
+            }
+            recover_jobs(&mut saved);
+            saved.jobs[1].status = "running".into();
+            w.saved.jobs = saved.jobs;
+            assert!(
+                preflight(&w, "job-r")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("interrupted")
+            );
+        }
+        fail_job(&server.shared, "job-p", "worker stopped".into());
+        let w = lock(&server.shared).unwrap();
+        assert_eq!(w.saved.jobs[1].status, "blocked");
+        assert_eq!(
+            w.saved.jobs[0].status, "interrupted",
+            "only active jobs are failed"
+        );
+    }
+
+    #[test]
+    fn simulations_are_rate_limited_per_window() {
+        let mut recent = std::collections::VecDeque::new();
+        let start = std::time::Instant::now();
+        for _ in 0..SIMULATIONS_PER_WINDOW {
+            assert!(admit_simulation(&mut recent, start));
+        }
+        assert!(!admit_simulation(&mut recent, start));
+        assert!(admit_simulation(&mut recent, start + SIMULATION_WINDOW));
     }
 }

@@ -1,6 +1,25 @@
 use crate::*;
 use reqwest::Client;
 
+/// Upper bound for one HydraDB response body.
+const MAX_RESPONSE: usize = 8 * 1024 * 1024;
+async fn bounded_json(mut response: reqwest::Response) -> Result<Value> {
+    if response
+        .content_length()
+        .is_some_and(|n| n > MAX_RESPONSE as u64)
+    {
+        return Err(err("HydraDB response exceeds the bounded size"));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > MAX_RESPONSE {
+            return Err(err("HydraDB response exceeds the bounded size"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(serde_json::from_slice(&body)?)
+}
+
 #[derive(Clone)]
 pub struct Hydra {
     client: Client,
@@ -45,6 +64,21 @@ impl Hydra {
             collection: "trustgraph-governance".into(),
         })
     }
+    /// A client that is never reachable, for router tests that must fail before evidence I/O.
+    #[cfg(test)]
+    pub fn unreachable() -> Self {
+        Self {
+            client: Client::builder()
+                .timeout(Duration::from_millis(200))
+                .no_proxy()
+                .build()
+                .expect("test client"),
+            key: String::new(),
+            base: "http://127.0.0.1:9".into(),
+            database: "test".into(),
+            collection: "test".into(),
+        }
+    }
     pub async fn query(&self, query: &str, params: Value) -> Result<Value> {
         let response=self.client.post(format!("{}/byog/query",self.base)).bearer_auth(&self.key).header("API-Version","2").json(&json!({"database":self.database,"collection":self.collection,"query":query,"params":params})).send().await?;
         if !response.status().is_success() {
@@ -53,7 +87,7 @@ impl Hydra {
                 response.status().as_u16()
             )));
         }
-        let v: Value = response.json().await?;
+        let v = bounded_json(response).await?;
         if v["success"] != true || !v["data"].is_array() {
             return Err(err("HydraDB returned an invalid graph result"));
         }
@@ -76,7 +110,7 @@ impl Hydra {
         if !response.status().is_success() {
             return Err(err("HydraDB Knowledge status check failed"));
         }
-        let v: Value = response.json().await?;
+        let v = bounded_json(response).await?;
         Ok(knowledge_rows(&v)
             .iter()
             .cloned()

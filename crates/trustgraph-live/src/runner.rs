@@ -1,8 +1,48 @@
 use crate::*;
 use std::{
     io::Write,
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
 };
+
+/// Start `command` as the leader of a new process group so a timeout can stop
+/// every descendant, not only the direct child.
+fn isolate_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+}
+/// SIGKILL the whole process group led by `child`, then the child itself.
+/// Call this before reaping the child so its PID cannot have been reused.
+fn kill_group(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("/bin/kill")
+            .args(["-s", "KILL", "--", &format!("-{}", child.id())])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+/// Feed stdin from a separate thread so a child that never reads cannot stall
+/// the caller past its deadline. The pipe closes when the bytes are written or
+/// the child dies.
+fn feed(child: &mut Child, input: Option<Vec<u8>>) -> Result<()> {
+    if let Some(input) = input {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| err("child stdin unavailable"))?;
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&input);
+        });
+    }
+    Ok(())
+}
 
 pub fn run(
     command: &mut Command,
@@ -21,27 +61,115 @@ pub fn run(
     } else {
         Stdio::null()
     });
+    isolate_group(command);
     let mut child = command.spawn()?;
-    if let Some(input) = input {
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| err("child stdin unavailable"))?
-            .write_all(input.as_bytes())?;
-    }
     let started = std::time::Instant::now();
+    if let Err(e) = feed(&mut child, input.map(|s| s.as_bytes().to_vec())) {
+        kill_group(&mut child);
+        return Err(e);
+    }
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok((status.code().unwrap_or(-1), fs::read_to_string(out)?));
         }
         if started.elapsed() > Duration::from_secs(seconds) || fs::metadata(&out)?.len() > 2_000_000
         {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_group(&mut child);
             return Err(err("process exceeded its time/output bound"));
         }
         std::thread::sleep(Duration::from_millis(30));
     }
+}
+
+/// Run a short external command (e.g. `gh`) with piped, size-capped stdout, a
+/// hard deadline and process-group cleanup. Stderr is discarded so provider
+/// error bodies and credentials are never echoed.
+pub fn bounded(
+    command: &mut Command,
+    input: Option<Vec<u8>>,
+    timeout: Duration,
+    max_output: usize,
+) -> Result<(i32, Vec<u8>)> {
+    command
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    isolate_group(command);
+    let mut child = command.spawn()?;
+    let deadline = std::time::Instant::now() + timeout;
+    if let Err(e) = feed(&mut child, input) {
+        kill_group(&mut child);
+        return Err(e);
+    }
+    let Some(stdout) = child.stdout.take() else {
+        kill_group(&mut child);
+        return Err(err("child stdout unavailable"));
+    };
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        let result = stdout
+            .take(max_output as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        let _ = sender.send(result);
+    });
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let bytes = receiver
+                .recv_timeout(remaining.max(Duration::from_millis(100)))
+                .map_err(|_| err("process output did not close before its deadline"))??;
+            if bytes.len() > max_output {
+                return Err(err("process output exceeded its bound"));
+            }
+            return Ok((status.code().unwrap_or(-1), bytes));
+        }
+        if std::time::Instant::now() > deadline {
+            kill_group(&mut child);
+            return Err(err("process exceeded its time bound"));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Environment variables passed to Codex. Everything else, including every
+/// TRUSTGRAPH_* capability and publication credential, is cleared.
+const CODEX_ENVIRONMENT: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "CODEX_HOME",
+    "CODEX_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "NO_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "no_proxy",
+];
+fn codex_environment(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    vars.into_iter()
+        .filter(|(k, _)| k.to_str().is_some_and(|k| CODEX_ENVIRONMENT.contains(&k)))
+        .collect()
 }
 
 pub fn generate(prompt: &str, dir: &Path) -> Result<(AgentOutput, Value)> {
@@ -91,16 +219,9 @@ pub fn generate(prompt: &str, dir: &Path) -> Result<(AgentOutput, Value)> {
     .arg("--output-last-message")
     .arg(&result_path)
     .arg("-")
-    .current_dir(cwd);
-    for key in [
-        "GH_TOKEN",
-        "GITHUB_TOKEN",
-        "HYDRADB_API_KEY",
-        "TRUSTGRAPH_HYDRA_TOKEN",
-        "COMPOSIO_API_KEY",
-    ] {
-        c.env_remove(key);
-    }
+    .current_dir(cwd)
+    .env_clear()
+    .envs(codex_environment(std::env::vars_os()));
     let (code, events) = run(&mut c, Some(prompt), dir, 240)?;
     if code != 0 {
         return Err(err(&format!(
@@ -179,17 +300,41 @@ pub fn test(
         })
         .collect();
     let directory_reads = ancestors.into_iter().collect::<Vec<_>>().join(" ");
-    let profile = format!(
-        "(version 1) (deny default) (allow file-read-metadata) (allow process*) (allow sysctl-read) (allow mach-lookup) (allow file-read* {directory_reads} (subpath \"/usr\") (subpath \"/System\") (subpath \"/Library\") (subpath \"{}\") (subpath \"{}\") (literal \"/dev/null\") (literal \"/dev/urandom\")) (allow file-write* (subpath \"{}\") (literal \"/dev/null\"))",
-        toolchain.display(),
-        realwork.display(),
-        realwork.display()
+    let quoted = |p: &Path| serde_json::to_string(&p.to_string_lossy()).expect("path string");
+    // The linker driver is located outside the sandbox. Only standard developer
+    // locations are accepted; an unexpected location simply fails the compile.
+    let developer = Command::new("/usr/bin/xcode-select")
+        .arg("-p")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|p| fs::canonicalize(p.trim()).ok())
+        .filter(|p| p.starts_with("/Library/Developer/") || p.starts_with("/Applications/"))
+        .map(|p| format!("(subpath {})", quoted(&p)))
+        .unwrap_or_default();
+    let reads = format!(
+        "(allow file-read* {directory_reads} (subpath \"/usr\") (subpath \"/System\") (subpath \"/Library\") (subpath {}) (subpath {}) (literal \"/dev/null\") (literal \"/dev/urandom\")) (allow file-write* (subpath {}) (literal \"/dev/null\"))",
+        quoted(toolchain),
+        quoted(&realwork),
+        quoted(&realwork)
+    );
+    // No blanket process* or mach-lookup: compilation may fork and exec only the
+    // Rust toolchain and the system linker driver; the test binary may exec only
+    // itself and cannot fork, so it cannot launch open, osascript or other tools.
+    let compile_profile = format!(
+        "(version 1) (deny default) (allow file-read-metadata) (allow sysctl-read) (allow process-fork) (allow process-exec (subpath {}) (literal \"/usr/bin/cc\") (literal \"/usr/bin/ld\") (literal \"/usr/bin/xcrun\") {developer}) {reads}",
+        quoted(toolchain)
+    );
+    let test_profile = format!(
+        "(version 1) (deny default) (allow file-read-metadata) (allow sysctl-read) (allow process-exec (literal {})) {reads}",
+        quoted(&realwork.join("test-binary"))
     );
     let mut compile = Command::new("/usr/bin/sandbox-exec");
     compile
         .args([
             "-p",
-            &profile,
+            &compile_profile,
             &rustc,
             "--edition=2024",
             "--test",
@@ -212,7 +357,7 @@ pub fn test(
     }
     let mut tests = Command::new("/usr/bin/sandbox-exec");
     tests
-        .args(["-p", &profile])
+        .args(["-p", &test_profile])
         .arg(realwork.join("test-binary"))
         .current_dir(&work)
         .env_clear()
@@ -224,4 +369,93 @@ pub fn test(
         command: "rustc --edition=2024 --test src/lib.rs; ./test-binary".into(),
         output: format!("{compile_output}{output}"),
     })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    fn alive(pid: &str) -> bool {
+        Command::new("/bin/kill")
+            .args(["-0", pid])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    #[test]
+    fn timeout_kills_the_whole_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+        let mut c = Command::new("/bin/sh");
+        c.arg("-c")
+            .arg(format!("sleep 30 & echo $! > {}; wait", pidfile.display()));
+        let started = std::time::Instant::now();
+        assert!(run(&mut c, None, dir.path(), 1).is_err());
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let pid = fs::read_to_string(&pidfile).unwrap();
+        let pid = pid.trim();
+        for _ in 0..50 {
+            if !alive(pid) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("forked grandchild {pid} survived the timeout");
+    }
+
+    #[test]
+    fn unread_stdin_cannot_outlive_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = "x".repeat(4 * 1024 * 1024);
+        let started = std::time::Instant::now();
+        let mut c = Command::new("/bin/sleep");
+        c.arg("20");
+        assert!(run(&mut c, Some(&input), dir.path(), 1).is_err());
+        let mut c = Command::new("/bin/sleep");
+        c.arg("20");
+        assert!(
+            bounded(
+                &mut c,
+                Some(input.into_bytes()),
+                Duration::from_secs(1),
+                1024
+            )
+            .is_err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn bounded_commands_return_capped_output() {
+        let mut c = Command::new("/bin/echo");
+        c.arg("hello");
+        let (code, out) = bounded(&mut c, None, Duration::from_secs(5), 64).unwrap();
+        assert_eq!((code, out.as_slice()), (0, b"hello\n".as_slice()));
+        let mut c = Command::new("/bin/cat");
+        assert!(bounded(&mut c, Some(vec![b'y'; 200]), Duration::from_secs(5), 64).is_err());
+    }
+
+    #[test]
+    fn codex_receives_only_allowlisted_environment() {
+        let vars = [
+            ("PATH", "/usr/bin"),
+            ("HOME", "/Users/me"),
+            ("CODEX_HOME", "/Users/me/.codex"),
+            ("TRUSTGRAPH_HYDRA_TOKEN", "secret"),
+            ("TRUSTGRAPH_AGENT_TOKEN", "secret"),
+            ("TRUSTGRAPH_OWNER", "secret"),
+            ("GH_TOKEN", "secret"),
+            ("GITHUB_TOKEN", "secret"),
+            ("COMPOSIO_API_KEY", "secret"),
+            ("HYDRADB_API_KEY", "secret"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+        ]
+        .map(|(k, v)| (k.into(), v.into()));
+        let kept: Vec<_> = codex_environment(vars)
+            .into_iter()
+            .map(|(k, _)| k.into_string().unwrap())
+            .collect();
+        assert_eq!(kept, ["PATH", "HOME", "CODEX_HOME"]);
+    }
 }

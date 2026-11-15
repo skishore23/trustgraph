@@ -1,10 +1,11 @@
+pub mod auth;
 mod github;
 mod hydra;
 mod runner;
 mod server;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-pub use server::router;
+pub use server::{Options, Started, router};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
@@ -226,8 +227,10 @@ struct Workspace {
     gate: Gate,
     saved: Saved,
     hydra: hydra::Hydra,
-    owner_token: String,
+    owner: auth::OwnerSessions,
     agent_token: String,
+    port: u16,
+    simulations: std::collections::VecDeque<std::time::Instant>,
 }
 type Shared = Arc<Mutex<Workspace>>;
 fn private_file(path: &Path) -> Result<File> {
@@ -255,19 +258,7 @@ fn atomic(path: &Path, body: &impl Serialize) -> Result<()> {
     Ok(())
 }
 fn token(path: &Path) -> Result<String> {
-    if path.exists() {
-        let t = fs::read_to_string(path)?;
-        if t.len() != 64 {
-            return Err(err("invalid local token file"));
-        }
-        return Ok(t);
-    }
-    use std::io::Write;
-    let t = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-    let mut f = private_file(path)?;
-    f.write_all(t.as_bytes())?;
-    f.sync_all()?;
-    Ok(t)
+    Ok(auth::capability_file(path)?)
 }
 fn safe_path(p: &str) -> bool {
     !p.is_empty()
@@ -688,5 +679,42 @@ mod tests {
         let receipt = runner::test(&files, &[], dir.path(), &hash).unwrap();
         assert!(receipt.passed, "{}", receipt.output);
         assert_eq!(receipt.patch_digest, hash);
+    }
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn rust_tests_cannot_launch_apps_run_scripts_or_write_outside_the_work_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = PathBuf::from(std::env::var("HOME").unwrap());
+        let outside = [
+            home.join(format!("trustgraph-probe-{}", Uuid::new_v4().simple())),
+            dir.path()
+                .join(format!("outside-{}", Uuid::new_v4().simple())),
+        ];
+        let content = format!(
+            r#"#[test] fn no_launch() {{
+                for (tool, args) in [("/usr/bin/open", vec!["-h"]), ("/usr/bin/osascript", vec!["-e", "return 1"]), ("/bin/sh", vec!["-c", "true"])] {{
+                    assert!(std::process::Command::new(tool).args(args).output().is_err(), "{{tool}} must not start");
+                }}
+            }}
+            #[test] fn no_outside_writes() {{
+                for path in [{:?}, {:?}, "/private/tmp/trustgraph-sandbox-probe"] {{
+                    assert!(std::fs::write(path, b"x").is_err(), "{{path}} must not be writable");
+                }}
+                std::fs::write("inside-work-dir", b"x").unwrap();
+            }}"#,
+            outside[0].to_str().unwrap(),
+            outside[1].to_str().unwrap()
+        );
+        let files = vec![ChangedFile {
+            path: "src/lib.rs".into(),
+            content,
+        }];
+        let hash = patch_digest("owner/repo", "base", &files);
+        let receipt = runner::test(&files, &[], dir.path(), &hash).unwrap();
+        assert!(receipt.passed, "{}", receipt.output);
+        assert!(receipt.output.contains("2 passed"), "{}", receipt.output);
+        for path in outside {
+            assert!(!path.exists(), "{}", path.display());
+        }
     }
 }

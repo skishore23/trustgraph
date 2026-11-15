@@ -69,6 +69,9 @@ enum Command {
         config: PathBuf,
         #[arg(long, default_value_t = 8080)]
         port: u16,
+        /// Allow (with a warning) a state directory inside the target or context repository.
+        #[arg(long)]
+        allow_state_in_repository: bool,
     },
     /// Compile a typed plan against the synthetic Northstar source snapshot.
     CompilePlan { file: Option<PathBuf> },
@@ -314,29 +317,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             return Err("work is still running; inspect its status without resubmitting".into());
         }
-        Command::Start { config, port } => {
+        Command::Start {
+            config,
+            port,
+            allow_state_in_repository,
+        } => {
             let config: trustgraph_live::Config = serde_json::from_slice(&std::fs::read(config)?)?;
-            let state_directory = config.directory.clone();
-            let app = trustgraph_live::router(config)
-                .await
-                .map_err(|e| e.to_string())?;
+            // Bind first so the single-use launch link names the actual port.
             let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
-            let operator_token = std::fs::read_to_string(state_directory.join("owner-token"))?;
-            let operator_link = state_directory.join("operator.html");
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            use std::io::Write;
-            options.open(&operator_link)?.write_all(format!("<!doctype html><meta http-equiv=refresh content=\"0;url=http://127.0.0.1:{port}/#/connect/{}\">",operator_token.trim()).as_bytes())?;
+            let started = trustgraph_live::router(
+                config,
+                trustgraph_live::Options {
+                    port,
+                    allow_state_in_repository,
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
             println!(
-                "TrustGraph workspace: http://127.0.0.1:{port}\nOperator sign-in: {}",
-                operator_link.display()
+                "TrustGraph workspace: http://127.0.0.1:{port}\nOperator sign-in (single use, this start only): {}",
+                started.launch_file.display()
             );
-            axum::serve(listener, app).await?;
+            axum::serve(listener, started.router).await?;
         }
         Command::CompilePlan { file } => {
             let plan = match file {
