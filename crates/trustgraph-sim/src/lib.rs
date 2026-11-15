@@ -72,6 +72,9 @@ pub fn run_with_bundles(
                 .get(key)
                 .ok_or("publisher effect has no durable operation")?;
             bundle::replay(&op.bundle).map_err(str::to_string)?;
+            if op.bundle.decision.context() != Some(&op.context) || op.intent != op.bundle.intent {
+                return Err("operation binding differs from its verified bundle".into());
+            }
             if op.context.artifact_hash != ack.payload.hash
                 || op.context.audience.destination != ack.payload.destination
                 || op.bundle.evidence.artifacts[&op.intent.artifact].content != ack.payload.content
@@ -194,7 +197,9 @@ fn step(
         }
         Action::ChangeAudience => {
             let mut audience = w.state().evidence.audiences[&AudienceId::from("company")].clone();
-            audience.destination = "sim://northstar/another-channel".into();
+            // Reviewers may narrow membership within the ceiling but never move
+            // the destination; any membership change invalidates the approval.
+            audience.recipients = fixtures::readers(&["maya", "arun"]);
             w.change_audience(&actor, audience)?;
             serde_json::json!({"audience_changed": true})
         }

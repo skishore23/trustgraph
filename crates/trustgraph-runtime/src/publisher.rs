@@ -32,9 +32,9 @@ pub enum Outcome {
 
 /// An unknown result never permits an implicit resend. Lookup is read-only.
 pub trait Publisher {
-    fn simulated(&self) -> bool {
-        true
-    }
+    /// Required: receipts must state truthfully whether a real destination
+    /// was written. There is deliberately no default.
+    fn simulated(&self) -> bool;
     fn send(&mut self, payload: &Payload) -> Result<(Outcome, Option<Acknowledgment>), Error>;
     fn lookup(&mut self, operation: &str) -> Result<Option<Acknowledgment>, Error>;
 }
@@ -123,6 +123,9 @@ impl LocalPublisher {
     }
 }
 impl Publisher for LocalPublisher {
+    fn simulated(&self) -> bool {
+        true
+    }
     fn send(&mut self, payload: &Payload) -> Result<(Outcome, Option<Acknowledgment>), Error> {
         if payload.hash != digest::content(payload.content.as_bytes())
             || !(payload.destination.starts_with("sim://northstar/")

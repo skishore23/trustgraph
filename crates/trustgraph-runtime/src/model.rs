@@ -51,6 +51,27 @@ pub struct State {
     pub source_authority: BTreeMap<SourceId, Readers>,
     #[serde(default)]
     pub destination_authority: BTreeMap<AudienceId, Audience>,
+    /// Readers last chosen through an explicit source permission change. Policy
+    /// activation may not widen a source beyond this restriction; only another
+    /// explicit change (bounded by the ceiling) can lift it.
+    #[serde(default)]
+    pub source_restrictions: BTreeMap<SourceId, Readers>,
+}
+impl State {
+    /// Effective per-source bound for policy compilation: the authoritative
+    /// ceiling narrowed by any explicit source restriction.
+    pub fn source_bounds(&self) -> BTreeMap<SourceId, Readers> {
+        self.source_authority
+            .iter()
+            .map(|(id, ceiling)| {
+                let bound = match self.source_restrictions.get(id) {
+                    Some(restriction) => ceiling.intersection(restriction).cloned().collect(),
+                    None => ceiling.clone(),
+                };
+                (id.clone(), bound)
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,6 +220,13 @@ pub enum Event {
     },
     OperationRecorded {
         operation: Box<Operation>,
+    },
+    /// An approver confirmed that an `OutcomeUnknown` operation was not
+    /// delivered, after the publisher lookup returned no acknowledgment.
+    OperationFailureConfirmed {
+        key: String,
+        confirmed_by: PrincipalId,
+        at: u64,
     },
 }
 

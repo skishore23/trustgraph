@@ -285,6 +285,13 @@ pub(crate) fn enforce_request(state: &State, request: &ReviewRequest) -> Result<
 
 /// Lower-level approval/publication endpoints share the same plan boundary.
 pub(crate) fn enforce_intent(state: &State, intent: &Intent) -> Result<(), Error> {
+    // A returned request blocks the lower-level approve/publish path too: the
+    // submitter must revise before this exact artifact and audience proceed.
+    if state.requests.values().any(|r| {
+        r.changes_requested && r.artifact() == &intent.artifact && r.audience == intent.audience
+    }) {
+        return Err(Error::Conflict);
+    }
     let mut seen = std::collections::BTreeSet::new();
     let mut pending = vec![intent.artifact.clone()];
     while let Some(id) = pending.pop() {
