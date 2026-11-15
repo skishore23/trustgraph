@@ -95,6 +95,17 @@ five completed checks cover all subsets of the three-principal universe; the
 larger arbitrary-key statement remains unproved. The final code also passed 18
 core regression/property tests and core clippy with warnings denied.
 
+### CI confirmation
+
+[GitHub Actions run 43680728039](https://github.com/skishore23/trustgraph/actions/runs/43680728039)
+verified code commit `a44a2732862e4eb4f332969d77d0314508f74ccd` on
+2026-11-15: **all six harnesses successfully verified, zero failures**. The
+arbitrary-key extension completed in 156.94 solver seconds with 0 of 597 checks
+failed (13 unreachable). The other five completed in 19.20, 7.56, 13.26, 7.26 and
+11.99 solver seconds, respectively, in the table's order. This supersedes the
+local inconclusive outcome for that extension, without changing the bounds or
+expanding the proof to the BTreeSet adapters or the whole application.
+
 Compilation reports potentially unsupported `caller_location` and a foreign
 function in the crate. Kani inserts reachable-unsupported checks; those checks
 are not disabled. A successful harness means no such unsupported path was
