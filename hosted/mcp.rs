@@ -114,7 +114,10 @@ impl ServerHandler for Demo {
     }
 }
 
-pub fn router() -> Router {
+/// Hosts the MCP transport accepts. `TRUSTGRAPH_ALLOWED_HOSTS` (comma-separated,
+/// e.g. `demo.example.com,trustgraph.example.org`) adds custom domains to the
+/// built-in local and Vercel hosts.
+fn allowed_hosts(lookup: impl Fn(&str) -> Option<String>) -> Vec<String> {
     let mut hosts = vec![
         "localhost".to_owned(),
         "127.0.0.1".to_owned(),
@@ -125,10 +128,28 @@ pub fn router() -> Router {
         "VERCEL_PROJECT_PRODUCTION_URL",
         "VERCEL_BRANCH_URL",
     ] {
-        if let Ok(host) = std::env::var(variable) {
+        if let Some(host) = lookup(variable) {
             hosts.push(host);
         }
     }
+    if let Some(extra) = lookup("TRUSTGRAPH_ALLOWED_HOSTS") {
+        hosts.extend(
+            extra
+                .split(',')
+                .map(|host| host.trim().to_ascii_lowercase())
+                .filter(|host| !host.is_empty()),
+        );
+    }
+    hosts.retain(|host| !host.trim().is_empty());
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
+/// Request bodies above this size are refused before JSON parsing.
+pub const MAX_MCP_BODY_BYTES: usize = 32_768;
+
+fn router_for(hosts: Vec<String>) -> Router {
     let origins: Vec<_> = hosts
         .iter()
         .map(|host| format!("https://{host}:443"))
@@ -136,7 +157,7 @@ pub fn router() -> Router {
     let config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false)
         .with_json_response(true)
-        .with_max_request_body_bytes(32_768)
+        .with_max_request_body_bytes(MAX_MCP_BODY_BYTES)
         .with_allowed_hosts(hosts)
         .with_allowed_origins(origins);
     let service = StreamableHttpService::new(
@@ -147,6 +168,11 @@ pub fn router() -> Router {
     Router::new()
         .route_service("/api/mcp", service.clone())
         .route_service("/mcp", service)
+        .layer(axum::middleware::map_response(crate::errors::json_errors))
+}
+
+pub fn router() -> Router {
+    router_for(allowed_hosts(|name| std::env::var(name).ok()))
 }
 
 #[cfg(test)]
@@ -157,6 +183,76 @@ mod tests {
         http::{Request, StatusCode},
     };
     use tower::ServiceExt;
+
+    fn post(host: &str, origin: Option<&str>, body: String) -> Request<Body> {
+        let mut builder = Request::post("/mcp")
+            .header("host", host)
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header("mcp-protocol-version", "2025-03-26");
+        if let Some(origin) = origin {
+            builder = builder.header("origin", origin);
+        }
+        builder.body(Body::from(body)).unwrap()
+    }
+
+    async fn refused(request: Request<Body>) -> (StatusCode, Value) {
+        let response = router().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 100_000).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    fn initialize() -> String {
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}).to_string()
+    }
+
+    #[tokio::test]
+    async fn rejects_unlisted_host_and_cross_origin_requests_with_json_errors() {
+        let (status, body) = refused(post("attacker.example", None, initialize())).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body["error"].as_str().unwrap().contains("Host"));
+        let (status, body) = refused(post(
+            "localhost",
+            Some("https://attacker.example"),
+            initialize(),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body["error"].as_str().unwrap().contains("Origin"));
+    }
+
+    #[tokio::test]
+    async fn enforces_the_32_kib_body_limit() {
+        let padding = "x".repeat(MAX_MCP_BODY_BYTES);
+        let body = json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"pad":padding}})
+            .to_string();
+        let (status, value) = refused(post("localhost", None, body)).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(value["error"].is_string());
+    }
+
+    #[test]
+    fn custom_hosts_extend_the_allowlist() {
+        let hosts = allowed_hosts(|name| match name {
+            "TRUSTGRAPH_ALLOWED_HOSTS" => Some(" Demo.Example.com, ,other.example ".into()),
+            "VERCEL_URL" => Some("preview.vercel.app".into()),
+            _ => None,
+        });
+        for host in [
+            "demo.example.com",
+            "other.example",
+            "preview.vercel.app",
+            "localhost",
+        ] {
+            assert!(hosts.contains(&host.to_owned()), "{host} missing");
+        }
+        assert!(!hosts.iter().any(|host| host.is_empty()));
+        assert_eq!(
+            allowed_hosts(|_| None),
+            ["127.0.0.1", "localhost", "trustgraph-demo.vercel.app"]
+        );
+    }
 
     async fn rpc(method: &str, params: Value) -> Value {
         let response = router()

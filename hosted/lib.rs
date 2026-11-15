@@ -1,6 +1,7 @@
 //! Public, stateless demo. Every request replays a bounded fictional story through
 //! the real Rust engine. Client history is demo input, never authorization for a
 //! live publisher. No credentials, durable state, or external writes are used.
+pub mod errors;
 pub mod framework;
 pub mod mcp;
 pub mod simulation;
@@ -20,6 +21,8 @@ use trustgraph_runtime::{
 };
 
 const MAX_COMMANDS: usize = 64;
+/// Largest accepted JSON body for every hosted demo endpoint.
+pub const MAX_BODY_BYTES: usize = 131_072;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -87,7 +90,8 @@ pub fn router() -> Router {
         .route("/api/demo", post(demo))
         .route("/api/framework", post(framework::demo))
         .route("/api/simulation", post(simulation::demo))
-        .layer(DefaultBodyLimit::max(131_072))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(axum::middleware::map_response(errors::json_errors))
 }
 
 #[cfg(test)]

@@ -21,12 +21,31 @@ From the repository root, with Rust 1.90+, Node.js, and an authenticated Vercel 
 ```sh
 cargo test --workspace --locked
 node scripts/test_demo.cjs
+node scripts/test_build_demo.cjs
+node web/framework.test.cjs
 vercel deploy --prod
 ```
 
 `vercel.json` builds the static interface into `public/` with
-`scripts/build_demo.cjs`. Vercel builds `api/framework.rs`, `api/demo.rs` and
-`api/simulation.rs` and `api/mcp.rs` using its official Rust runtime. No environment variables or external services are required.
+`scripts/build_demo.cjs`, which empties `public/` first and fails if an expected
+HTML anchor is missing. Vercel builds four Rust functions with its official Rust
+runtime:
+
+| Function | Route | Purpose |
+|---|---|---|
+| `api/framework.rs` | `POST /api/framework` | Typed-dataflow lab (root page) |
+| `api/demo.rs` | `POST /api/demo` | Previous Northstar story (`/story.html`) |
+| `api/simulation.rs` | `POST /api/simulation` | Seeded virtual-time simulator |
+| `api/mcp.rs` | `/mcp`, `/api/mcp` | Read-only remote MCP server |
+
+No external services are required. The only optional environment variable is
+`TRUSTGRAPH_ALLOWED_HOSTS` (see [Remote MCP](#remote-mcp)).
+
+Every endpoint answers errors with a JSON body, `{"error": "..."}`, including
+malformed JSON (400), unknown fields (422), a missing JSON content type (415),
+oversize bodies (413), wrong methods (405) and unknown paths (404). The
+browser clients also tolerate non-JSON bodies from proxies and show a short
+readable message instead of a parse error.
 
 For local development with Vercel's routing and runtime bridge:
 
@@ -49,7 +68,9 @@ the next command or compare policies. Every step is revalidated by Rust. This
 works across cold starts and concurrent instances without server-side sessions
 or a shared database. Reloading preserves the tab's progress; **Restart the
 story** clears it. Closing the tab normally clears its session storage. If
-browser storage is unavailable, progress lasts until the page reloads.
+browser storage is unavailable, progress lasts until the page reloads. If the
+server rejects a saved history (for example after a deployment changed the
+story), the page clears it, restarts the story once and says so.
 
 Requests are limited to 128 KiB and 64 commands. Restart the story to begin
 another walkthrough. Failed commands are not added to browser history.
@@ -76,6 +97,19 @@ No authentication or API key is needed. The endpoint is stateless, uses JSON
 responses, accepts at most 32 KiB per request, and cannot access local runtime
 files, credentials, HydraDB, Codex, Composio, or GitHub. It does not expose the
 live gateway's task submission, review, policy activation, or publication tools.
+
+To limit DNS rebinding and cross-site use, the endpoint accepts only requests
+whose `Host` is `localhost`, `127.0.0.1`, `trustgraph-demo.vercel.app` or one of
+Vercel's `VERCEL_URL`, `VERCEL_PROJECT_PRODUCTION_URL` and `VERCEL_BRANCH_URL`
+values. A browser `Origin`, when present, must be `https://` one of those hosts.
+To serve the endpoint from a custom domain, set a comma-separated list in the
+Vercel project:
+
+```sh
+vercel env add TRUSTGRAPH_ALLOWED_HOSTS   # e.g. demo.example.com,trust.example.org
+```
+
+Other hosts and origins receive `403` with a JSON error.
 
 Connect a Codex client without replacing its existing local TrustGraph server:
 
