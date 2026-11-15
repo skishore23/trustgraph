@@ -17,9 +17,13 @@ cargo build --locked -p trustgraph-cli
 ./target/debug/trustgraph start
 ```
 
-Startup creates separate owner and agent capabilities in the configured state
-directory. The owner opens the private launch file for human review. Give the
-MCP adapter only the **agent-token** file. It must be a private regular file
+Startup writes an **agent-token** file to the configured state directory and a
+single-use `operator.html` launch file for the human owner. The launch file is
+deleted once it has been opened; the owner session is an HttpOnly cookie that
+lasts 8 hours or until the server restarts. Owner routes (approve, publish,
+policy, revise, confirm-failed, connections) never accept a bearer token, so the
+agent token cannot approve or publish. Give the MCP adapter only the
+**agent-token** file. It must be a private regular file
 with owner-only permissions; do not paste its value into a prompt or commit it.
 
 ## 2. Register MCP
@@ -89,6 +93,14 @@ Any client on the same machine may use the HTTP API directly with an
 | `POST /api/work` | `{ "goal": "<admitted task>", "include_risk": true }` → `{ "id": "job-…" }` |
 | `POST /api/work/{id}/repair` | `{}` → new job ID |
 | `POST /api/simulate` | Supported scenario and optional proposed policy → comparison |
+
+`POST /api/simulate` is limited to 20 requests per minute (429 beyond that).
+
+Owner-only routes use the browser session, never a bearer token. Besides review,
+approval and publication, the owner can call `POST /api/work/{id}/confirm-failed`
+to close an `outcome_unknown` publication once GitHub confirms nothing was
+written. Publishing the same change again while an earlier attempt is pending,
+published or unresolved returns **409 Conflict** instead of sending twice.
 
 The CLI resolves the default token path from ignored `trustgraph.local.json`:
 

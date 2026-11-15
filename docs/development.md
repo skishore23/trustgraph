@@ -59,7 +59,10 @@ The target must be a clean Git checkout of that private repository with committe
 belong in `src/lib.rs`. Source imports read **committed Git bytes** from
 `context_repository`. Commit controlled inputs before importing them. Use a new
 state directory for a different repository or audience; only one server may own
-it. Department-mode evidence uses the `bank-departments` namespace.
+it. Keep the state directory **outside** `context_repository` and
+`target_repository`: an agent with workspace access could otherwise read local
+capabilities. `start` refuses a state directory inside either repository unless
+you pass `--allow-state-in-repository`. Department-mode evidence uses the `bank-departments` namespace.
 
 The hosted Hydra adapter reads the authenticated CLI configuration from
 `~/.hydradb/config.json`, or the path in `TRUSTGRAPH_HYDRA_CONFIG`. It requires
@@ -70,8 +73,9 @@ cargo build --locked -p trustgraph-cli
 ./target/debug/trustgraph start
 ```
 
-Open the private `operator.html` file printed at startup once. It establishes a
-local HttpOnly/SameSite operator session. The workspace is at
+Open the private `operator.html` file printed at startup once. It is single-use:
+it establishes a local HttpOnly, SameSite=Strict operator session for 8 hours and
+is then deleted. To sign in again, restart the server. The workspace is at
 [localhost:8080](http://127.0.0.1:8080/), with Workspace, Policy and Simulator.
 The server also writes a separate restricted `agent-token`; use that path for
 [the MCP adapter](agent-integration.md). Tokens, local state and configuration

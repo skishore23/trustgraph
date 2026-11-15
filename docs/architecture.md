@@ -198,8 +198,10 @@ model are configured principals; they are not synchronized GitHub team identitie
 | Local workspace files | Job metadata, run logs, isolated checks and operator/agent capability files | Operate and inspect the local workspace |
 | Publisher records | Attempt markers and acknowledged payloads | Preserve the adapter's observed publication outcome |
 
-The journal and workspace files live under the configured state directory. The
-example configuration puts them in the ignored `.trustgraph-live` directory.
+The journal and workspace files live under the configured state directory, which
+must sit outside the context and target repositories. The owner launch secret is
+held only in memory and in a single-use `operator.html`; only the agent token is
+persisted.
 HydraDB holds evidence; Rust evaluates authorization. The journal preserves
 publication intent before any external mutation.
 

@@ -26,9 +26,11 @@ cp trustgraph-actions.example.json trustgraph-actions.local.json
 ```
 
 Set `github_repository` in the ignored local config to your demo repository.
-Open the private `operator.html` file printed at startup to establish an HttpOnly
-operator session at [127.0.0.1:8084](http://127.0.0.1:8084). The separate agent
-API is on port 8085; it has no approval or execution routes.
+Open the single-use private `operator.html` file printed at startup to establish
+an HttpOnly operator session (restart the server to sign in again) at [127.0.0.1:8084](http://127.0.0.1:8084). The separate agent
+API is on port 8085; it has no approval or execution routes. The owner and agent ports must differ. Optional
+`composio_dashboard_url` and `source_url` config fields set the dashboard and
+source links shown in the walkthrough.
 
 Set the real project and Work Order IDs in the [example](../examples/8090/github-issue.json), then submit:
 

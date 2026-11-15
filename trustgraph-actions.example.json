@@ -7,5 +7,7 @@
   "tool_version": null,
   "composio_transport": "project_api",
   "tool_schema_hash": null,
-  "agent_public_url": null
+  "agent_public_url": null,
+  "composio_dashboard_url": null,
+  "source_url": null
 }

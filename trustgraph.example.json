@@ -1,5 +1,5 @@
 {
-  "directory": "/absolute/TrustGraph/.trustgraph-live/bank",
+  "directory": "/absolute/trustgraph-state/bank",
   "context_repository": "/absolute/TrustGraph",
   "context_files": [
     "examples/bankcase/engineering-requirements.md",
