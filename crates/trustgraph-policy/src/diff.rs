@@ -55,11 +55,11 @@ pub fn diff(old: &Policy, new: &Policy) -> Diff {
         match (old.sources.get(name), new.sources.get(name)) {
             (None, Some(s)) => {
                 let readers = new.people(&s.readers);
-                subject_changes.push(added(&subject, readers));
+                subject_changes.push(added(&subject, readers, source_detail(s)));
             }
             (Some(s), None) => {
                 let readers = old.people(&s.readers);
-                subject_changes.push(removed(&subject, readers));
+                subject_changes.push(removed(&subject, readers, source_detail(s)));
             }
             (Some(o), Some(n)) => {
                 set_change(
@@ -89,11 +89,11 @@ pub fn diff(old: &Policy, new: &Policy) -> Diff {
         match (old.actions.get(name), new.actions.get(name)) {
             (None, Some(a)) => {
                 let audience = new.people(&a.audience);
-                subject_changes.push(added(&subject, audience));
+                subject_changes.push(added(&subject, audience, action_detail(new, a)));
             }
             (Some(a), None) => {
                 let audience = old.people(&a.audience);
-                subject_changes.push(removed(&subject, audience));
+                subject_changes.push(removed(&subject, audience, action_detail(old, a)));
             }
             (Some(o), Some(n)) => {
                 set_change(
@@ -153,27 +153,47 @@ fn neutral(subject: &str, summary: &str) -> Change {
     }
 }
 
-fn added(subject: &str, people: BTreeSet<String>) -> Change {
+fn added(subject: &str, people: BTreeSet<String>, detail: String) -> Change {
     Change {
         kind: ChangeKind::Widens,
         subject: subject.to_string(),
-        summary: format!("{subject} added, reaching {}", or_nobody(&people)),
+        summary: format!("{subject} added, reaching {}; {detail}", or_nobody(&people)),
         gained: people,
         lost: BTreeSet::new(),
     }
 }
 
-fn removed(subject: &str, people: BTreeSet<String>) -> Change {
+fn removed(subject: &str, people: BTreeSet<String>, detail: String) -> Change {
     Change {
         kind: ChangeKind::Narrows,
         subject: subject.to_string(),
         summary: format!(
-            "{subject} removed, no longer reaching {}",
+            "{subject} removed, no longer reaching {}; {detail}",
             or_nobody(&people)
         ),
         gained: BTreeSet::new(),
         lost: people,
     }
+}
+
+fn agents_text(agents: &BTreeSet<String>) -> String {
+    if agents.is_empty() {
+        "no agents".to_string()
+    } else {
+        format!("agents {}", list(agents))
+    }
+}
+
+fn source_detail(source: &crate::Source) -> String {
+    format!("usable by {}", agents_text(&source.agents))
+}
+
+fn action_detail(policy: &Policy, action: &crate::Action) -> String {
+    let approval = action
+        .approval
+        .as_ref()
+        .map_or("no approval".to_string(), |r| describe(policy, r));
+    format!("attempted by {}; {approval}", agents_text(&action.agents))
 }
 
 fn or_nobody(people: &BTreeSet<String>) -> String {
