@@ -40,9 +40,3 @@ human review → publication gate. Use the separate [live workspace](development
 for real generation, tests, Hydra evidence and a GitHub draft PR. Its human
 operator capability protects actual publication; it is not needed for this
 presentation flow.
-
-The [technical explainer](../media/trustgraph-technical-explainer.mp4)
-([captions](../media/trustgraph-technical-explainer.srt)) covers controlled inputs,
-HydraDB evidence, inherited access, exact approval and durable publication. The
-[story explainer](../media/trustgraph-explainer.mp4)
-([captions](../media/trustgraph-explainer.srt)) introduces the dashboard example.

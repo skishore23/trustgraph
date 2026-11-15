@@ -216,7 +216,6 @@ See [agent integration](docs/agent-integration.md) for MCP and HTTP clients, and
 | `web` | Embedded guided-demo and live-workspace assets |
 | `examples` | Policy examples, simulation inputs and fictional bank source material |
 | `docs` | Architecture, setup and usage guides |
-| `media` | Current explainers and captions |
 
 ## Development
 
@@ -240,7 +239,3 @@ output are ignored by Git.
 | [Demo walkthrough](docs/demo.md) | The complete fictional dashboard scenario |
 | [Development and live setup](docs/development.md) | Configuration, checks and the real bank workbench |
 
-Watch the [technical explainer](media/trustgraph-technical-explainer.mp4)
-([captions](media/trustgraph-technical-explainer.srt)) or the
-[story explainer](media/trustgraph-explainer.mp4)
-([captions](media/trustgraph-explainer.srt)).
