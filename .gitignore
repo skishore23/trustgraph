@@ -20,3 +20,6 @@ __pycache__/
 *.swo
 *~
 .DS_Store
+
+# Local agent worktrees
+/.claude/
