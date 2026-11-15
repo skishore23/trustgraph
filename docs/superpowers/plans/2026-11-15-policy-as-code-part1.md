@@ -25,7 +25,7 @@ This is part 1 of 3. Part 2: `trustgraph serve` (HTTP, MCP, operator page). Part
 - Kani is not installed locally. New harnesses must compile under `cargo check -p trustgraph-core` and are verified by the `Bounded permission proofs` workflow; do not record a proof result in `docs/verification.md` until a CI run has produced it.
 - The reference applications (`trustgraph-runtime` PolicySpec, `trustgraph-live` WorkPolicy, story demo) keep their own formats; do not migrate them.
 - Do not touch `README.md` beyond fixing links broken by Task 1.
-- Commit messages end with a blank line, then `Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>`.
+- Commit messages end with a blank line, then a Co-Authored-By trailer naming the model that did the work.
 
 ## Review Focus
 
