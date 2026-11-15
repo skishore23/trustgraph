@@ -2030,8 +2030,19 @@ dependencies = [
  "serde_json",
  "tokio",
  "tower",
+ "trustgraph-framework",
  "trustgraph-runtime",
  "vercel_runtime",
+]
+
+[[package]]
+name = "trustgraph-framework"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "trustgraph-core",
 ]
 
 [[package]]

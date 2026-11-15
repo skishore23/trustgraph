@@ -2,11 +2,17 @@
 
 [Open the demo](https://trustgraph-demo.vercel.app). No sign-in or API key is required.
 
-The Vercel deployment presents the five-chapter Northstar company story. Its
-Rust API uses the same policy compiler, lineage verifier, approvals, and simulated
-publisher as the local guided demo. Data and generated artifacts are fictional;
-releases are simulated. It does not run Codex, connect to HydraDB, or create
-GitHub issues or pull requests.
+The root page is a typed-dataflow lab backed by `trustgraph-framework` through
+`POST /api/framework`. It reconstructs bounded fictional document/email and data
+export pipelines, displays exact artifact and operation records, and checks type
+compatibility, inherited access and approval freshness using Rust. Browser
+controls are hypothetical inputs, not authority for a live effect. Each request
+is independent; no session or persistent graph is needed.
+
+The previous five-chapter Northstar story remains at `/story.html` (also
+`/legacy.html`) with its existing `/api/demo` API. Both demonstrations are
+fictional. Neither runs Codex, connects to HydraDB, sends mail, uploads exports,
+or creates GitHub issues or pull requests.
 
 ## Deploy
 
@@ -19,8 +25,8 @@ vercel deploy --prod
 ```
 
 `vercel.json` builds the static interface into `public/` with
-`scripts/build_demo.cjs`. Vercel builds `api/demo.rs` using its official Rust
-runtime. No environment variables or external services are required.
+`scripts/build_demo.cjs`. Vercel builds `api/framework.rs`, `api/demo.rs` and
+`api/mcp.rs` using its official Rust runtime. No environment variables or external services are required.
 
 For local development with Vercel's routing and runtime bridge:
 
@@ -28,7 +34,14 @@ For local development with Vercel's routing and runtime bridge:
 vercel dev
 ```
 
-## Visitor progress
+For the framework UI and Rust endpoints without Vercel credentials:
+
+```sh
+cargo run --locked --example framework_server
+# http://127.0.0.1:9082
+```
+
+## Previous story: visitor progress
 
 Each tab keeps its successful demo commands in `sessionStorage`. Requests to
 `POST /api/demo` replay that history into a fresh in-memory `Story`, then execute

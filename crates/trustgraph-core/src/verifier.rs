@@ -45,11 +45,11 @@ pub fn verify(e: &Evidence, intent: &Intent, now: u64) -> Decision {
     {
         return block(Code::AudienceUnresolved, None);
     }
-    if !audience.recipients.is_subset(&closure.readers) {
+    if !permissions::can_flow(&closure.readers, &audience.recipients) {
         let witness = closure
             .acls
             .iter()
-            .find(|(_, acl)| !audience.recipients.is_subset(&acl.readers))
+            .find(|(_, acl)| !permissions::can_flow(&acl.readers, &audience.recipients))
             .and_then(|(id, _)| closure.sources.get(id).map(|s| s.artifact.clone()));
         return block(Code::RestrictedSource, witness);
     }

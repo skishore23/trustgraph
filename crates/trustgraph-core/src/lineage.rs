@@ -134,7 +134,7 @@ fn walk<'a>(
                 height = height.max(child_height + 1);
                 allowed = Some(match allowed {
                     None => incoming,
-                    Some(existing) => existing.intersection(&incoming).cloned().collect(),
+                    Some(existing) => permissions::intersect(&existing, &incoming),
                 });
             }
             (allowed.ok_or(Code::IncompleteLineage)?, height)

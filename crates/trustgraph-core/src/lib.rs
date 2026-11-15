@@ -3,6 +3,7 @@ pub mod bundle;
 pub mod digest;
 pub mod domain;
 pub mod lineage;
+pub mod permissions;
 pub mod plan;
 pub mod verifier;
 pub use domain::*;

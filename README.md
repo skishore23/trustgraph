@@ -1,18 +1,110 @@
 # TrustGraph
 
-[**Try the public demo →**](https://trustgraph-demo.vercel.app)
-No sign-in required. Fictional data and simulated releases, using the Rust policy engine.
+**A Rust framework for typed dataflow with permission-preserving transformations.**
 
-TrustGraph controls how AI-generated work is shared. It records the inputs an
-agent uses, carries their access restrictions into the result, and requires
-human approval for the exact version and destination being published.
+Applications combine information: an agent turns documents into a report, a
+pipeline turns tables into an export, or a function turns a request and a price
+sheet into a quote. The output is new, but the restrictions on its inputs must
+not disappear.
 
-For example, a dashboard built from private HR salary data inherits that data's
-access restrictions. Sharing a version with Engineering requires a fresh run
-using separately shared planning data, followed by review of the exact output.
-Passing tests or approving restricted work cannot grant source access.
+TrustGraph records **which exact data went into which operation and what came
+out**, then deterministically checks whether that derived data may flow to a
+proposed recipient. It is not a graph database, an LLM judge, or a claim that
+Rust's compiler proves arbitrary permissions.
 
-## Try the guided demo
+```text
+Request ─────┐
+             ├─ create_quote@1 ─→ Quote ──────┐
+Price sheet ─┘                               ├─ draft_email@1 ─→ Email
+Template ───────────────────────────────────┘
+```
+
+An artifact has an identity and a data type. An operation has named input and
+output ports. An execution connects exact artifact versions through those ports.
+The quote's identity is shared by the first operation's output and the second
+operation's input, like a foreign key joining two rows. Those references form
+the graph; traversal means following them back to the recorded sources.
+
+## The invariant
+
+For the reader-set policy model:
+
+```text
+Readers(output) = intersection(Readers(each input))
+Recipients(destination) must be a subset of Readers(output)
+```
+
+If one input permits Sales and Finance, and another permits only Finance, their
+combined output permits only Finance. Every output of an execution conservatively
+inherits every supplied input. The framework does not trust an agent's claim
+that it ignored a sensitive input. Approval is a separate obligation, not a way
+to erase source restrictions.
+
+## Framework and applications
+
+The reusable SDK is `crates/trustgraph-framework`. It models immutable artifacts,
+versioned operation contracts, executions, source permissions and generic action
+checks. The existing GitHub gateway and guided hackathon demonstration remain
+available as applications; their specialized publication workflows have not
+been silently replaced with a new protocol.
+
+See [framework design and integration](docs/framework.md) for the API, trust
+boundary, data model and migration scope. The dependency graph is typed at
+runtime by records and port schema identities; this is **not** compile-time
+information-flow verification or semantic proof that an output contains no secret.
+
+### Run the framework examples
+
+Requires Rust 1.90 or newer. No credentials or database needed:
+
+```sh
+cargo run --locked -p trustgraph-framework --example document_flow
+cargo run --locked -p trustgraph-framework --example data_export
+cargo test --locked -p trustgraph-framework
+```
+
+The first example links quote and email steps, checks an exact approval and
+changes a source restriction. The second runs an ordinary CSV sum with two
+outputs and no approval requirement. Neither sends, publishes or uploads data.
+
+### HydraDB's role
+
+HydraDB is an evidence backend in the existing gateway. It stores connected
+records, which the gateway reads back and checks against recorded evidence.
+The Rust verifier applies the permission rules. A durable local journal tracks
+that gateway's runtime and publication outcomes. The in-process framework does
+not require HydraDB or make network calls. A graph store is not itself an
+execution sandbox or an enforcement point.
+
+### Integration boundary
+
+The application must route input disclosure and outgoing effects through trusted
+checks. The executor or model receiving an input is itself a recipient. Record
+all supplied context, not merely sources the model chooses to cite. Secret-bearing
+parameters must be governed artifact inputs, not unlabelled parameters JSON. Hashes detect
+changed content relative to trusted records; they do not prove honest execution
+or complete capture. A decision is not an atomic transaction with an external
+email, repository or other service.
+
+## Interactive typed-graph demo
+
+[Open the framework demo](https://trustgraph-demo.vercel.app). Inspect named ports,
+artifact identities and inherited readers, then try an incompatible schema, a
+restricted recipient, review, or a relevant/unrelated policy change. Verdicts
+come from the Rust SDK through `/api/framework`, not a browser-only simulation.
+All data is fictional; no external action occurs.
+
+```sh
+cargo run --locked --example framework_server
+# Open http://127.0.0.1:9082
+```
+
+## Existing guided demo
+
+[Try the previous gateway demo](https://trustgraph-demo.vercel.app/story.html), using fictional data
+and simulated releases. No sign-in required.
+
+### Run locally
 
 Requires Rust 1.90 or newer. Run commands from the repository root:
 
@@ -30,7 +122,7 @@ See [public demo deployment](docs/vercel.md) for setup and visitor-state behavio
 Agents can also connect to the [public demo MCP endpoint](https://trustgraph-demo.vercel.app/mcp)
 for fictional workspace inspection and policy simulation, with no API key required.
 
-## Architecture
+## Existing gateway architecture
 
 TrustGraph combines three responsibilities:
 
@@ -73,6 +165,7 @@ See [agent integration](docs/agent-integration.md) for MCP and HTTP clients, and
 
 | Path | Purpose |
 | --- | --- |
+| `crates/trustgraph-framework` | Generic typed dataflow SDK and permission-preserving execution records |
 | `crates/trustgraph-core` | Deterministic verification, lineage and approval binding |
 | `crates/trustgraph-runtime` | Policy compilation, coordination, journals and recovery |
 | `crates/trustgraph-live` | Codex execution, hosted Hydra evidence, HTTP API and GitHub publication |

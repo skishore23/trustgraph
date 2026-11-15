@@ -6,8 +6,10 @@ fs.mkdirSync(output, { recursive: true });
 const html = fs.readFileSync(path.join(root, 'web/story.html'), 'utf8')
   .replace('<head>', '<head>\n  <meta name="trustgraph-mode" content="hosted">\n  <meta name="description" content="Explore how TrustGraph enforces source permissions and exact human approval for AI-generated work.">')
   .replace('Information boundaries <span', 'Interactive demo · Fictional data · Simulated releases <span');
-fs.writeFileSync(path.join(output, 'index.html'), html);
-for (const file of ['story.css', 'story.js']) {
+fs.writeFileSync(path.join(output, 'legacy.html'), html);
+fs.writeFileSync(path.join(output, 'story.html'), html);
+fs.copyFileSync(path.join(root, 'web/framework.html'), path.join(output, 'index.html'));
+for (const file of ['story.css', 'story.js', 'framework.css', 'framework.js']) {
   fs.copyFileSync(path.join(root, 'web', file), path.join(output, file));
 }
 console.log('Built TrustGraph public demo assets.');

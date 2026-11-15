@@ -1,6 +1,7 @@
 //! Public, stateless demo. Every request replays a bounded fictional story through
 //! the real Rust engine. Client history is demo input, never authorization for a
 //! live publisher. No credentials, durable state, or external writes are used.
+pub mod framework;
 pub mod mcp;
 
 use axum::{
@@ -83,6 +84,7 @@ async fn demo(Json(request): Json<DemoRequest>) -> Response {
 pub fn router() -> Router {
     Router::new()
         .route("/api/demo", post(demo))
+        .route("/api/framework", post(framework::demo))
         .layer(DefaultBodyLimit::max(131_072))
 }
 

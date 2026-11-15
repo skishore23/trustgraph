@@ -1,4 +1,8 @@
-# TrustGraph architecture
+# TrustGraph gateway architecture
+
+For the reusable typed-dataflow SDK, see [framework design](framework.md).
+This document describes the existing specialized gateway, not a claim that
+every SDK consumer uses Codex, GitHub, HydraDB or mandatory human approval.
 
 TrustGraph is a local governance gateway for agent-generated work. It records
 which inputs produced an artifact, derives who may access that artifact, and
