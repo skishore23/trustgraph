@@ -2004,6 +2004,7 @@ dependencies = [
  "tower",
  "trustgraph-core",
  "trustgraph-live",
+ "trustgraph-policy",
  "trustgraph-runtime",
  "trustgraph-sim",
  "uuid",

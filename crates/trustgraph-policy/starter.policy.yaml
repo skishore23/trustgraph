@@ -1,0 +1,56 @@
+# trustgraph.policy.yaml
+# Decides where an AI agent's output may go, based on what the agent read.
+# Anything not named in this file is denied.
+
+# Format version of this file. It must be 1.
+version: 1
+
+# Groups: named lists of people. Other sections refer to groups by name.
+groups:
+  hr: [nina]
+  engineering: [sam, ravi]
+  sales: [leo]
+  customers: [acme]
+
+# Agents: the AI agents this policy governs. Agents are named principals too.
+agents: [planner, mailer]
+
+# Sources: data an agent may read. `readers` are who may receive anything
+# derived from it; `agents` are the agents that may take it as input.
+sources:
+  salaries:
+    readers: [hr]
+    agents: [planner]
+  roadmap:
+    readers: [hr, engineering]
+    agents: [planner]
+  price_sheet:
+    readers: [sales, customers]
+    agents: [mailer]
+
+# Actions: places an agent may send output. `agents` may attempt the action,
+# `audience` receives the output, and `approval` (optional) makes a human
+# reviewer sign off first; the approval stays valid for `valid_for` (30m, 2h, 1d).
+actions:
+  post_to_slack:
+    agents: [planner]
+    audience: [engineering]
+  email_customer:
+    agents: [mailer]
+    audience: [customers]
+    approval: { reviewers: [sales], valid_for: 30m }
+
+# Tests: examples of what you expect. `trustgraph policy test` runs them, and
+# each says what the agent read (`output_from`), who acts, and the expected
+# verdict: allow, needs_approval or deny.
+tests:
+  - name: salary data never reaches engineering
+    output_from: [salaries, roadmap]
+    agent: planner
+    action: post_to_slack
+    expect: deny
+  - name: roadmap summary can be posted
+    output_from: [roadmap]
+    agent: planner
+    action: post_to_slack
+    expect: allow

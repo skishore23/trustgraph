@@ -14,11 +14,12 @@ const MAX_ERRORS: usize = 100;
 const MAX_SUGGEST_LEN: usize = 64;
 const MAX_VALID_FOR_SECONDS: u64 = 30 * 24 * 60 * 60;
 
-const TOP_KEYS: &[&str] = &["version", "groups", "agents", "sources", "actions", "tests"];
-const SOURCE_KEYS: &[&str] = &["readers", "agents"];
-const ACTION_KEYS: &[&str] = &["agents", "audience", "approval"];
-const APPROVAL_KEYS: &[&str] = &["reviewers", "valid_for"];
-const CASE_KEYS: &[&str] = &[
+pub(crate) const TOP_KEYS: &[&str] =
+    &["version", "groups", "agents", "sources", "actions", "tests"];
+pub(crate) const SOURCE_KEYS: &[&str] = &["readers", "agents"];
+pub(crate) const ACTION_KEYS: &[&str] = &["agents", "audience", "approval"];
+pub(crate) const APPROVAL_KEYS: &[&str] = &["reviewers", "valid_for"];
+pub(crate) const CASE_KEYS: &[&str] = &[
     "name",
     "output_from",
     "agent",

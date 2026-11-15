@@ -10,7 +10,7 @@ use trustgraph_sim::{Scenario, Trace};
 #[command(
     name = "trustgraph",
     version,
-    about = "A Rust governance gateway for agent work"
+    about = "Policy-as-code for what agents produce"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -18,6 +18,11 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Write, check, test, explain and diff a trustgraph.policy.yaml.
+    Policy {
+        #[command(subcommand)]
+        command: trustgraph_cli::policy_cmd::PolicyCommand,
+    },
     /// Open the guided, deterministic company-governance demo. No sign-in or external effects.
     Story {
         #[arg(long, default_value_t = 9081)]
@@ -140,6 +145,9 @@ fn save(path: &Path, value: &impl serde::Serialize) -> Result<(), Box<dyn Error>
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     match Cli::parse().command {
+        Command::Policy { command } => {
+            std::process::exit(trustgraph_cli::policy_cmd::run(command));
+        }
         Command::Story { port } => {
             let app = trustgraph_cli::story::router()?;
             let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;

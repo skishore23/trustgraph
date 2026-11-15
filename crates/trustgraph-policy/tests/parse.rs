@@ -292,3 +292,14 @@ fn huge_unknown_name_is_fast_and_unsuggested() {
     assert_eq!(errs[0].code, "unknown_name");
     assert_eq!(errs[0].suggestion, None);
 }
+
+#[test]
+fn starter_is_clean() {
+    let parsed = parse(trustgraph_policy::STARTER);
+    assert_eq!(parsed.diagnostics, vec![]);
+    let policy = parsed.policy.expect("policy");
+    assert_eq!(trustgraph_policy::lint(&policy), vec![]);
+    let results = trustgraph_policy::run_tests(&policy);
+    assert!(!results.is_empty());
+    assert!(results.iter().all(|r| r.pass), "{results:?}");
+}
