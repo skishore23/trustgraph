@@ -5,29 +5,49 @@ verification. None is a claim that the whole application is formally verified.
 
 ## Kani proof harnesses
 
-`crates/trustgraph-core/src/permissions.rs` contains `#[cfg(kani)]` harnesses
-calling the **production** `intersect` and `can_flow` helpers. The legacy verifier
-and generic dataflow SDK both use these helpers. The proofs do not substitute a
-second bitmask implementation for the functions actually used by the application.
+`crates/trustgraph-core/src/permissions.rs` separates two allocation-free,
+production **sorted-iterator kernels** from their `BTreeSet` adapters:
+
+- `visit_intersection` performs a linear merge and emits common readers.
+- `sorted_subset` scans sorted readers to check every destination recipient.
+- Public `intersect`/`can_flow` pass real `BTreeSet` iterators into these kernels.
+  Intersection buffers common readers in a preallocated Vec and uses bulk
+  `collect`, rather than repeated tree insertion. This adapter trades a
+  transient result buffer for a single easily verifiable merge loop.
+  The scans are O(n + m); they are not benchmarked as equivalent to the standard
+  library's adaptive performance on highly skewed set sizes.
+
+The legacy verifier and generic SDK both use those public functions. Kani runs
+these exact kernels with stack-array iterators. This avoids symbolically executing
+Rust's tree allocation and balancing machinery. It is **not a proof of the full
+BTreeSet adapters**. Sorted, unique iteration is an explicit kernel precondition,
+guaranteed by `BTreeSet` in production. Regression and property tests compare the
+adapters against standard-library intersection/subset on empty, finite and random
+sets (random vectors up to 63 `u16` keys are canonicalized into sets).
 
 | Harness | Property |
 | --- | --- |
-| `intersection_never_widens` | A combined reader set is a subset of both inputs |
+| `intersection_kernel_matches_membership` | Output contains exactly the common readers, with sorted unique output; this includes no widening |
+| `subset_kernel_matches_membership` | The scan permits exactly destinations whose members are all readers |
 | `composition_is_associative` | Grouping three input restrictions does not change the result |
 | `duplicate_or_reordered_inputs_preserve_readers` | Repeated inputs are idempotent; ordering does not change the intersection |
 | `recipient_must_be_permitted_by_every_input` | A destination is allowed by the intersection exactly when both input policies allow it |
+| `arbitrary_keys_match_set_specification` | Both kernels match membership specifications for arbitrary ordered `u8` keys, not just fixed principal IDs |
 
-**Bound:** the principal universe is `{0, 1, 2}`. Every membership is a symbolic
-Boolean, so each reader set can be any of the eight subsets, including empty.
-The three-set harnesses quantify over all 512 combinations within that universe. Loops
-are unwound to 16, and unwinding assertions remain enabled: exceeding the bound
-fails verification instead of silently excluding executions.
+**Bounds:** the first five harnesses quantify over every subset of `{0, 1, 2}`,
+including empty sets (512 combinations for three-set laws), with unwind 5. The
+last harness uses two arbitrary `u8` arrays, symbolic lengths from 0 through 3,
+and assumes only strict ascending order of the active prefixes. It checks exact
+intersection, ordered unique output, and subset correctness with unwind 8. The
+larger unwind permits merges of disjoint key ranges. No safety, overflow or
+unwinding assertions are disabled. An insufficient loop bound fails verification.
 
-This is a bounded proof of the instantiated Rust helper code and its reachable
-standard-library operations, not an unbounded theorem for arbitrary sets, graph
-sizes, all Rust types or all workflow schedules. It does not prove authentication,
-complete input capture, external publication atomicity, cryptographic properties,
-semantic absence of secrets, or correctness of the full approval verifier.
+These are bounded proofs of the production iterator kernels with slice iterators,
+not an unbounded theorem for arbitrary sizes, types, graph shapes, or schedules.
+The tree iterator, Vec buffering and output collection are outside this proof boundary. It also
+does not prove authentication, complete input capture, external publication
+atomicity, cryptographic properties, semantic absence of secrets, or correctness
+of the full approval verifier.
 
 ### Reproduce
 
@@ -45,23 +65,43 @@ not change the project's ordinary Rust compiler requirement. The
 same command for relevant changes and can be started manually. The workflow has
 read-only repository permissions and a 30-minute timeout.
 
-### Recorded run
+### Recorded runs
 
-**2026-11-15 local result: harnesses compiled, but no proof verdict completed.**
-Installed Kani 0.68.0, CBMC 6.11.0 and nightly-2026-08-21. The all-harness run was
-interrupted after roughly four minutes on the recipient-conjunction harness
-without a verdict. A subsequent isolated `intersection_never_widens` run with a
-180-second process timeout exited 124 while still checking. This is an
-**inconclusive resource-bounded attempt**, neither a successful proof nor a
-counterexample. No safety or unwinding checks were disabled, and the principal
-universe was not reduced to obtain a green result.
+The original full-BTreeSet attempt was **inconclusive**: local runs were stopped
+at roughly four minutes and 180 seconds, and the first GitHub Actions run reached
+the 30-minute job limit without completing its first harness. A simpler
+filter/contains full-BTreeSet variant also timed out locally after 70 seconds.
+These are resource-limit outcomes, not counterexamples or proofs. The principal
+universe was not reduced to make these attempts pass.
 
-Kani also reported possibly unsupported constructs (`caller_location` and foreign
-functions) in the compiled code, with verification failing if reachable. Because
-checking did not finish, their unreachability is not established by this run.
-The CI workflow permits a longer 30-minute job; inspect its result for the exact
-commit before making any proof claim. `cargo test` succeeding does not mean Kani
-verification succeeded.
+The subsequent kernel refactor removes tree allocation from the proof boundary
+rather than pretending it was verified. Kani 0.68.0 / CBMC 6.11.0 /
+nightly-2026-08-21 are used. On 2026-11-15 the final code completed **five
+successful bounded proofs**:
+
+| Harness | Result | Solver seconds |
+| --- | --- | ---: |
+| `recipient_must_be_permitted_by_every_input` | Successful, 0 of 584 checks failed | 37.57 |
+| `duplicate_or_reordered_inputs_preserve_readers` | Successful, 0 of 516 checks failed | 15.12 |
+| `composition_is_associative` | Successful, 0 of 515 checks failed | 27.05 |
+| `subset_kernel_matches_membership` | Successful, 0 of 616 checks failed | 13.86 |
+| `intersection_kernel_matches_membership` | Successful, 0 of 742 checks failed | 24.85 |
+| `arbitrary_keys_match_set_specification` | **Inconclusive: process time budget exhausted** | No completed verdict |
+
+The complete command had a 480-second process budget and exited 124 while checking
+the final arbitrary-key harness. Therefore this is **five proved bounded
+properties, one uncompleted extension**, not a successful all-harness run. The
+five completed checks cover all subsets of the three-principal universe; the
+larger arbitrary-key statement remains unproved. The final code also passed 18
+core regression/property tests and core clippy with warnings denied.
+
+Compilation reports potentially unsupported `caller_location` and a foreign
+function in the crate. Kani inserts reachable-unsupported checks; those checks
+are not disabled. A successful harness means no such unsupported path was
+reachable within that harness's assumptions and bounds, **not** that all code in
+the crate supports verification. A timeout establishes neither reachability nor
+unreachability. Inspect the CI result for the exact commit before claiming that
+revision passed. Ordinary `cargo test` success is independent evidence.
 
 ## Tests
 

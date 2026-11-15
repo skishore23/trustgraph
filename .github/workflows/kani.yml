@@ -26,5 +26,5 @@ jobs:
         run: |
           cargo install --locked kani-verifier --version 0.68.0
           cargo kani setup
-      - name: Verify production reader-set helpers
+      - name: Verify production sorted-iterator kernels
         run: cargo kani -p trustgraph-core --lib --output-format terse

@@ -5,16 +5,65 @@
 //! callers must validate the complete evidence and the destination separately.
 use std::collections::BTreeSet;
 
+/// Visit common items from strictly increasing iterators without allocating.
+/// BTreeSet supplies the sorted/unique precondition in the public adapter.
+fn visit_intersection<T: Ord>(
+    left: impl Iterator<Item = T>,
+    right: impl Iterator<Item = T>,
+    mut emit: impl FnMut(T),
+) {
+    let mut left = left.peekable();
+    let mut right = right.peekable();
+    while let (Some(a), Some(b)) = (left.peek(), right.peek()) {
+        match a.cmp(b) {
+            std::cmp::Ordering::Less => {
+                left.next();
+            }
+            std::cmp::Ordering::Greater => {
+                right.next();
+            }
+            std::cmp::Ordering::Equal => {
+                if let Some(item) = left.next() {
+                    emit(item);
+                }
+                right.next();
+            }
+        }
+    }
+}
+
+/// Check inclusion of sorted, unique recipients in sorted, unique readers.
+/// No allocation and at most a linear scan through both iterators.
+fn sorted_subset<T: Ord>(
+    readers: impl Iterator<Item = T>,
+    recipients: impl Iterator<Item = T>,
+) -> bool {
+    let mut readers = readers.peekable();
+    for recipient in recipients {
+        while readers.peek().is_some_and(|reader| reader < &recipient) {
+            readers.next();
+        }
+        if readers.peek() != Some(&recipient) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Readers of a value derived from both inputs. Empty means nobody, not public.
 pub fn intersect<T: Ord + Clone>(left: &BTreeSet<T>, right: &BTreeSet<T>) -> BTreeSet<T> {
-    left.intersection(right).cloned().collect()
+    let mut result = Vec::with_capacity(left.len().min(right.len()));
+    visit_intersection(left.iter(), right.iter(), |reader| {
+        result.push(reader.clone())
+    });
+    result.into_iter().collect()
 }
 
 /// Whether an already resolved destination can receive a value with `readers`.
 /// A missing/unresolved destination must be rejected by the caller, not passed
 /// here as an empty set.
 pub fn can_flow<T: Ord>(readers: &BTreeSet<T>, recipients: &BTreeSet<T>) -> bool {
-    recipients.is_subset(readers)
+    sorted_subset(readers.iter(), recipients.iter())
 }
 
 #[cfg(test)]
@@ -23,6 +72,19 @@ mod tests {
 
     fn set(mask: u8) -> BTreeSet<u8> {
         (0..3).filter(|bit| mask & (1 << bit) != 0).collect()
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn adapters_match_standard_sets(
+            left in proptest::collection::vec(proptest::prelude::any::<u16>(), 0..64),
+            right in proptest::collection::vec(proptest::prelude::any::<u16>(), 0..64),
+        ) {
+            let left: BTreeSet<_> = left.into_iter().collect();
+            let right: BTreeSet<_> = right.into_iter().collect();
+            proptest::prop_assert_eq!(intersect(&left, &right), left.intersection(&right).copied().collect());
+            proptest::prop_assert_eq!(can_flow(&left, &right), right.is_subset(&left));
+        }
     }
 
     #[test]
@@ -45,63 +107,143 @@ mod tests {
     }
 }
 
-/// Bounded proofs execute the production functions above, not a second model.
-/// The principal universe is {0,1,2}; each membership bit is symbolic.
+/// Kani checks the production allocation-free kernels. BTreeSet allocation,
+/// iteration, and collection are adapters covered by ordinary differential tests.
 #[cfg(kani)]
 mod proofs {
     use super::*;
 
-    fn arbitrary_readers() -> BTreeSet<u8> {
-        let membership: [bool; 3] = kani::any();
-        let mut readers = BTreeSet::new();
-        for (principal, included) in membership.into_iter().enumerate() {
-            if included {
-                readers.insert(principal as u8);
+    struct Readers {
+        items: [u8; 3],
+        len: usize,
+    }
+    impl Readers {
+        fn arbitrary() -> Self {
+            let membership: [bool; 3] = kani::any();
+            let mut result = Self {
+                items: [0; 3],
+                len: 0,
+            };
+            for (principal, included) in membership.into_iter().enumerate() {
+                if included {
+                    result.items[result.len] = principal as u8;
+                    result.len += 1;
+                }
             }
+            result
         }
-        readers
+        fn slice(&self) -> &[u8] {
+            &self.items[..self.len]
+        }
+        fn intersect(&self, other: &Self) -> Self {
+            let mut result = Self {
+                items: [0; 3],
+                len: 0,
+            };
+            visit_intersection(self.slice().iter(), other.slice().iter(), |reader| {
+                result.items[result.len] = *reader;
+                result.len += 1;
+            });
+            result
+        }
+        fn allows(&self, recipients: &Self) -> bool {
+            sorted_subset(self.slice().iter(), recipients.slice().iter())
+        }
     }
 
+    // Arbitrary u8 keys exercise comparisons beyond the fixed three-principal
+    // universe. Canonical sorted inputs are the kernel's explicit precondition.
     #[kani::proof]
-    #[kani::unwind(16)]
-    fn intersection_never_widens() {
-        let left = arbitrary_readers();
-        let right = arbitrary_readers();
-        let output = intersect(&left, &right);
-        assert!(output.is_subset(&left));
-        assert!(output.is_subset(&right));
-    }
-
-    #[kani::proof]
-    #[kani::unwind(16)]
-    fn composition_is_associative() {
-        let a = arbitrary_readers();
-        let b = arbitrary_readers();
-        let c = arbitrary_readers();
+    #[kani::unwind(8)]
+    fn arbitrary_keys_match_set_specification() {
+        let a: [u8; 3] = kani::any();
+        let b: [u8; 3] = kani::any();
+        let alen: usize = kani::any();
+        let blen: usize = kani::any();
+        kani::assume(alen <= 3 && blen <= 3);
+        let a = &a[..alen];
+        let b = &b[..blen];
+        kani::assume(a.windows(2).all(|pair| pair[0] < pair[1]));
+        kani::assume(b.windows(2).all(|pair| pair[0] < pair[1]));
+        let mut output = [0u8; 3];
+        let mut len = 0;
+        visit_intersection(a.iter(), b.iter(), |item| {
+            output[len] = *item;
+            len += 1;
+        });
+        let output = &output[..len];
+        assert!(output.iter().all(|p| a.contains(p) && b.contains(p)));
+        assert!(
+            a.iter()
+                .filter(|p| b.contains(p))
+                .all(|p| output.contains(p))
+        );
+        assert!(output.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(
-            intersect(&intersect(&a, &b), &c),
-            intersect(&a, &intersect(&b, &c))
+            sorted_subset(a.iter(), b.iter()),
+            b.iter().all(|p| a.contains(p))
         );
     }
 
     #[kani::proof]
-    #[kani::unwind(16)]
-    fn duplicate_or_reordered_inputs_preserve_readers() {
-        let a = arbitrary_readers();
-        let b = arbitrary_readers();
-        assert_eq!(intersect(&a, &a), a);
-        assert_eq!(intersect(&a, &b), intersect(&b, &a));
+    #[kani::unwind(5)]
+    fn intersection_kernel_matches_membership() {
+        let a = Readers::arbitrary();
+        let b = Readers::arbitrary();
+        let output = a.intersect(&b);
+        for principal in 0..3 {
+            assert_eq!(
+                output.slice().contains(&principal),
+                a.slice().contains(&principal) && b.slice().contains(&principal)
+            );
+        }
+        assert!(output.slice().windows(2).all(|pair| pair[0] < pair[1]));
     }
 
     #[kani::proof]
-    #[kani::unwind(16)]
-    fn recipient_must_be_permitted_by_every_input() {
-        let a = arbitrary_readers();
-        let b = arbitrary_readers();
-        let destination = arbitrary_readers();
+    #[kani::unwind(5)]
+    fn subset_kernel_matches_membership() {
+        let readers = Readers::arbitrary();
+        let recipients = Readers::arbitrary();
         assert_eq!(
-            can_flow(&intersect(&a, &b), &destination),
-            can_flow(&a, &destination) && can_flow(&b, &destination)
+            readers.allows(&recipients),
+            recipients
+                .slice()
+                .iter()
+                .all(|p| readers.slice().contains(p))
+        );
+    }
+
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn composition_is_associative() {
+        let a = Readers::arbitrary();
+        let b = Readers::arbitrary();
+        let c = Readers::arbitrary();
+        assert_eq!(
+            a.intersect(&b).intersect(&c).slice(),
+            a.intersect(&b.intersect(&c)).slice()
+        );
+    }
+
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn duplicate_or_reordered_inputs_preserve_readers() {
+        let a = Readers::arbitrary();
+        let b = Readers::arbitrary();
+        assert_eq!(a.intersect(&a).slice(), a.slice());
+        assert_eq!(a.intersect(&b).slice(), b.intersect(&a).slice());
+    }
+
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn recipient_must_be_permitted_by_every_input() {
+        let a = Readers::arbitrary();
+        let b = Readers::arbitrary();
+        let destination = Readers::arbitrary();
+        assert_eq!(
+            a.intersect(&b).allows(&destination),
+            a.allows(&destination) && b.allows(&destination)
         );
     }
 }

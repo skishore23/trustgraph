@@ -134,7 +134,7 @@ These are distinct layers:
 - **Finite state exploration:** explores a declared authorization abstraction and
   calls the production verifier; the deliberately broken rule supplies a useful
   counterexample control.
-- **Kani harnesses:** bounded proofs of selected production permission functions,
+- **Kani harnesses:** bounded checks of production sorted-iterator permission kernels,
   not a proof of the entire gateway, external integrations or input capture.
 
 See [verification scope and reproduction](docs/verification.md) for exact proof
