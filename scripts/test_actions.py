@@ -4,8 +4,9 @@ import tempfile
 import unittest
 from unittest.mock import patch
 from trustgraph_actions import endpoint
-from check_composio_github import private_key
-from composio_connect import Connect, ISSUE_TOOL, preflight, schema_hash
+import io
+from check_composio_github import ensure_new_output, private_key, write_config
+from composio_connect import Connect, ISSUE_TOOL, preflight, read_sse_result, schema_hash
 
 
 class ActionClientBoundaryTests(unittest.TestCase):
@@ -55,6 +56,29 @@ class ActionClientBoundaryTests(unittest.TestCase):
             os.symlink(path, link)
             with self.assertRaises(ValueError):
                 private_key(link)
+
+    def test_sse_reader_accepts_final_event_without_trailing_blank_line(self):
+        body = b'event: message\ndata: {"jsonrpc":"2.0","id":7,"result":{"ok":true}}'
+        self.assertEqual(read_sse_result(io.BytesIO(body), 7)["result"], {"ok": True})
+        body = (b'data: {"jsonrpc":"2.0","method":"notifications/progress"}\n\n'
+                b'data: {"jsonrpc":"2.0",\ndata: "id":3,"result":{}}\r\n\r\n')
+        self.assertEqual(read_sse_result(io.BytesIO(body), 3)["id"], 3)
+        with self.assertRaises(ValueError):
+            read_sse_result(io.BytesIO(b'data: {"jsonrpc":"2.0","id":1,"result":{}}\n\n'), 2)
+        with self.assertRaises(ValueError):
+            read_sse_result(io.BytesIO(b"data: " + b"x" * 64 + b"\n"), 1, limit=32)
+
+    def test_rerunning_preflight_explains_existing_config_instead_of_raw_exists_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "live.json"
+            ensure_new_output(path)
+            write_config(path, {"mode": "live"})
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            for attempt in (lambda: ensure_new_output(path), lambda: write_config(path, {})):
+                with self.assertRaises(ValueError) as raised:
+                    attempt()
+                self.assertIn("already exists", str(raised.exception))
+                self.assertIn("--output", str(raised.exception))
 
 
 if __name__ == "__main__":

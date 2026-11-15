@@ -12,6 +12,36 @@ def schema_hash(schema):
     return hashlib.sha256(json.dumps(schema, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
 
 
+def read_sse_result(stream, identifier, limit=LIMIT):
+    """Return the JSON-RPC message with ``identifier`` from a bounded SSE body.
+
+    An event ends at a blank line or at end of stream, so a final event without
+    a trailing blank line is still read."""
+    consumed, event = 0, []
+
+    def finish():
+        item = json.loads("\n".join(event))
+        return item if isinstance(item, dict) and item.get("id") == identifier else None
+
+    while True:
+        line = stream.readline(limit + 1 - consumed)
+        consumed += len(line)
+        if consumed > limit:
+            raise ValueError("MCP response too large")
+        if not line:
+            if event and (result := finish()) is not None:
+                return result
+            raise ValueError("No bounded MCP response")
+        if not line.strip():
+            if event:
+                result = finish()
+                event = []
+                if result is not None:
+                    return result
+        elif line.startswith(b"data:"):
+            event.append(line[5:].decode().removeprefix(" ").rstrip("\r\n"))
+
+
 class Connect:
     def __init__(self, key):
         self.opener = urllib.request.build_opener(NoRedirect)
@@ -39,22 +69,7 @@ class Connect:
             if session:
                 self.headers["Mcp-Session-Id"] = session
             if "text/event-stream" in response.headers.get("Content-Type", ""):
-                consumed, event, result = 0, [], None
-                while consumed <= LIMIT:
-                    line = response.readline(LIMIT + 1 - consumed)
-                    consumed += len(line)
-                    if not line or consumed > LIMIT:
-                        break
-                    if not line.strip() and event:
-                        item = json.loads("\n".join(event))
-                        event = []
-                        if item.get("id") == identifier:
-                            result = item
-                            break
-                    elif line.startswith(b"data:"):
-                        event.append(line[5:].decode().removeprefix(" ").rstrip("\r\n"))
-                if result is None:
-                    raise ValueError("No bounded MCP response")
+                result = read_sse_result(response, identifier)
             else:
                 raw = response.read(LIMIT + 1)
                 if len(raw) > LIMIT:

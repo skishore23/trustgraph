@@ -33,6 +33,7 @@ def main():
         raise ValueError("Invalid connected account ID")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repository):
         raise ValueError("Use an explicit owner/repository")
+    ensure_new_output(args.output)
     key = os.environ.get("COMPOSIO_API_KEY") or private_key(args.directory / "composio-key")
     if not key or len(key) > 512 or any(not 33 <= ord(c) <= 126 for c in key):
         raise ValueError("Invalid Composio key")
@@ -75,8 +76,22 @@ def main():
     print("No issue was created. Start the gateway with --config pointing at this file when ready.")
 
 
+def existing_output_message(path):
+    return (f"{path} already exists, so it was not overwritten. Start the gateway with "
+            f"--config {path}, or remove it (or pass --output with a new path) to re-run the preflight.")
+
+
+def ensure_new_output(path):
+    """Fail before any network call when a previous run already wrote the config."""
+    if os.path.lexists(path):
+        raise ValueError(existing_output_message(path))
+
+
 def write_config(path, config):
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        raise ValueError(existing_output_message(path)) from None
     with os.fdopen(fd, "w") as output:
         json.dump(config, output, indent=2)
         output.write("\n")
