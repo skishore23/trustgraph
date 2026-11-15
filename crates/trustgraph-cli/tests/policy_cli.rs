@@ -244,3 +244,130 @@ fn non_utf8_exits_2() {
     assert_eq!(code(&o), 2);
     assert_eq!(json(&o)["error"]["code"], "io");
 }
+
+#[cfg(unix)]
+mod unix {
+    use super::*;
+    use std::os::unix::ffi::OsStrExt;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    fn files(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn fifo_exits_2_without_hanging() {
+        let d = tempfile::tempdir().unwrap();
+        let fifo = d.path().join("p.fifo");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        for cmd in ["check", "test", "explain"] {
+            let mut child = Command::new(env!("CARGO_BIN_EXE_trustgraph"))
+                .current_dir(d.path())
+                .args(["policy", cmd, "p.fifo", "--json"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let start = Instant::now();
+            let status = loop {
+                if let Some(s) = child.try_wait().unwrap() {
+                    break s;
+                }
+                if start.elapsed() > Duration::from_secs(5) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("{cmd} hung on a FIFO");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert_eq!(status.code(), Some(2), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn force_replaces_symlink_and_leaves_its_target() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("victim.txt"), "keep").unwrap();
+        std::os::unix::fs::symlink("victim.txt", d.path().join("p.yaml")).unwrap();
+        assert_eq!(code(&tg(d.path(), &["init", "--path", "p.yaml"])), 2);
+        assert_eq!(
+            code(&tg(d.path(), &["init", "--path", "p.yaml", "--force"])),
+            0
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("victim.txt")).unwrap(),
+            "keep"
+        );
+        let meta = std::fs::symlink_metadata(d.path().join("p.yaml")).unwrap();
+        assert!(meta.is_file());
+        assert_eq!(files(d.path()), ["p.yaml", "victim.txt"]);
+    }
+
+    #[test]
+    fn plain_init_refuses_dangling_symlink() {
+        let d = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("missing.txt", d.path().join("p.yaml")).unwrap();
+        let o = tg(d.path(), &["init", "--path", "p.yaml", "--json"]);
+        assert_eq!(code(&o), 2);
+        assert_eq!(json(&o)["error"]["code"], "exists");
+        assert!(!d.path().join("missing.txt").exists());
+        assert_eq!(files(d.path()), ["p.yaml"]);
+    }
+
+    #[test]
+    fn failed_init_leaves_no_temp_file() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(d.path().join("target")).unwrap();
+        let o = tg(d.path(), &["init", "--path", "target", "--force"]);
+        assert_eq!(code(&o), 2);
+        assert_eq!(files(d.path()), ["target"]);
+        let o = tg(d.path(), &["init", "--path", "nodir/p.yaml"]);
+        assert_eq!(code(&o), 2);
+        assert_eq!(files(d.path()), ["target"]);
+    }
+
+    #[test]
+    fn closed_stdout_exits_2_not_panic() {
+        let d = tempfile::tempdir().unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_trustgraph"))
+            .current_dir(d.path())
+            .args(["policy", "schema"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        drop(child.stdout.take());
+        let status = child.wait().unwrap();
+        assert_eq!(status.code(), Some(2));
+    }
+
+    #[test]
+    fn init_json_with_non_utf8_path_does_not_panic() {
+        let d = tempfile::tempdir().unwrap();
+        let name = std::ffi::OsStr::from_bytes(b"p\xff.yaml");
+        let o = Command::new(env!("CARGO_BIN_EXE_trustgraph"))
+            .current_dir(d.path())
+            .args(["policy", "init", "--json", "--path"])
+            .arg(name)
+            .output()
+            .unwrap();
+        // Some filesystems (APFS) refuse non-UTF-8 names; either way no panic.
+        match code(&o) {
+            0 => assert_eq!(json(&o)["ok"], true),
+            2 => assert_eq!(json(&o)["error"]["code"], "io"),
+            other => panic!("exit {other}: {}", String::from_utf8_lossy(&o.stderr)),
+        }
+    }
+}

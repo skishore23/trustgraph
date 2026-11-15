@@ -5,6 +5,7 @@
 //! command could not run (I/O failure, file exists). With `--json` stdout
 //! carries exactly one JSON document and nothing else.
 
+use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -60,66 +61,130 @@ pub enum PolicyCommand {
     },
 }
 
+macro_rules! out {
+    ($o:expr, $($a:tt)*) => {{ let _ = write!($o, $($a)*); }};
+}
+macro_rules! outln {
+    ($o:expr) => {{ $o.push('\n'); }};
+    ($o:expr, $($a:tt)*) => {{ let _ = writeln!($o, $($a)*); }};
+}
+
 /// Run a policy command and return the process exit code.
 pub fn run(command: PolicyCommand) -> i32 {
-    let code = match command {
-        PolicyCommand::Init { path, force, json } => init(&path, force, json),
+    let mut out = String::new();
+    let code = dispatch(&mut out, command);
+    match emit(&mut std::io::stdout().lock(), &out) {
+        Ok(()) => code,
+        Err(_) => 2,
+    }
+}
+
+/// The single place command output reaches stdout; a closed pipe is an
+/// error value, never a panic.
+fn emit(writer: &mut impl Write, text: &str) -> std::io::Result<()> {
+    writer.write_all(text.as_bytes())?;
+    writer.flush()
+}
+
+fn dispatch(out: &mut String, command: PolicyCommand) -> i32 {
+    match command {
+        PolicyCommand::Init { path, force, json } => init(out, &path, force, json),
         PolicyCommand::Schema { .. } => {
-            println!("{}", pretty(&schema()));
+            outln!(out, "{}", pretty(&schema()));
             0
         }
-        PolicyCommand::Check { file, json } => check(&file, json),
-        PolicyCommand::Test { file, json } => test(&file, json),
-        PolicyCommand::Explain { file, json } => explain_cmd(&file, json),
-        PolicyCommand::Diff { old, new, json } => diff_cmd(&old, &new, json),
-    };
-    let _ = std::io::stdout().flush();
-    code
+        PolicyCommand::Check { file, json } => check(out, &file, json),
+        PolicyCommand::Test { file, json } => test(out, &file, json),
+        PolicyCommand::Explain { file, json } => explain_cmd(out, &file, json),
+        PolicyCommand::Diff { old, new, json } => diff_cmd(out, &old, &new, json),
+    }
 }
 
 fn pretty(value: &Value) -> String {
     serde_json::to_string_pretty(value).expect("JSON value serializes")
 }
 
-fn fail(json: bool, code: &str, message: String) -> i32 {
+fn fail(out: &mut String, json: bool, code: &str, message: String) -> i32 {
     if json {
-        println!(
+        outln!(
+            out,
             "{}",
             pretty(&json!({"ok": false, "error": {"code": code, "message": message}}))
         );
     } else {
-        eprintln!("error: {message}");
+        let _ = writeln!(std::io::stderr(), "error: {message}");
     }
     2
 }
 
-fn init(path: &Path, force: bool, json: bool) -> i32 {
-    let mut options = OpenOptions::new();
-    options.write(true);
-    if force {
-        options.create(true).truncate(true);
-    } else {
-        options.create_new(true);
+/// Write `STARTER` to a fresh sibling temp file, then put it at `path`:
+/// `rename` (replacing whatever is there, including a symlink itself) with
+/// `force`, otherwise a hard link that fails if anything exists at `path`,
+/// dangling symlinks included. The temp file is always removed.
+fn write_starter(path: &Path, force: bool) -> std::io::Result<()> {
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("path has no file name"))?
+        .to_string_lossy();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let mut attempt = 0u32;
+    let (temp, mut file) = loop {
+        let temp = dir.join(format!(
+            ".{name}.{}.{nanos}.{attempt}.tmp",
+            std::process::id()
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&temp) {
+            Ok(f) => break (temp, f),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 100 => {
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    let result = file
+        .write_all(STARTER.as_bytes())
+        .and_then(|()| file.sync_all())
+        .and_then(|()| {
+            if force {
+                std::fs::rename(&temp, path)
+            } else {
+                std::fs::hard_link(&temp, path)
+            }
+        });
+    if !force || result.is_err() {
+        let _ = std::fs::remove_file(&temp);
     }
+    result
+}
+
+fn init(out: &mut String, path: &Path, force: bool, json: bool) -> i32 {
     let shown = path.display();
-    let result = options
-        .open(path)
-        .and_then(|mut f| f.write_all(STARTER.as_bytes()));
-    match result {
+    match write_starter(path, force) {
         Ok(()) => {
             if json {
-                println!("{}", pretty(&json!({"ok": true, "path": path})));
+                outln!(
+                    out,
+                    "{}",
+                    pretty(&json!({"ok": true, "path": path.to_string_lossy()}))
+                );
             } else {
-                println!("Wrote {shown}");
+                outln!(out, "Wrote {shown}");
             }
             0
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => fail(
+            out,
             json,
             "exists",
             format!("{shown} already exists; pass --force to overwrite"),
         ),
-        Err(e) => fail(json, "io", format!("cannot write {shown}: {e}")),
+        Err(e) => fail(out, json, "io", format!("cannot write {shown}: {e}")),
     }
 }
 
@@ -145,7 +210,13 @@ fn has_errors(diagnostics: &[Diagnostic]) -> bool {
 /// is an I/O error message.
 fn load(file: &Path) -> Result<Loaded, String> {
     let io = |e: &dyn std::fmt::Display| format!("cannot read {}: {e}", file.display());
+    // Check before opening: opening a FIFO would block until a writer shows up.
+    let before = std::fs::metadata(file).map_err(|e| io(&e))?;
+    if !before.is_file() {
+        return Err(io(&"not a regular file"));
+    }
     let handle = std::fs::File::open(file).map_err(|e| io(&e))?;
+    // Guard against the path being swapped between the two calls.
     let meta = handle.metadata().map_err(|e| io(&e))?;
     if !meta.is_file() {
         return Err(io(&"not a regular file"));
@@ -188,18 +259,18 @@ fn plural(n: usize, word: &str) -> String {
     }
 }
 
-fn print_diagnostics(diagnostics: &[Diagnostic]) {
+fn print_diagnostics(out: &mut String, diagnostics: &[Diagnostic]) {
     for d in diagnostics {
         let severity = match d.severity {
             Severity::Error => "error",
             Severity::Warning => "warning",
         };
         let path = if d.path.is_empty() { "(root)" } else { &d.path };
-        print!("{severity} {path} {}: {}", d.code, d.message);
+        out!(out, "{severity} {path} {}: {}", d.code, d.message);
         if let Some(s) = &d.suggestion {
-            print!(" ({s})");
+            out!(out, " ({s})");
         }
-        println!();
+        outln!(out);
     }
 }
 
@@ -217,26 +288,33 @@ fn summary(diagnostics: &[Diagnostic]) -> String {
     )
 }
 
-fn check(file: &Path, json: bool) -> i32 {
+fn check(out: &mut String, file: &Path, json: bool) -> i32 {
     let loaded = match load(file) {
         Ok(l) => l,
-        Err(m) => return fail(json, "io", m),
+        Err(m) => return fail(out, json, "io", m),
     };
     let ok = !loaded.has_errors();
     if json {
-        println!(
+        outln!(
+            out,
             "{}",
             pretty(&json!({"ok": ok, "diagnostics": loaded.diagnostics}))
         );
     } else {
-        print_diagnostics(&loaded.diagnostics);
-        println!("{}", summary(&loaded.diagnostics));
+        print_diagnostics(out, &loaded.diagnostics);
+        outln!(out, "{}", summary(&loaded.diagnostics));
     }
     i32::from(!ok)
 }
 
 /// Print the diagnostics of a file that failed to load cleanly.
-fn report_invalid(loaded: &Loaded, json: bool, extra: Option<(&str, Value)>, results: bool) -> i32 {
+fn report_invalid(
+    out: &mut String,
+    loaded: &Loaded,
+    json: bool,
+    extra: Option<(&str, Value)>,
+    results: bool,
+) -> i32 {
     if json {
         let mut doc = json!({"ok": false, "diagnostics": loaded.diagnostics});
         if results {
@@ -245,30 +323,31 @@ fn report_invalid(loaded: &Loaded, json: bool, extra: Option<(&str, Value)>, res
         if let Some((k, v)) = extra {
             doc[k] = v;
         }
-        println!("{}", pretty(&doc));
+        outln!(out, "{}", pretty(&doc));
     } else {
         if let Some((_, Value::String(name))) = &extra {
-            println!("{name}:");
+            outln!(out, "{name}:");
         }
-        print_diagnostics(&loaded.diagnostics);
-        println!("{}", summary(&loaded.diagnostics));
+        print_diagnostics(out, &loaded.diagnostics);
+        outln!(out, "{}", summary(&loaded.diagnostics));
     }
     1
 }
 
-fn test(file: &Path, json: bool) -> i32 {
+fn test(out: &mut String, file: &Path, json: bool) -> i32 {
     let loaded = match load(file) {
         Ok(l) => l,
-        Err(m) => return fail(json, "io", m),
+        Err(m) => return fail(out, json, "io", m),
     };
     let policy = match &loaded.policy {
         Some(p) if !loaded.has_errors() => p,
-        _ => return report_invalid(&loaded, json, None, true),
+        _ => return report_invalid(out, &loaded, json, None, true),
     };
     let results = run_tests(policy);
     let failed = results.iter().filter(|r| !r.pass).count();
     if json {
-        println!(
+        outln!(
+            out,
             "{}",
             pretty(&json!({
                 "ok": failed == 0,
@@ -279,9 +358,10 @@ fn test(file: &Path, json: bool) -> i32 {
     } else {
         for r in &results {
             if r.pass {
-                println!("PASS {}", r.name);
+                outln!(out, "PASS {}", r.name);
             } else {
-                println!(
+                outln!(
+                    out,
                     "FAIL {}: expected {}, got {} \u{2014} {}",
                     r.name,
                     r.expect.as_str(),
@@ -290,47 +370,48 @@ fn test(file: &Path, json: bool) -> i32 {
                 );
             }
         }
-        println!("{} passed, {} failed", results.len() - failed, failed);
+        outln!(out, "{} passed, {} failed", results.len() - failed, failed);
     }
     i32::from(failed > 0)
 }
 
-fn explain_cmd(file: &Path, json: bool) -> i32 {
+fn explain_cmd(out: &mut String, file: &Path, json: bool) -> i32 {
     let loaded = match load(file) {
         Ok(l) => l,
-        Err(m) => return fail(json, "io", m),
+        Err(m) => return fail(out, json, "io", m),
     };
     let policy = match &loaded.policy {
         Some(p) if !loaded.has_errors() => p,
-        _ => return report_invalid(&loaded, json, None, false),
+        _ => return report_invalid(out, &loaded, json, None, false),
     };
     let text = explain(policy);
     if json {
-        println!("{}", pretty(&json!({"ok": true, "text": text})));
+        outln!(out, "{}", pretty(&json!({"ok": true, "text": text})));
     } else {
-        print!("{text}");
+        out!(out, "{text}");
     }
     0
 }
 
-fn diff_cmd(old: &Path, new: &Path, json: bool) -> i32 {
+fn diff_cmd(out: &mut String, old: &Path, new: &Path, json: bool) -> i32 {
     let mut policies = Vec::new();
     for file in [old, new] {
         let loaded = match load(file) {
             Ok(l) => l,
-            Err(m) => return fail(json, "io", m),
+            Err(m) => return fail(out, json, "io", m),
         };
         match loaded.policy {
             Some(ref p) if !loaded.has_errors() => policies.push(p.clone()),
             _ => {
                 let name = file.display().to_string();
-                return report_invalid(&loaded, json, Some(("file", json!(name))), false);
+                return report_invalid(out, &loaded, json, Some(("file", json!(name))), false);
             }
         }
     }
     let result = diff(&policies[0], &policies[1]);
     if json {
-        println!(
+        outln!(
+            out,
             "{}",
             pretty(&json!({
                 "ok": true,
@@ -339,7 +420,7 @@ fn diff_cmd(old: &Path, new: &Path, json: bool) -> i32 {
             }))
         );
     } else if result.is_empty() {
-        println!("No changes.");
+        outln!(out, "No changes.");
     } else {
         for c in &result.changes {
             let tag = match c.kind {
@@ -347,7 +428,7 @@ fn diff_cmd(old: &Path, new: &Path, json: bool) -> i32 {
                 ChangeKind::Narrows => "narrows",
                 ChangeKind::Neutral => "neutral",
             };
-            println!("{tag} {}: {}", c.subject, c.summary);
+            outln!(out, "{tag} {}: {}", c.subject, c.summary);
         }
     }
     0
