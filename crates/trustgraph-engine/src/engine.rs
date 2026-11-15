@@ -1,0 +1,829 @@
+//! The state machine. Every handler validates before it mutates, so a
+//! `Rejected` reply leaves the state as it was (apart from the clock).
+//!
+//! Two deciders must agree before anything is allowed: the pure
+//! `trustgraph_policy::decide` and the framework `Graph`, which tracks lineage
+//! and approvals. `decide` alone may deny; neither alone may allow.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde::Serialize;
+use trustgraph_core::decision::{Gate, approval_live};
+use trustgraph_core::digest;
+use trustgraph_framework::{
+    ActionIntent, ActionRule, Approval, ApprovalRequirement, ArtifactId, Decision, Error, Graph,
+    OperationDefinition, OutputValue, PrincipalId, Readers, SchemaId,
+};
+use trustgraph_policy::{
+    MAX_BYTES, Outcome, Policy, Query, Severity, Verdict, decide, diff, explain, lint, parse,
+    run_tests,
+};
+
+use crate::event::{Event, Fault, Reply};
+
+/// Longest accepted name or id, in bytes.
+const MAX_FIELD: usize = 256;
+const MAX_INPUTS: usize = 64;
+const MAX_RECIPIENTS: usize = 256;
+const MAX_PROPOSALS: usize = 64;
+/// Longest echo of caller input inside a `Rejected` message, in characters.
+const MAX_ECHO: usize = 64;
+/// The engine never sees content, so every port carries the same nominal type.
+const SCHEMA: &str = "any";
+const OUTPUT_PORT: &str = "out";
+const RECEIPT: &str = "trustgraph-engine";
+
+/// A `NeedsApproval` decision, kept so it can be approved or revoked.
+#[derive(Debug, Clone, Serialize)]
+struct Remembered {
+    agent: String,
+    artifact: String,
+    action: String,
+    recipients: Option<BTreeSet<String>>,
+    intent: ActionIntent,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct Granted {
+    reviewer: String,
+    issued_at: u64,
+    valid_for: u64,
+    expires_at: u64,
+    voided: bool,
+    approval: Approval,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct Activation {
+    revision: u64,
+    digest: String,
+    /// `None` for `Genesis`.
+    operator: Option<String>,
+    at: u64,
+}
+
+/// Key of a recorded output: `(agent, step, inputs, sha256)`.
+type OutputKey = (String, String, Vec<String>, String);
+
+/// The deterministic runtime core. See the crate docs.
+#[derive(Debug, Default)]
+pub struct Engine {
+    fault: Fault,
+    graph: Graph,
+    policy: Option<Policy>,
+    revision: u64,
+    last_at: u64,
+    activation: Option<Activation>,
+    /// Source artifact id -> source name.
+    sources: BTreeMap<String, String>,
+    /// `(source name, sha256)` -> artifact id.
+    source_ids: BTreeMap<(String, String), String>,
+    outputs: BTreeMap<OutputKey, String>,
+    /// Every action name ever given a Graph rule.
+    rule_names: BTreeSet<String>,
+    decisions: BTreeMap<String, Remembered>,
+    approvals: BTreeMap<String, Granted>,
+    /// Oldest first.
+    proposals: Vec<(String, Policy)>,
+}
+
+type Handled = Result<Reply, Reply>;
+
+fn reject(code: &str, message: impl Into<String>) -> Reply {
+    Reply::Rejected {
+        code: code.into(),
+        message: message.into(),
+    }
+}
+
+/// Caller input, cut to a bounded length for echoing.
+fn clip(value: &str) -> String {
+    let mut out: String = value.chars().take(MAX_ECHO).collect();
+    if out.len() < value.len() {
+        out.push('…');
+    }
+    out
+}
+
+fn field(name: &str, value: &str) -> Result<(), Reply> {
+    if value.trim().is_empty() || value.len() > MAX_FIELD {
+        return Err(reject(
+            "invalid_field",
+            format!("`{name}` must be 1 to {MAX_FIELD} bytes and not blank"),
+        ));
+    }
+    Ok(())
+}
+
+fn sha256(value: &str) -> Result<(), Reply> {
+    if digest::Digest(value.to_string()).is_canonical() {
+        Ok(())
+    } else {
+        Err(reject(
+            "invalid_digest",
+            format!("`{}` is not 64 lowercase hex characters", clip(value)),
+        ))
+    }
+}
+
+fn graph_error(error: Error) -> Reply {
+    let code = match error {
+        Error::Lineage(_) => "lineage_limit",
+        _ => "engine_mismatch",
+    };
+    reject(code, clip(&error.to_string()))
+}
+
+fn principals(names: impl IntoIterator<Item = String>) -> Readers {
+    names.into_iter().map(PrincipalId).collect()
+}
+
+/// A source's Graph reader set: its people plus the agents that may use it.
+/// A source missing from the policy has no readers.
+fn graph_readers(policy: &Policy, name: &str) -> Readers {
+    match policy.sources.get(name) {
+        Some(source) => principals(
+            policy
+                .people(&source.readers)
+                .into_iter()
+                .chain(source.agents.iter().cloned()),
+        ),
+        None => Readers::new(),
+    }
+}
+
+/// An action's Graph rule. A missing action gets a rule nobody can satisfy.
+fn action_rule(policy: &Policy, name: &str) -> ActionRule {
+    match policy.actions.get(name) {
+        Some(action) => ActionRule {
+            actors: principals(action.agents.iter().cloned()),
+            approval: action.approval.as_ref().map(|rule| ApprovalRequirement {
+                reviewers: principals(policy.people(&rule.reviewers)),
+                ttl_seconds: rule.valid_for_seconds,
+            }),
+        },
+        None => closed_rule(),
+    }
+}
+
+fn closed_rule() -> ActionRule {
+    ActionRule {
+        actors: Readers::new(),
+        approval: None,
+    }
+}
+
+/// Parse, lint and test a policy text; any failure is `invalid_policy`.
+fn validate_policy(text: &str) -> Result<Policy, Reply> {
+    if text.len() > MAX_BYTES {
+        return Err(reject(
+            "invalid_policy",
+            format!("policy is {} bytes; the limit is {MAX_BYTES}", text.len()),
+        ));
+    }
+    let parsed = parse(text);
+    let Some(policy) = parsed.policy else {
+        let first = parsed
+            .diagnostics
+            .iter()
+            .find(|d| d.severity == Severity::Error);
+        let message = first.map_or("the policy does not parse".to_string(), |d| {
+            format!("{} at `{}`: {}", d.code, clip(&d.path), clip(&d.message))
+        });
+        return Err(reject("invalid_policy", message));
+    };
+    if let Some(d) = lint(&policy)
+        .into_iter()
+        .find(|d| d.severity == Severity::Error)
+    {
+        return Err(reject(
+            "invalid_policy",
+            format!("{} at `{}`: {}", d.code, clip(&d.path), clip(&d.message)),
+        ));
+    }
+    if let Some(t) = run_tests(&policy).into_iter().find(|t| !t.pass) {
+        return Err(reject(
+            "invalid_policy",
+            format!(
+                "test `{}` expects {} but the policy says {}",
+                clip(&t.name),
+                t.expect.as_str(),
+                t.outcome.verdict.as_str()
+            ),
+        ));
+    }
+    Ok(policy)
+}
+
+fn decision_reply(id: String, outcome: Outcome) -> Reply {
+    Reply::Decision {
+        id,
+        verdict: outcome.verdict,
+        code: outcome.code.to_string(),
+        reason: outcome.reason,
+        blocking: outcome.blocking,
+        expires_at: None,
+    }
+}
+
+impl Engine {
+    /// An engine with no policy. Until `Genesis`, every other event is
+    /// `Rejected { code: "no_policy" }`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Apply one event at time `at` (seconds). Never panics.
+    pub fn apply(&mut self, at: u64, event: &Event) -> Reply {
+        if at < self.last_at {
+            return reject(
+                "clock_regressed",
+                format!("time {at} is before the previous event at {}", self.last_at),
+            );
+        }
+        self.last_at = at;
+        if self.policy.is_none() && !matches!(event, Event::Genesis { .. }) {
+            return reject("no_policy", "no policy is active; send Genesis first");
+        }
+        let handled = match event {
+            Event::Genesis { policy } => {
+                validate_policy(policy).and_then(|policy| self.activate(policy, None, at))
+            }
+            Event::RegisterSource { source, sha256 } => self.register_source(source, sha256),
+            Event::RecordOutput {
+                agent,
+                step,
+                inputs,
+                sha256,
+            } => self.record_output(agent, step, inputs, sha256),
+            Event::Check {
+                agent,
+                artifact,
+                action,
+                recipients,
+            } => self.check(at, agent, artifact, action, recipients.as_ref()),
+            Event::Approve { decision, reviewer } => self.approve(at, decision, reviewer),
+            Event::Revoke { decision, reviewer } => self.revoke(decision, reviewer),
+            Event::ProposePolicy { agent, policy } => self.propose(agent.as_deref(), policy),
+            Event::ActivatePolicy { proposal, operator } => {
+                self.activate_proposal(at, proposal, operator)
+            }
+        };
+        handled.unwrap_or_else(|rejected| rejected)
+    }
+
+    pub fn policy(&self) -> Option<&Policy> {
+        self.policy.as_ref()
+    }
+
+    /// 0 before `Genesis`; incremented by every activation.
+    pub fn policy_revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// SHA-256 over everything that affects future replies: the policy digest,
+    /// revision, clock, artifacts, lineage, source permissions, action rules,
+    /// remembered decisions, approvals with expiry, and proposals.
+    pub fn state_digest(&self) -> String {
+        #[derive(Serialize)]
+        struct State<'a> {
+            policy: Option<String>,
+            revision: u64,
+            last_at: u64,
+            activation: &'a Option<Activation>,
+            artifacts: &'a BTreeMap<ArtifactId, trustgraph_framework::Artifact>,
+            executions:
+                &'a BTreeMap<trustgraph_framework::ExecutionId, trustgraph_framework::Execution>,
+            permissions: BTreeMap<&'a String, Option<trustgraph_framework::SourcePermission>>,
+            sources: Vec<(&'a String, &'a String, &'a String)>,
+            outputs: Vec<(&'a OutputKey, &'a String)>,
+            rules: &'a BTreeSet<String>,
+            decisions: &'a BTreeMap<String, Remembered>,
+            approvals: &'a BTreeMap<String, Granted>,
+            proposals: Vec<&'a String>,
+        }
+        let permissions = self
+            .sources
+            .keys()
+            .map(|id| {
+                let id_ref = ArtifactId(id.clone());
+                let permission = self
+                    .graph
+                    .sources(&id_ref)
+                    .ok()
+                    .and_then(|mut m| m.remove(&id_ref));
+                (id, permission)
+            })
+            .collect();
+        let state = State {
+            policy: self.policy.as_ref().map(Policy::digest),
+            revision: self.revision,
+            last_at: self.last_at,
+            activation: &self.activation,
+            artifacts: self.graph.artifacts(),
+            executions: self.graph.executions(),
+            permissions,
+            sources: self
+                .source_ids
+                .iter()
+                .map(|((name, sha), id)| (name, sha, id))
+                .collect(),
+            outputs: self.outputs.iter().collect(),
+            rules: &self.rule_names,
+            decisions: &self.decisions,
+            approvals: &self.approvals,
+            proposals: self.proposals.iter().map(|(id, _)| id).collect(),
+        };
+        digest::structured("engine-state-v1", &state).0
+    }
+
+    /// Source names an artifact derives from, or `None` for an unknown id.
+    /// Names stay even after the active policy drops the source.
+    pub fn lineage(&self, artifact: &str) -> Option<BTreeSet<String>> {
+        let sources = self.graph.sources(&ArtifactId(artifact.to_string())).ok()?;
+        let artifacts = self.graph.artifacts();
+        sources
+            .keys()
+            .map(|id| artifacts.get(id).map(|a| a.logical_id.clone()))
+            .collect()
+    }
+
+    #[doc(hidden)]
+    pub fn with_fault(mut self, fault: Fault) -> Self {
+        self.fault = fault;
+        self
+    }
+
+    fn active(&self) -> Result<&Policy, Reply> {
+        self.policy
+            .as_ref()
+            .ok_or_else(|| reject("no_policy", "no policy is active; send Genesis first"))
+    }
+
+    fn activate(&mut self, policy: Policy, operator: Option<String>, at: u64) -> Handled {
+        let revision = self
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| reject("revision_exhausted", "the policy revision cannot grow"))?;
+
+        if self.fault != Fault::SkipReaderRefresh {
+            for (id, name) in &self.sources {
+                // Fails only on an unknown id or revision overflow; `decide`
+                // still gates every allow on the new policy.
+                let _ = self.graph.update_source_permissions(
+                    &ArtifactId(id.clone()),
+                    graph_readers(&policy, name),
+                );
+            }
+        }
+
+        let names: BTreeSet<String> = self
+            .rule_names
+            .iter()
+            .chain(policy.actions.keys())
+            .cloned()
+            .collect();
+        for name in &names {
+            if self
+                .graph
+                .set_action_rule(name.clone(), action_rule(&policy, name))
+                .is_err()
+            {
+                let _ = self.graph.set_action_rule(name.clone(), closed_rule());
+            }
+        }
+        self.rule_names = names;
+
+        if self.fault != Fault::KeepApprovalsAcrossPolicyChange {
+            for granted in self.approvals.values() {
+                self.graph.revoke_approval(&granted.approval);
+            }
+            self.approvals.clear();
+            self.decisions.clear();
+        }
+
+        let digest = policy.digest();
+        self.policy = Some(policy);
+        self.revision = revision;
+        self.activation = Some(Activation {
+            revision,
+            digest: digest.clone(),
+            operator,
+            at,
+        });
+        Ok(Reply::Activated { revision, digest })
+    }
+
+    fn register_source(&mut self, source: &str, sha: &str) -> Handled {
+        field("source", source)?;
+        sha256(sha)?;
+        let policy = self.active()?;
+        if !policy.sources.contains_key(source) {
+            return Err(reject(
+                "unknown_source",
+                format!("`{}` is not a source in the active policy", clip(source)),
+            ));
+        }
+        let key = (source.to_string(), sha.to_string());
+        if let Some(id) = self.source_ids.get(&key) {
+            return Ok(Reply::Artifact { id: id.clone() });
+        }
+        let readers = graph_readers(policy, source);
+        let id = self
+            .graph
+            .register_source(
+                source,
+                SchemaId(SCHEMA.into()),
+                sha.as_bytes().to_vec(),
+                readers,
+            )
+            .map_err(graph_error)?
+            .0;
+        self.sources.insert(id.clone(), source.to_string());
+        self.source_ids.insert(key, id.clone());
+        Ok(Reply::Artifact { id })
+    }
+
+    fn record_output(&mut self, agent: &str, step: &str, inputs: &[String], sha: &str) -> Handled {
+        field("agent", agent)?;
+        field("step", step)?;
+        sha256(sha)?;
+        let policy = self.active()?;
+        if !policy.agents.contains(agent) {
+            return Err(reject(
+                "unknown_agent",
+                format!("`{}` is not an agent in the active policy", clip(agent)),
+            ));
+        }
+        if inputs.is_empty() || inputs.len() > MAX_INPUTS {
+            return Err(reject(
+                "invalid_inputs",
+                format!(
+                    "an output needs 1 to {MAX_INPUTS} inputs, not {}",
+                    inputs.len()
+                ),
+            ));
+        }
+        for input in inputs {
+            field("inputs", input)?;
+            if !self
+                .graph
+                .artifacts()
+                .contains_key(&ArtifactId(input.clone()))
+            {
+                return Err(reject(
+                    "unknown_artifact",
+                    format!("no artifact `{}`", clip(input)),
+                ));
+            }
+        }
+        for input in inputs {
+            let names = self.lineage(input).ok_or_else(|| {
+                reject(
+                    "unknown_artifact",
+                    format!("no lineage for `{}`", clip(input)),
+                )
+            })?;
+            if let Some(name) = names.iter().find(|n| {
+                !policy
+                    .sources
+                    .get(*n)
+                    .is_some_and(|s| s.agents.contains(agent))
+            }) {
+                return Err(reject(
+                    "agent_cannot_use_source",
+                    format!(
+                        "agent `{}` may not use source `{}`",
+                        clip(agent),
+                        clip(name)
+                    ),
+                ));
+            }
+        }
+
+        let key: OutputKey = (agent.into(), step.into(), inputs.to_vec(), sha.into());
+        if let Some(id) = self.outputs.get(&key) {
+            return Ok(Reply::Artifact { id: id.clone() });
+        }
+        let ports = (0..inputs.len())
+            .map(|i| (format!("in{i}"), SchemaId(SCHEMA.into())))
+            .collect();
+        let operation = self
+            .graph
+            .register_operation(OperationDefinition {
+                name: step.into(),
+                // One contract per (step, input count, agent), so contracts never collide.
+                version: format!("{}/{agent}", inputs.len()),
+                executor: PrincipalId(agent.into()),
+                inputs: ports,
+                outputs: BTreeMap::from([(OUTPUT_PORT.into(), SchemaId(SCHEMA.into()))]),
+            })
+            .map_err(graph_error)?;
+        let bound = inputs
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (format!("in{i}"), ArtifactId(id.clone())))
+            .collect();
+        let ticket = self
+            .graph
+            .begin_execution(
+                &operation,
+                bound,
+                PrincipalId(agent.into()),
+                serde_json::Value::Null,
+            )
+            .map_err(graph_error)?;
+        let values = BTreeMap::from([(
+            OUTPUT_PORT.to_string(),
+            OutputValue {
+                logical_id: step.into(),
+                bytes: sha.as_bytes().to_vec(),
+            },
+        )]);
+        let outputs = self
+            .graph
+            .finish_execution(ticket, values, RECEIPT)
+            .map_err(graph_error)?;
+        let id = outputs
+            .get(OUTPUT_PORT)
+            .ok_or_else(|| reject("engine_mismatch", "the graph returned no output"))?
+            .0
+            .clone();
+        self.outputs.insert(key, id.clone());
+        Ok(Reply::Artifact { id })
+    }
+
+    fn check(
+        &mut self,
+        at: u64,
+        agent: &str,
+        artifact: &str,
+        action: &str,
+        recipients: Option<&BTreeSet<String>>,
+    ) -> Handled {
+        field("agent", agent)?;
+        field("artifact", artifact)?;
+        field("action", action)?;
+        if let Some(names) = recipients {
+            if names.len() > MAX_RECIPIENTS {
+                return Err(reject(
+                    "invalid_field",
+                    format!("at most {MAX_RECIPIENTS} recipients"),
+                ));
+            }
+            for name in names {
+                field("recipients", name)?;
+            }
+        }
+        let output_from = self.lineage(artifact).ok_or_else(|| {
+            reject(
+                "unknown_artifact",
+                format!("no artifact `{}`", clip(artifact)),
+            )
+        })?;
+        let policy = self.active()?;
+        let outcome = decide(
+            policy,
+            &Query {
+                output_from,
+                agent: agent.into(),
+                action: action.into(),
+                recipients: recipients.cloned(),
+            },
+        );
+        let query_id =
+            || digest::structured("engine-query-v1", &(artifact, agent, action, recipients)).0;
+        if outcome.verdict == Verdict::Deny {
+            return Ok(decision_reply(query_id(), outcome));
+        }
+
+        // `decide` permits it; the Graph must say the same thing.
+        let Some(rule) = policy.actions.get(action) else {
+            return Ok(self.mismatch(query_id(), outcome.verdict, "no such action"));
+        };
+        let people = policy.people(recipients.unwrap_or(&rule.audience));
+        let intent = ActionIntent {
+            actor: PrincipalId(agent.into()),
+            action: action.into(),
+            artifact: ArtifactId(artifact.into()),
+            destination: action.into(),
+            recipients: principals(people),
+            parameters: serde_json::Value::Null,
+        };
+        match (outcome.verdict, self.graph.check_action(&intent, None, at)) {
+            (Verdict::Allow, Decision::Allow { context }) => {
+                Ok(decision_reply(context.digest, outcome))
+            }
+            (Verdict::NeedsApproval, Decision::NeedsApproval { context }) => {
+                let id = context.digest;
+                if let Some(granted) = self.approvals.get(&id)
+                    && approval_live(granted.issued_at, granted.valid_for, at, granted.voided)
+                    && matches!(
+                        self.graph
+                            .check_action(&intent, Some(&granted.approval), at),
+                        Decision::Allow { .. }
+                    )
+                {
+                    return Ok(Reply::Decision {
+                        id,
+                        verdict: Verdict::Allow,
+                        code: Gate::Allowed.code().into(),
+                        reason: format!("allowed: approved by `{}`", granted.reviewer),
+                        blocking: Vec::new(),
+                        expires_at: Some(granted.expires_at),
+                    });
+                }
+                self.decisions.insert(
+                    id.clone(),
+                    Remembered {
+                        agent: agent.into(),
+                        artifact: artifact.into(),
+                        action: action.into(),
+                        recipients: recipients.cloned(),
+                        intent,
+                    },
+                );
+                Ok(decision_reply(id, outcome))
+            }
+            (verdict, graph) => {
+                let said = match graph {
+                    Decision::Allow { .. } => "allow".to_string(),
+                    Decision::NeedsApproval { .. } => "needs_approval".to_string(),
+                    Decision::Deny { reason } => format!("deny ({})", clip(&reason)),
+                };
+                Ok(self.mismatch(query_id(), verdict, &said))
+            }
+        }
+    }
+
+    fn mismatch(&self, id: String, verdict: Verdict, graph: &str) -> Reply {
+        Reply::Decision {
+            id,
+            verdict: Verdict::Deny,
+            code: "engine_mismatch".into(),
+            reason: format!(
+                "denied: the policy says {} but the dataflow graph says {graph}",
+                verdict.as_str()
+            ),
+            blocking: Vec::new(),
+            expires_at: None,
+        }
+    }
+
+    /// The remembered decision and its action's expanded reviewers.
+    fn pending(&self, decision: &str) -> Result<(&Remembered, BTreeSet<String>, u64), Reply> {
+        let unknown = || {
+            reject(
+                "unknown_decision",
+                format!("no pending decision `{}`", clip(decision)),
+            )
+        };
+        let remembered = self.decisions.get(decision).ok_or_else(unknown)?;
+        let policy = self.active()?;
+        let rule = policy
+            .actions
+            .get(&remembered.action)
+            .and_then(|a| a.approval.as_ref())
+            .ok_or_else(unknown)?;
+        Ok((
+            remembered,
+            policy.people(&rule.reviewers),
+            rule.valid_for_seconds,
+        ))
+    }
+
+    fn approve(&mut self, at: u64, decision: &str, reviewer: &str) -> Handled {
+        field("decision", decision)?;
+        field("reviewer", reviewer)?;
+        let (remembered, reviewers, valid_for) = self.pending(decision)?;
+        let policy = self.active()?;
+        let output_from = self.lineage(&remembered.artifact).unwrap_or_default();
+        let outcome = decide(
+            policy,
+            &Query {
+                output_from,
+                agent: remembered.agent.clone(),
+                action: remembered.action.clone(),
+                recipients: remembered.recipients.clone(),
+            },
+        );
+        if outcome.verdict != Verdict::NeedsApproval {
+            return Err(reject(
+                "decision_not_pending",
+                format!("the policy now says {}", outcome.verdict.as_str()),
+            ));
+        }
+        if !reviewers.contains(reviewer)
+            || !outcome.readers.contains(reviewer)
+            || reviewer == remembered.agent
+        {
+            return Err(reject(
+                "reviewer_not_allowed",
+                format!(
+                    "`{}` must be a listed reviewer, a reader of the output and not the agent",
+                    clip(reviewer)
+                ),
+            ));
+        }
+        if let Some(granted) = self.approvals.get(decision)
+            && approval_live(granted.issued_at, granted.valid_for, at, granted.voided)
+        {
+            return Err(reject(
+                "already_approved",
+                format!(
+                    "approved by `{}` until {}",
+                    granted.reviewer, granted.expires_at
+                ),
+            ));
+        }
+        let expires_at = at
+            .checked_add(valid_for)
+            .ok_or_else(|| reject("invalid_time", "the approval would expire past u64::MAX"))?;
+        let intent = remembered.intent.clone();
+        let approval = self
+            .graph
+            .approve(&intent, PrincipalId(reviewer.into()), at)
+            .map_err(graph_error)?;
+        let granted = Granted {
+            reviewer: reviewer.into(),
+            issued_at: at,
+            valid_for,
+            expires_at,
+            voided: false,
+            approval,
+        };
+        if let Some(old) = self.approvals.insert(decision.into(), granted) {
+            self.graph.revoke_approval(&old.approval);
+        }
+        Ok(Reply::Approved {
+            decision: decision.into(),
+            expires_at,
+        })
+    }
+
+    fn revoke(&mut self, decision: &str, reviewer: &str) -> Handled {
+        field("decision", decision)?;
+        field("reviewer", reviewer)?;
+        let (_, reviewers, _) = self.pending(decision)?;
+        if !reviewers.contains(reviewer) {
+            return Err(reject(
+                "reviewer_not_allowed",
+                format!("`{}` is not a reviewer for this action", clip(reviewer)),
+            ));
+        }
+        let granted = self
+            .approvals
+            .get_mut(decision)
+            .ok_or_else(|| reject("no_approval", "this decision has no approval to revoke"))?;
+        granted.voided = true;
+        self.graph.revoke_approval(&granted.approval);
+        Ok(Reply::Revoked {
+            decision: decision.into(),
+        })
+    }
+
+    fn propose(&mut self, agent: Option<&str>, text: &str) -> Handled {
+        let active = self.active()?;
+        if let Some(agent) = agent {
+            field("agent", agent)?;
+            if !active.agents.contains(agent) {
+                return Err(reject(
+                    "unknown_agent",
+                    format!("`{}` is not an agent in the active policy", clip(agent)),
+                ));
+            }
+        }
+        let proposed = validate_policy(text)?;
+        let id = proposed.digest();
+        let changes = diff(active, &proposed);
+        let reply = Reply::Proposed {
+            id: id.clone(),
+            widens: changes.widens(),
+            changes: changes.changes,
+            explanation: explain(&proposed),
+        };
+        self.proposals.retain(|(existing, _)| *existing != id);
+        self.proposals.push((id, proposed));
+        if self.proposals.len() > MAX_PROPOSALS {
+            self.proposals.remove(0);
+        }
+        Ok(reply)
+    }
+
+    fn activate_proposal(&mut self, at: u64, proposal: &str, operator: &str) -> Handled {
+        field("proposal", proposal)?;
+        field("operator", operator)?;
+        let policy = self
+            .proposals
+            .iter()
+            .find(|(id, _)| id == proposal)
+            .map(|(_, policy)| policy.clone())
+            .ok_or_else(|| {
+                reject(
+                    "unknown_proposal",
+                    format!("no stored proposal `{}`", clip(proposal)),
+                )
+            })?;
+        self.activate(policy, Some(operator.into()), at)
+    }
+}

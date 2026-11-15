@@ -2056,6 +2056,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "trustgraph-engine"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "trustgraph-core",
+ "trustgraph-framework",
+ "trustgraph-policy",
+]
+
+[[package]]
 name = "trustgraph-framework"
 version = "0.1.0"
 dependencies = [

@@ -468,6 +468,11 @@ impl Graph {
         self.lineage(artifact).map(|(readers, _)| readers)
     }
 
+    /// Every source version an artifact derives from, with its current permissions.
+    pub fn sources(&self, artifact: &ArtifactId) -> Result<BTreeMap<ArtifactId, SourcePermission>> {
+        self.lineage(artifact).map(|(_, sources)| sources)
+    }
+
     /// Forward impact from one artifact, including itself, without pulling in sibling inputs.
     pub fn impact(&self, changed: &ArtifactId) -> Result<BTreeSet<ArtifactId>> {
         if !self.artifacts.contains_key(changed) {

@@ -459,3 +459,35 @@ fn graph_rejects_too_deep_composition_before_execution() {
         Err(Error::Lineage(_))
     ));
 }
+
+#[test]
+fn sources_lists_every_source_version_with_current_permissions() {
+    let mut g = Graph::new();
+    let broad = source(&mut g, "broad", ALL);
+    let narrow = source(&mut g, "narrow", RESTRICTED);
+    let op = operation(&mut g, &["a", "b"], &["quote"]);
+    let first = run(&mut g, &op, &[("a", &broad), ("b", &narrow)], &["quote"]);
+    let second = run(
+        &mut g,
+        &op,
+        &[("a", &first["quote"]), ("b", &broad)],
+        &["quote"],
+    );
+    let sources = g.sources(&second["quote"]).unwrap();
+    assert_eq!(
+        sources.keys().cloned().collect::<BTreeSet<_>>(),
+        BTreeSet::from([broad.clone(), narrow.clone()])
+    );
+    assert_eq!(sources[&narrow].readers, readers(RESTRICTED));
+    assert_eq!(g.sources(&broad).unwrap().len(), 1);
+
+    g.update_source_permissions(&narrow, readers(&["reviewer"]))
+        .unwrap();
+    let updated = g.sources(&second["quote"]).unwrap();
+    assert_eq!(updated[&narrow].readers, readers(&["reviewer"]));
+    assert_eq!(updated[&narrow].revision, 2);
+    assert!(matches!(
+        g.sources(&ArtifactId::from("missing")),
+        Err(Error::Unknown(_))
+    ));
+}
