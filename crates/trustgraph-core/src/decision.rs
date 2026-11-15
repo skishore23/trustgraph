@@ -188,7 +188,18 @@ mod tests {
 
     #[test]
     fn denial_flag_and_codes() {
-        assert!(Gate::AudienceOutsideReaders.is_denial());
+        for denial in [
+            Gate::UnknownAction,
+            Gate::UnknownAgent,
+            Gate::UnknownSource,
+            Gate::EmptyOutput,
+            Gate::AgentNotListed,
+            Gate::AgentCannotUseSource,
+            Gate::RecipientsOutsideAudience,
+            Gate::AudienceOutsideReaders,
+        ] {
+            assert!(denial.is_denial(), "{denial:?}");
+        }
         assert!(!Gate::NeedsApproval.is_denial());
         assert!(!Gate::Allowed.is_denial());
         let codes = [
@@ -221,6 +232,7 @@ mod tests {
         assert!(!approval_live(issued, valid, issued, true));
         assert!(!approval_live(issued, 0, issued, false));
         assert!(approval_live(u64::MAX, u64::MAX, u64::MAX, false));
+        assert!(approval_live(u64::MAX - 1, 5, u64::MAX, false));
     }
 }
 
@@ -278,8 +290,19 @@ mod proofs {
     #[kani::proof]
     fn needs_approval_implies_otherwise_allowed() {
         let f = any_facts();
+        let permitted = f.action_known
+            && f.agent_known
+            && f.sources_known
+            && f.has_sources
+            && f.agent_listed
+            && f.agent_may_use_inputs
+            && f.recipients_in_audience
+            && f.audience_in_readers;
+        assert_eq!(
+            gate(f) == Gate::NeedsApproval,
+            permitted && f.approval_required && !f.approval_live
+        );
         if gate(f) == Gate::NeedsApproval {
-            assert!(f.approval_required && !f.approval_live);
             let without_approval = Facts {
                 approval_required: false,
                 ..f

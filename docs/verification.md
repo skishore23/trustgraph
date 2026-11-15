@@ -35,18 +35,18 @@ sets (random vectors up to 63 `u16` keys are canonicalized into sets).
 | `arbitrary_keys_match_set_specification` | Both kernels match membership specifications for arbitrary ordered `u8` keys, not just fixed principal IDs |
 | `gate_allows_only_when_every_fact_holds` | `decision::gate` returns `Allowed` exactly when all eight permission facts hold and approval is not required or is live |
 | `approval_cannot_turn_a_denial_into_allow` | Varying `approval_required` and `approval_live` never changes a denial gate and never yields `Allowed` |
-| `needs_approval_implies_otherwise_allowed` | `NeedsApproval` occurs only when approval is required and not live, and the same facts without the requirement give `Allowed` |
+| `needs_approval_implies_otherwise_allowed` | `NeedsApproval` occurs exactly when the eight permission facts hold, approval is required and not live; the same facts without the requirement give `Allowed` |
 | `approval_window_is_exact_and_overflow_free` | `approval_live` equals `issued_at <= now < issued_at + valid_for` computed in 128 bits, and a voided approval is never live |
 
-**Bounds:** the first five harnesses quantify over every subset of `{0, 1, 2}`,
+**Bounds:** the first five `permissions` harnesses (through `recipient_must_be_permitted_by_every_input`) quantify over every subset of `{0, 1, 2}`,
 including empty sets (512 combinations for three-set laws), with unwind 5. The
-last harness uses two arbitrary `u8` arrays, symbolic lengths from 0 through 3,
+`arbitrary_keys_match_set_specification` uses two arbitrary `u8` arrays, symbolic lengths from 0 through 3,
 and assumes only strict ascending order of the active prefixes. It checks exact
 intersection, ordered unique output, and subset correctness with unwind 8. The
 larger unwind permits merges of disjoint key ranges. No safety, overflow or
 unwinding assertions are disabled. An insufficient loop bound fails verification.
 
-**Decision kernel bounds:** the four `decision` harnesses cover all 1,024 fact combinations; arbitrary u64 timestamps; loop-free, no unwind bound needed. Their results will be recorded after a CI run.
+**Decision kernel bounds:** the three gate harnesses cover all 1,024 fact combinations; `approval_window_is_exact_and_overflow_free` covers arbitrary u64 inputs; all four are loop-free, so no unwind bound is needed. Their results will be recorded after a CI run.
 
 These are bounded proofs of the production iterator kernels with slice iterators,
 not an unbounded theorem for arbitrary sizes, types, graph shapes, or schedules.
