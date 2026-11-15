@@ -1,0 +1,41 @@
+version: 1
+
+groups:                       # people
+  hr: [nina]
+  engineering: [sam, ravi]
+  sales: [leo]
+  customers: [acme]
+
+agents: [planner, mailer]     # agents are named principals too
+
+sources:
+  salaries:
+    readers: [hr]             # who may receive anything derived from it
+    agents: [planner]         # which agents may take it as input
+  roadmap:
+    readers: [hr, engineering]
+    agents: [planner]
+  price_sheet:
+    readers: [sales, customers]
+    agents: [mailer]
+
+actions:
+  post_to_slack:
+    agents: [planner]         # who may attempt it
+    audience: [engineering]   # who receives the output
+  email_customer:
+    agents: [mailer]
+    audience: [customers]
+    approval: { reviewers: [sales], valid_for: 30m }
+
+tests:                        # run by `policy test`; must pass to activate
+  - name: salary data never reaches engineering
+    output_from: [salaries, roadmap]
+    agent: planner
+    action: post_to_slack
+    expect: deny
+  - name: roadmap summary can be posted
+    output_from: [roadmap]
+    agent: planner
+    action: post_to_slack
+    expect: allow
