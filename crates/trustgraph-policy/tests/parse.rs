@@ -249,3 +249,46 @@ fn to_yaml_round_trips() {
     assert_eq!(again.diagnostics, vec![]);
     assert_eq!(again.policy, Some(p));
 }
+
+fn big_pool_header(n: usize) -> String {
+    let mut yaml = String::from("version: 1\ngroups:\n");
+    for i in 0..n {
+        yaml.push_str(&format!("  g{i}: [p{i}]\n"));
+    }
+    yaml.push_str("agents: [planner]\nsources:\n");
+    yaml
+}
+
+#[test]
+fn many_unknown_refs_are_capped_and_fast() {
+    let mut yaml = big_pool_header(4000);
+    let refs: Vec<String> = (0..8000).map(|i| format!("zz{i}")).collect();
+    yaml.push_str(&format!("  s: {{readers: [{}]}}\n", refs.join(", ")));
+    assert!(yaml.len() < trustgraph_policy::MAX_BYTES);
+    let start = Instant::now();
+    let parsed = parse(&yaml);
+    assert!(start.elapsed().as_secs() < 1, "took {:?}", start.elapsed());
+    assert!(parsed.policy.is_none());
+    let errs: Vec<_> = parsed
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .collect();
+    assert_eq!(errs.len(), 101);
+    assert_eq!(errs[100].code, "too_many_errors");
+    assert_eq!(errs[100].path, "");
+    assert!(errs[..100].iter().all(|d| d.code == "unknown_name"));
+}
+
+#[test]
+fn huge_unknown_name_is_fast_and_unsuggested() {
+    let mut yaml = big_pool_header(4000);
+    let long = "a".repeat(100_000);
+    yaml.push_str(&format!("  s: {{readers: [{long}]}}\n"));
+    let start = Instant::now();
+    let errs = errors(&yaml);
+    assert!(start.elapsed().as_secs() < 1, "took {:?}", start.elapsed());
+    assert_eq!(errs.len(), 1);
+    assert_eq!(errs[0].code, "unknown_name");
+    assert_eq!(errs[0].suggestion, None);
+}

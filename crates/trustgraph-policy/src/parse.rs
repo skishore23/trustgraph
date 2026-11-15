@@ -8,6 +8,10 @@ use crate::model::{
 
 /// Largest accepted policy file, checked before any parsing.
 pub const MAX_BYTES: usize = 262_144;
+/// Errors reported before the rest are summarised as `too_many_errors`.
+const MAX_ERRORS: usize = 100;
+/// Longer names get no did-you-mean suggestion.
+const MAX_SUGGEST_LEN: usize = 64;
 const MAX_VALID_FOR_SECONDS: u64 = 30 * 24 * 60 * 60;
 
 const TOP_KEYS: &[&str] = &["version", "groups", "agents", "sources", "actions", "tests"];
@@ -63,10 +67,24 @@ fn duplicate_key(message: &str) -> Option<String> {
 #[derive(Default)]
 struct Cx {
     diagnostics: Vec<Diagnostic>,
+    errors: usize,
+    suppressed: usize,
 }
 
 impl Cx {
-    fn finish(self, policy: Option<Policy>) -> Parsed {
+    fn finish(mut self, policy: Option<Policy>) -> Parsed {
+        if self.suppressed > 0 {
+            self.diagnostics.push(Diagnostic {
+                severity: Severity::Error,
+                path: String::new(),
+                code: "too_many_errors",
+                message: format!(
+                    "{} more errors were suppressed after the first {MAX_ERRORS}",
+                    self.suppressed
+                ),
+                suggestion: None,
+            });
+        }
         let has_error = self
             .diagnostics
             .iter()
@@ -81,6 +99,11 @@ impl Cx {
         self.error_with(path, code, message, None);
     }
 
+    /// Whether the error cap is reached; callers skip expensive work then.
+    fn full(&self) -> bool {
+        self.errors >= MAX_ERRORS
+    }
+
     fn error_with(
         &mut self,
         path: &str,
@@ -88,6 +111,11 @@ impl Cx {
         message: String,
         suggestion: Option<String>,
     ) {
+        if self.full() {
+            self.suppressed += 1;
+            return;
+        }
+        self.errors += 1;
         self.diagnostics.push(Diagnostic {
             severity: Severity::Error,
             path: path.to_string(),
@@ -155,6 +183,10 @@ impl Cx {
             if allowed.contains(&k) {
                 out.insert(k, v);
             } else {
+                if self.full() {
+                    self.suppressed += 1;
+                    continue;
+                }
                 let suggestion =
                     closest(k, allowed.iter().copied()).map(|c| format!("did you mean `{c}`?"));
                 self.error_with(
@@ -223,6 +255,10 @@ impl Cx {
     }
 
     fn unknown(&mut self, path: &str, name: &str, pool: &BTreeSet<String>, what: &str) {
+        if self.full() {
+            self.suppressed += 1;
+            return;
+        }
         let suggestion =
             closest(name, pool.iter().map(String::as_str)).map(|c| format!("did you mean `{c}`?"));
         self.error_with(
@@ -704,25 +740,34 @@ fn parse_duration(s: &str) -> Option<u64> {
 }
 
 /// The nearest candidate within edit distance 2 (ties go to the first).
+/// Over-long names and candidates whose length differs by more than 2 are
+/// skipped, which keeps hostile input from costing quadratic time.
 fn closest<'a>(name: &str, candidates: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    if name.len() > MAX_SUGGEST_LEN {
+        return None;
+    }
+    let a: Vec<char> = name.chars().collect();
+    let (mut prev, mut cur) = (Vec::new(), Vec::new());
     candidates
-        .map(|c| (edit_distance(name, c), c))
+        .filter(|c| name.len().abs_diff(c.len()) <= 2 && c.len() <= MAX_SUGGEST_LEN)
+        .map(|c| (edit_distance(&a, c, &mut prev, &mut cur), c))
         .filter(|(d, _)| *d <= 2)
         .min_by_key(|(d, _)| *d)
         .map(|(_, c)| c)
 }
 
-fn edit_distance(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
+fn edit_distance(a: &[char], b: &str, prev: &mut Vec<usize>, cur: &mut Vec<usize>) -> usize {
     let b: Vec<char> = b.chars().collect();
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    prev.clear();
+    prev.extend(0..=b.len());
     for (i, ca) in a.iter().enumerate() {
-        let mut cur = vec![i + 1];
+        cur.clear();
+        cur.push(i + 1);
         for (j, cb) in b.iter().enumerate() {
             let sub = prev[j] + usize::from(ca != cb);
             cur.push(sub.min(prev[j + 1] + 1).min(cur[j] + 1));
         }
-        prev = cur;
+        std::mem::swap(prev, cur);
     }
     prev[b.len()]
 }
