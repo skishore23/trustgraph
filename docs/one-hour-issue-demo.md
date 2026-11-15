@@ -1,6 +1,6 @@
 # Guided issue walkthrough
 
-Open the live UI at **http://127.0.0.1:18084** in your signed-in browser.
+Open the live UI at **http://127.0.0.1:8084** in your signed-in browser.
 Choose a chapter on the left and select **Start this walkthrough**. The UI loads
 its saved native 8090 draft, provides the next action, and updates the flow,
 checks, activity, and presenter notes. There is no JSON import or terminal step
