@@ -503,3 +503,178 @@ proptest::proptest! {
         proptest::prop_assert!(read("ab").is_subset(&set(a)));
     }
 }
+
+fn second_approval(e: &mut Evidence, id: &str, issued_at: u64) {
+    let mut a = e.approvals[&ApprovalId::from("approval")].clone();
+    a.id = id.into();
+    a.issued_at = issued_at;
+    a.expires_at = issued_at + 70;
+    e.approvals.insert(a.id.clone(), a);
+}
+
+#[test]
+fn revoking_an_approval_blocks_same_context_approvals_issued_no_later() {
+    // A newer revoked approval blocks an older one for the same context.
+    let (mut e, i) = fixture(false);
+    approve(&mut e, &i);
+    second_approval(&mut e, "approval-newer", 11);
+    e.revoked.insert("approval-newer".into());
+    assert!(verify(&e, &i, 12).has(Code::ApprovalRevoked));
+    // Same issue time is also blocked.
+    let (mut e, i) = fixture(false);
+    approve(&mut e, &i);
+    second_approval(&mut e, "approval-same", 10);
+    e.revoked.insert("approval-same".into());
+    assert!(verify(&e, &i, 12).has(Code::ApprovalRevoked));
+    // A strictly newer approval re-authorizes after revocation.
+    let (mut e, i) = fixture(false);
+    approve(&mut e, &i);
+    e.revoked.insert("approval".into());
+    second_approval(&mut e, "approval-newer", 11);
+    assert!(matches!(
+        verify(&e, &i, 12),
+        Decision::Ready { approval, .. } if approval == ApprovalId::from("approval-newer")
+    ));
+}
+
+#[test]
+fn agent_requester_cannot_receive_ready_even_with_valid_approval() {
+    let (mut e, mut i) = fixture(false);
+    approve(&mut e, &i);
+    i.requester = "agent".into();
+    assert!(verify(&e, &i, 11).has(Code::CallerUnauthorized));
+    let mut disabled = e.clone();
+    i.requester = "maya".into();
+    disabled
+        .principals
+        .get_mut(&PrincipalId::from("maya"))
+        .unwrap()
+        .enabled = false;
+    assert!(verify(&disabled, &i, 11).has(Code::CallerUnauthorized));
+}
+
+#[test]
+fn signer_outside_policy_approvers_is_unauthorized_not_stale() {
+    let (mut e, i) = fixture(false);
+    approve(&mut e, &i);
+    e.approvals
+        .get_mut(&ApprovalId::from("approval"))
+        .unwrap()
+        .signer = "arun".into();
+    assert!(!e.policy.approvers.contains(&PrincipalId::from("arun")));
+    let decision = verify(&e, &i, 11);
+    assert!(decision.has(Code::SignerUnauthorized), "{decision:?}");
+}
+
+#[test]
+fn breadth_over_artifact_limit_and_oversized_manifests_are_incomplete() {
+    let (mut e, mut i) = fixture(false);
+    let mut groups = vec![];
+    for g in 0..5 {
+        let mut inputs = vec![];
+        for n in 0..60 {
+            let name = format!("src-{g}-{n}");
+            let mut a = e.artifacts[&ArtifactId::from("roadmap")].clone();
+            a.id = name.as_str().into();
+            a.logical_id = name.clone();
+            a.origin = Origin::Source(name.as_str().into());
+            e.artifacts.insert(a.id.clone(), a);
+            e.sources.insert(
+                name.as_str().into(),
+                Source {
+                    id: name.as_str().into(),
+                    workspace: e.workspace.clone(),
+                    artifact: name.as_str().into(),
+                    acl: "roadmap".into(),
+                },
+            );
+            inputs.push(name);
+        }
+        let group = format!("group-{g}");
+        derive(&mut e, &group, inputs.iter().map(String::as_str).collect());
+        groups.push(group);
+    }
+    derive(&mut e, "wide", groups.iter().map(String::as_str).collect());
+    i.artifact = "wide".into();
+    assert!(verify(&e, &i, 10).has(Code::IncompleteLineage));
+    // Each group alone is within bounds.
+    i.artifact = "group-0".into();
+    assert!(matches!(
+        verify(&e, &i, 10),
+        Decision::PendingApproval { .. }
+    ));
+    // More than 64 inputs in one manifest is refused even if the closure is small.
+    derive(&mut e, "too-many-inputs", vec!["roadmap"; 65]);
+    i.artifact = "too-many-inputs".into();
+    assert!(verify(&e, &i, 10).has(Code::IncompleteLineage));
+    derive(&mut e, "max-inputs", vec!["roadmap"; 64]);
+    i.artifact = "max-inputs".into();
+    assert!(matches!(
+        verify(&e, &i, 10),
+        Decision::PendingApproval { .. }
+    ));
+}
+
+#[test]
+fn two_transformations_claiming_one_output_are_invalid() {
+    let (mut e, i) = fixture(false);
+    let mut copy = e.transformations[&TransformationId::from("draft")].clone();
+    copy.id = "draft-duplicate".into();
+    e.transformations.insert(copy.id.clone(), copy);
+    assert!(verify(&e, &i, 10).has(Code::InvalidSchema));
+}
+
+fn reseal(bundle: &mut bundle::Bundle) {
+    bundle.digest = digest::structured(
+        "verification-bundle",
+        &(
+            bundle.schema,
+            &bundle.evidence,
+            &bundle.intent,
+            bundle.at,
+            &bundle.decision,
+        ),
+    );
+}
+
+#[test]
+fn verified_bundle_check_and_replay_reject_tampering() {
+    use trustgraph_core::bundle::{VerifiedBundle, replay};
+    let (mut e, i) = fixture(false);
+    assert!(VerifiedBundle::check(&e, &i, 11).is_err());
+    approve(&mut e, &i);
+    let bundle = VerifiedBundle::check(&e, &i, 11).unwrap().export().clone();
+    assert!(replay(&bundle).is_ok());
+    // The integrity seal covers the evidence bytes.
+    let mut tampered = bundle.clone();
+    tampered
+        .evidence
+        .artifacts
+        .get_mut(&ArtifactId::from("draft"))
+        .unwrap()
+        .content
+        .push('!');
+    assert_eq!(replay(&tampered).err(), Some("bundle integrity mismatch"));
+    // A resealed bundle whose evidence no longer authorizes is rejected.
+    let mut revoked = bundle.clone();
+    revoked.evidence.revoked.insert("approval".into());
+    reseal(&mut revoked);
+    assert_eq!(
+        replay(&revoked).err(),
+        Some("recorded publication was not authorized")
+    );
+    // A resealed bundle with extra evidence does not follow from the snapshot.
+    let mut padded = bundle.clone();
+    let mut extra = padded.evidence.approvals[&ApprovalId::from("approval")].clone();
+    extra.id = "padding".into();
+    padded.evidence.approvals.insert(extra.id.clone(), extra);
+    reseal(&mut padded);
+    assert_eq!(
+        replay(&padded).err(),
+        Some("recorded decision does not follow from evidence")
+    );
+    let mut schema = bundle;
+    schema.schema = 2;
+    reseal(&mut schema);
+    assert!(replay(&schema).is_err());
+}

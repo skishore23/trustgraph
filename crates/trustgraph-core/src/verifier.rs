@@ -1,5 +1,12 @@
 use crate::{digest, lineage, *};
 /// Evaluate a materialized snapshot at an explicit timestamp.
+///
+/// `Ready` additionally requires that the requester is an enabled human in the
+/// workspace (agents may request review but never execute a release), and that
+/// no revoked approval for the same exact context was issued at or after the
+/// selected approval: revoking any approval for a context blocks every approval
+/// for that context issued at or before the revoked one; a strictly newer
+/// approval can re-authorize.
 pub fn verify(e: &Evidence, intent: &Intent, now: u64) -> Decision {
     let block = |code, witness| Decision::Blocked {
         violations: vec![Violation { code, witness }],
@@ -26,25 +33,10 @@ pub fn verify(e: &Evidence, intent: &Intent, now: u64) -> Decision {
     if !closure.readers.contains(&intent.requester) {
         return block(Code::CallerUnauthorized, None);
     }
-    let Some(audience) = e.audiences.get(&intent.audience) else {
-        return block(Code::AudienceUnresolved, None);
+    let audience = match resolve_audience(e, &intent.audience) {
+        Ok(audience) => audience,
+        Err(code) => return block(code, None),
     };
-    if audience.workspace != e.workspace {
-        return block(Code::CrossWorkspace, None);
-    }
-    if audience.id != intent.audience || audience.revision == 0 || audience.destination.is_empty() {
-        return block(Code::InvalidSchema, None);
-    }
-    if !audience.resolved
-        || audience.recipients.is_empty()
-        || audience.recipients.iter().any(|id| {
-            !e.principals
-                .get(id)
-                .is_some_and(|p| p.id == *id && p.enabled && p.workspace == e.workspace)
-        })
-    {
-        return block(Code::AudienceUnresolved, None);
-    }
     if !permissions::can_flow(&closure.readers, &audience.recipients) {
         let witness = closure
             .acls
@@ -55,6 +47,15 @@ pub fn verify(e: &Evidence, intent: &Intent, now: u64) -> Decision {
     }
     let artifact = e.artifacts.get(&intent.artifact).expect("validated root");
     let context = bind_context(e, intent, &closure, audience);
+    // Revoking any approval for an exact context blocks every approval for that
+    // same context issued at or before the revoked approval's issue time. Only
+    // a strictly newer approval can re-authorize the context.
+    let revoked_through = e
+        .approvals
+        .iter()
+        .filter(|(id, a)| e.revoked.contains(*id) && a.context == context)
+        .map(|(_, a)| a.issued_at)
+        .max();
     let mut failure = None;
     let mut stale = false;
     for (id, approval) in &e.approvals {
@@ -67,7 +68,9 @@ pub fn verify(e: &Evidence, intent: &Intent, now: u64) -> Decision {
         }
         let code = if approval.id != *id || id.0.is_empty() {
             Some(Code::InvalidSchema)
-        } else if e.revoked.contains(id) {
+        } else if e.revoked.contains(id)
+            || revoked_through.is_some_and(|cutoff| approval.issued_at <= cutoff)
+        {
             Some(Code::ApprovalRevoked)
         } else if approval.issued_at > now
             || now >= approval.expires_at
@@ -91,6 +94,11 @@ pub fn verify(e: &Evidence, intent: &Intent, now: u64) -> Decision {
         if let Some(code) = code {
             failure.get_or_insert(code);
         } else {
+            // Approval authorizes the exact context, not the executor: only an
+            // enabled, in-workspace human requester may perform the release.
+            if actor.role != Role::Human {
+                return block(Code::CallerUnauthorized, None);
+            }
             return Decision::Ready {
                 context,
                 approval: id.clone(),
@@ -151,4 +159,27 @@ fn bind_context(
         ),
         acl_hash: digest::structured("source-acls", &closure.acls),
     }
+}
+
+/// Shared destination validation for publication and plan analysis. Missing or
+/// unresolved memberships are never treated as empty sets.
+pub(crate) fn resolve_audience<'a>(e: &'a Evidence, id: &AudienceId) -> Result<&'a Audience, Code> {
+    let audience = e.audiences.get(id).ok_or(Code::AudienceUnresolved)?;
+    if audience.workspace != e.workspace {
+        return Err(Code::CrossWorkspace);
+    }
+    if audience.id != *id || audience.revision == 0 || audience.destination.is_empty() {
+        return Err(Code::InvalidSchema);
+    }
+    if !audience.resolved
+        || audience.recipients.is_empty()
+        || audience.recipients.iter().any(|id| {
+            !e.principals
+                .get(id)
+                .is_some_and(|p| p.id == *id && p.enabled && p.workspace == e.workspace)
+        })
+    {
+        return Err(Code::AudienceUnresolved);
+    }
+    Ok(audience)
 }
