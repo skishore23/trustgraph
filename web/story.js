@@ -35,6 +35,20 @@ const title = (chapter, heading, description) => `<div class="eyebrow"><span></s
 const footer = (takeaway, next, nextLabel) => `<div class="chapter-footer"><p class="takeaway">${takeaway}</p>${link(nextLabel,next)}</div>`;
 const checkRow = (title,value,tone='') => `<div class="check-row"><dt>${escape(title)}</dt><dd class="${tone}">${escape(value)}</dd></div>`;
 const evidence = (label,value) => `<details class="evidence"><summary>${escape(label)}</summary><pre>${pretty(value)}</pre></details>`;
+// Read the body as text first: proxies and extractor rejections may not send JSON.
+async function readResponse(response) {
+  let text = '';
+  try { text = await response.text(); } catch { /* Treat an unreadable body as empty. */ }
+  let value = null;
+  try { value = text ? JSON.parse(text) : null; } catch { value = null; }
+  if (!response.ok) {
+    const detail = value && typeof value.error === 'string' ? value.error
+      : `The server returned ${response.status}${text ? `: ${text.slice(0, 160)}` : ''}.`;
+    const error = Error(detail); error.status = response.status; throw error;
+  }
+  if (!value || typeof value !== 'object') throw Error('The server returned an unreadable response. Please retry.');
+  return value;
+}
 async function api(path='', body) {
   if (hostedDemo) {
     const history = path === '/reset' ? [] : demoHistory;
@@ -42,16 +56,28 @@ async function api(path='', body) {
     if (path === '/compare') request.comparison = body;
     else if (body !== undefined && path !== '/reset') request.command = body;
     const response = await fetch('/api/demo', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(request)});
-    const value = await response.json();
-    if (!response.ok) throw Error(value.error || 'The demo could not complete this step.');
+    const value = await readResponse(response);
     demoHistory = request.command ? [...history, request.command] : history;
     try { sessionStorage.setItem(historyKey, JSON.stringify(demoHistory)); } catch { /* Keep progress in memory. */ }
     return value;
   }
   const response = await fetch('/api/story'+path, {method:body===undefined?'GET':'POST',headers:body===undefined?{}:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body)});
-  const value = await response.json();
-  if (!response.ok) throw Error(value.error || 'The request could not be completed.');
-  return value;
+  return readResponse(response);
+}
+// A saved history from an older deployment can be rejected (4xx). Start over once.
+async function loadInitialState() {
+  try { return {value: await api(), restarted: false}; }
+  catch (error) {
+    if (!hostedDemo || !demoHistory.length || !(error.status >= 400 && error.status < 500)) throw error;
+    demoHistory = [];
+    try { sessionStorage.removeItem(historyKey); } catch { /* Storage is optional. */ }
+    return {value: await api(), restarted: true};
+  }
+}
+const maxApprovalAge = 10080;
+function approvalAge(text) {
+  const value = Number(text);
+  return String(text).trim() !== '' && Number.isInteger(value) && value >= 0 && value <= maxApprovalAge ? value : null;
 }
 function notify(message) {
   const notice = document.querySelector('#notice');
@@ -110,7 +136,7 @@ function simulatorPage() {
   const presets=[['private','Salary + budget data → Engineering'],['hr','Salary + budget data → HR'],['approved','Shared planning data → Engineering'],['changed','Dashboard edited after approval']];
   return title('03 / TEST BEFORE YOU ACT','Test a policy change.<br>See who can access the dashboard.','Choose the data and department. Compare the current policy with your proposed changes before applying them.')+
     `<div class="sim-presets" aria-label="Scenario presets">${presets.map(([id,label])=>`<button data-preset="${id}" class="${selectedPreset===id?'selected':''}" aria-pressed="${selectedPreset===id}">${escape(label)}</button>`).join('')}</div>
-    <div class="sim-layout"><section class="panel"><div class="panel-head"><h2>Proposed work · TG-104</h2>${pill('WHAT IF')}</div><fieldset class="sim-inputs"><legend class="sr-only">Inputs used by the agent</legend>${state.sources.map(s=>`<label class="input-choice"><input type="checkbox" data-input="${s.id}" ${scenario.inputs.includes(s.id)?'checked':''}><span><strong>${escape(s.title)}</strong><small>${escape(s.description)}</small><span class="source-scope">${state.policy.source_readers[s.id].map(id=>departments[id]).join(' + ')}</span></span></label>`).join('')}</fieldset><div class="sim-controls"><div><label for="sim-destination">Which department needs access?</label><select id="sim-destination">${Object.entries(departments).map(([id,name])=>`<option value="${id}" ${scenario.destination===id?'selected':''}>${name}</option>`).join('')}</select></div><div><label for="sim-approval">Approval status for this test</label><select id="sim-approval">${[['missing','No approval yet'],['valid','This version is approved'],['changed','Changed after approval'],['expired','Expired approval']].map(([id,name])=>`<option value="${id}" ${scenario.approval===id?'selected':''}>${name}</option>`).join('')}</select></div><label class="inline-check"><input type="checkbox" id="sim-lineage" ${scenario.complete_lineage?'checked':''}>All inputs are recorded</label><div><label for="sim-age">Minutes since approval</label><input type="number" id="sim-age" min="0" max="10080" value="${scenario.approval_age_minutes}"></div>${primary('Run comparison','id="compare"')}</div></section>
+    <div class="sim-layout"><section class="panel"><div class="panel-head"><h2>Proposed work · TG-104</h2>${pill('WHAT IF')}</div><fieldset class="sim-inputs"><legend class="sr-only">Inputs used by the agent</legend>${state.sources.map(s=>`<label class="input-choice"><input type="checkbox" data-input="${s.id}" ${scenario.inputs.includes(s.id)?'checked':''}><span><strong>${escape(s.title)}</strong><small>${escape(s.description)}</small><span class="source-scope">${state.policy.source_readers[s.id].map(id=>departments[id]).join(' + ')}</span></span></label>`).join('')}</fieldset><div class="sim-controls"><div><label for="sim-destination">Which department needs access?</label><select id="sim-destination">${Object.entries(departments).map(([id,name])=>`<option value="${id}" ${scenario.destination===id?'selected':''}>${name}</option>`).join('')}</select></div><div><label for="sim-approval">Approval status for this test</label><select id="sim-approval">${[['missing','No approval yet'],['valid','This version is approved'],['changed','Changed after approval'],['expired','Expired approval']].map(([id,name])=>`<option value="${id}" ${scenario.approval===id?'selected':''}>${name}</option>`).join('')}</select></div><label class="inline-check"><input type="checkbox" id="sim-lineage" ${scenario.complete_lineage?'checked':''}>All inputs are recorded</label><div><label for="sim-age">Minutes since approval</label><input type="number" id="sim-age" min="0" max="10080" step="1" inputmode="numeric" value="${escape(scenario.approval_age_minutes)}"></div>${primary('Run comparison','id="compare"')}</div></section>
     <section id="comparison-results" aria-label="Policy comparison" aria-live="polite">${simulationResult()}</section></div>`+
     footer('<strong>Simulation and release use the same verifier.</strong> The simulator evaluates explicit assumptions; the release gate checks recorded work and approval.','enforce','See the policy enforced');
 }
@@ -162,6 +188,7 @@ function invalidateComparison() {
   if (host) {host.innerHTML=simulationResult();bindResults();}
 }
 async function compare() {
+  if (approvalAge(scenario.approval_age_minutes) === null) throw Error(`Minutes since approval must be a whole number from 0 to ${maxApprovalAge}.`);
   const sentSignature=signature();
   const result=await api('/compare',{policy:candidate,scenario});
   if (sentSignature!==signature()) {comparison=undefined;notify('Inputs changed during evaluation. Run the comparison again.');return;}
@@ -199,7 +226,7 @@ function bind() {
   document.querySelector('#sim-destination')?.addEventListener('change',event=>{scenario.destination=event.target.value;invalidateComparison();});
   document.querySelector('#sim-approval')?.addEventListener('change',event=>{scenario.approval=event.target.value;invalidateComparison();});
   document.querySelector('#sim-lineage')?.addEventListener('change',event=>{scenario.complete_lineage=event.target.checked;invalidateComparison();});
-  document.querySelector('#sim-age')?.addEventListener('input',event=>{scenario.approval_age_minutes=Number(event.target.value);invalidateComparison();});
+  document.querySelector('#sim-age')?.addEventListener('input',event=>{const age=approvalAge(event.target.value);event.target.setAttribute('aria-invalid',String(age===null));scenario.approval_age_minutes=age===null?event.target.value:age;invalidateComparison();});
   document.querySelectorAll('[data-preset]').forEach(button=>button.addEventListener('click',()=>{
     selectedPreset=button.dataset.preset;
     scenario={inputs:selectedPreset==='approved'||selectedPreset==='changed'?['approved-planning','directory']:['budget','compensation','directory'],destination:selectedPreset==='hr'?'hr':'engineering',approval:selectedPreset==='changed'?'changed':'valid',approval_age_minutes:0,complete_lineage:true};
@@ -237,7 +264,10 @@ document.querySelector('#reset').addEventListener('click',()=>perform(async()=>{
 }));
 window.addEventListener('hashchange',()=>{render();main.focus({preventScroll:true});window.scrollTo({top:0,behavior:'instant'});});
 async function initialize() {
-  try { state=await api();candidate=clone(state.policy);render(); }
+  try {
+    const {value, restarted}=await loadInitialState();state=value;candidate=clone(state.policy);render();
+    if (restarted) notify('Saved progress was from an older version of this demo, so the story restarted.');
+  }
   catch(error) { main.innerHTML=`<div class="error-box"><strong>The workspace could not connect.</strong><p>${escape(error.message)}</p></div>`; }
 }
 initialize();

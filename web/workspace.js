@@ -53,8 +53,26 @@ async function api(path, body) {
     headers: body === undefined ? {} : { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
-  const data = await r.json();
-  if (!r.ok) throw Error(data.error || `Request failed (${r.status})`);
+  let text = "";
+  try {
+    text = await r.text();
+  } catch {
+    /* Treat an unreadable body as empty. */
+  }
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = null;
+  }
+  if (!r.ok)
+    throw Error(
+      data && typeof data.error === "string"
+        ? data.error
+        : `Request failed (${r.status})${text ? `: ${text.slice(0, 160)}` : ""}`,
+    );
+  if (!data || typeof data !== "object")
+    throw Error("The server returned an unreadable response.");
   return data;
 }
 function notify(text) {

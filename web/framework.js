@@ -8,6 +8,8 @@ const label = (value, max = 24) => String(value ?? '').length > max ? String(val
 const statusNames = {allow:'Allowed',needs_approval:'Approval required',deny:'Blocked',invalid:'Execution rejected'};
 const statusClasses = {allow:'allow',needs_approval:'approval',deny:'deny',invalid:'deny'};
 
+// Read the body as text first: proxies and extractor rejections may not send JSON.
+async function readJson(response){let text='';try{text=await response.text();}catch{/* Treat an unreadable body as empty. */}let value=null;try{value=text?JSON.parse(text):null;}catch{value=null;}if(!response.ok)throw new Error(value&&typeof value.error==='string'?value.error:`Server returned ${response.status}${text?`: ${text.slice(0,160)}`:''}`);if(!value||typeof value!=='object')throw new Error('The server returned an unreadable response.');return value;}
 function inspect(node, group) {
   for (const el of document.querySelectorAll('.svg-node.selected')) el.classList.remove('selected');
   group?.classList.add('selected');
@@ -56,7 +58,7 @@ function render(data) {
 async function evaluate(){
   const requestId=++latest;$('#run').disabled=true;$('#engine-status').textContent='EVALUATING…';$('#engine-status').className='engine-status';
   const body={scenario,audience:$('#recipient').value,approve:$('#approved').checked,mutation:$('#change').value};
-  try{const response=await fetch('/api/framework',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});const data=await response.json();if(requestId!==latest)return;if(!response.ok)throw new Error(data.error||`Server returned ${response.status}`);if(!['allow','needs_approval','deny','invalid'].includes(data.status))throw new Error('The server did not return a framework decision.');render(data);}
+  try{const response=await fetch('/api/framework',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});const data=await readJson(response);if(requestId!==latest)return;if(!['allow','needs_approval','deny','invalid'].includes(data.status))throw new Error('The server did not return a framework decision.');render(data);}
   catch(error){if(requestId!==latest)return;const box=$('#decision');box.className='decision error';box.querySelector('.decision-title').textContent='Could not verify';box.querySelector('p').textContent=error.message;$('#engine-status').textContent='ENGINE UNAVAILABLE';$('#engine-status').className='engine-status';$('#graph').replaceChildren();const p=document.createElement('p');p.className='empty';p.textContent='No current evidence. Retry when the server is available.';$('#graph').append(p);$('#events').replaceChildren();$('#record').textContent='No verified result.';current=null;}
   finally{if(requestId===latest)$('#run').disabled=false;}
 }
@@ -92,8 +94,7 @@ async function simulate() {
   if(seedText.trim()===''||!Number.isInteger(seed)||seed<0||seed>65535){$('#sim-status').textContent='INVALID SEED';tracePlaceholder('Choose an integer seed from 0 to 65535.');return;}
   const id=++simulationRequest;$('#sim-run').disabled=true;$('#sim-status').textContent='SIMULATING…';$('#sim-status').className='engine-status';tracePlaceholder('Running the Rust coordinator under virtual time…');$('#sim-json').textContent='Waiting for server trace.';
   try {
-    const response=await fetch('/api/simulation',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({scenario:$('#sim-scenario').value,seed})});const result=await response.json();if(id!==simulationRequest)return;
-    if(!response.ok)throw new Error(result.error||`Server returned ${response.status}`);
+    const response=await fetch('/api/simulation',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({scenario:$('#sim-scenario').value,seed})});const result=await readJson(response);if(id!==simulationRequest)return;
     if(!result.trace||!Array.isArray(result.trace.steps))throw new Error('The server did not return a simulation trace.');
     $('#sim-trace').replaceChildren();
     result.trace.steps.forEach((step,index)=>{const li=document.createElement('li'),time=document.createElement('span'),heading=document.createElement('strong'),outcome=document.createElement('p');time.className='sim-time';time.textContent=`${String(index+1).padStart(2,'0')} / VIRTUAL t=${step.at}`;heading.textContent=step.action?.action||'Recorded action';const detail={outcome:step.outcome};if(step.accepted!==undefined)detail.accepted=step.accepted;outcome.textContent=JSON.stringify(detail,null,2);li.append(time,heading,outcome);$('#sim-trace').append(li);});

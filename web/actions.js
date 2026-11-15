@@ -18,8 +18,10 @@ function notify(message = '', error = false) { $('#notice').textContent = messag
 function eventLog(text) { session().events.unshift({ text, at: new Date().toISOString() }); session().events = session().events.slice(0, 12); persist(); }
 async function api(path, options = {}) {
   const response = await fetch(path, { cache: 'no-store', signal: AbortSignal.timeout(options.method ? 180000 : 15000), ...options, headers: { 'Content-Type': 'application/json', ...options.headers } });
-  const value = await response.json();
-  if (!response.ok) { const error = new Error(value.error || 'The gateway could not complete this request.'); error.status = response.status; throw error; }
+  let text = ''; try { text = await response.text(); } catch { /* Treat an unreadable body as empty. */ }
+  let value = null; try { value = text ? JSON.parse(text) : null; } catch { value = null; }
+  if (!response.ok) { const error = new Error(value && typeof value.error === 'string' ? value.error : `The gateway returned ${response.status}${text ? `: ${text.slice(0, 160)}` : ''}.`); error.status = response.status; throw error; }
+  if (!value || typeof value !== 'object') throw new Error('The gateway returned an unreadable response.');
   return value;
 }
 const post = (path, value) => api(path, { method: 'POST', body: JSON.stringify(value) });
