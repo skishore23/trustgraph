@@ -16,6 +16,10 @@ name = "demo"
 path = "api/demo.rs"
 
 [[bin]]
+name = "simulation"
+path = "api/simulation.rs"
+
+[[bin]]
 name = "framework"
 path = "api/framework.rs"
 
@@ -31,6 +35,7 @@ tokio.workspace = true
 tower = { version = "0.5", features = ["util"] }
 trustgraph-runtime = { path = "crates/trustgraph-runtime" }
 trustgraph-framework = { path = "crates/trustgraph-framework" }
+trustgraph-sim = { path = "crates/trustgraph-sim" }
 vercel_runtime = { version = "2.4", features = ["axum"] }
 rmcp = { version = "=3.10.0", default-features = false, features = ["server", "transport-streamable-http-server"] }
 
@@ -59,3 +64,4 @@ fs2 = "0.4"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

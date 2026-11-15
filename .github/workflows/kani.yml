@@ -1,0 +1,30 @@
+name: Bounded permission proofs
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'crates/trustgraph-core/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/kani.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/trustgraph-core/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/kani.yml'
+permissions:
+  contents: read
+jobs:
+  permissions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Kani verifier
+        run: |
+          cargo install --locked kani-verifier --version 0.68.0
+          cargo kani setup
+      - name: Verify production reader-set helpers
+        run: cargo kani -p trustgraph-core --lib --output-format terse

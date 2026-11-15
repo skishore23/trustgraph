@@ -44,3 +44,64 @@ mod tests {
         }
     }
 }
+
+/// Bounded proofs execute the production functions above, not a second model.
+/// The principal universe is {0,1,2}; each membership bit is symbolic.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    fn arbitrary_readers() -> BTreeSet<u8> {
+        let membership: [bool; 3] = kani::any();
+        let mut readers = BTreeSet::new();
+        for (principal, included) in membership.into_iter().enumerate() {
+            if included {
+                readers.insert(principal as u8);
+            }
+        }
+        readers
+    }
+
+    #[kani::proof]
+    #[kani::unwind(16)]
+    fn intersection_never_widens() {
+        let left = arbitrary_readers();
+        let right = arbitrary_readers();
+        let output = intersect(&left, &right);
+        assert!(output.is_subset(&left));
+        assert!(output.is_subset(&right));
+    }
+
+    #[kani::proof]
+    #[kani::unwind(16)]
+    fn composition_is_associative() {
+        let a = arbitrary_readers();
+        let b = arbitrary_readers();
+        let c = arbitrary_readers();
+        assert_eq!(
+            intersect(&intersect(&a, &b), &c),
+            intersect(&a, &intersect(&b, &c))
+        );
+    }
+
+    #[kani::proof]
+    #[kani::unwind(16)]
+    fn duplicate_or_reordered_inputs_preserve_readers() {
+        let a = arbitrary_readers();
+        let b = arbitrary_readers();
+        assert_eq!(intersect(&a, &a), a);
+        assert_eq!(intersect(&a, &b), intersect(&b, &a));
+    }
+
+    #[kani::proof]
+    #[kani::unwind(16)]
+    fn recipient_must_be_permitted_by_every_input() {
+        let a = arbitrary_readers();
+        let b = arbitrary_readers();
+        let destination = arbitrary_readers();
+        assert_eq!(
+            can_flow(&intersect(&a, &b), &destination),
+            can_flow(&a, &destination) && can_flow(&b, &destination)
+        );
+    }
+}

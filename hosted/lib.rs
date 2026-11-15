@@ -3,6 +3,7 @@
 //! live publisher. No credentials, durable state, or external writes are used.
 pub mod framework;
 pub mod mcp;
+pub mod simulation;
 
 use axum::{
     Json, Router,
@@ -85,6 +86,7 @@ pub fn router() -> Router {
     Router::new()
         .route("/api/demo", post(demo))
         .route("/api/framework", post(framework::demo))
+        .route("/api/simulation", post(simulation::demo))
         .layer(DefaultBodyLimit::max(131_072))
 }
 

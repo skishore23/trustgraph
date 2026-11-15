@@ -26,7 +26,7 @@ vercel deploy --prod
 
 `vercel.json` builds the static interface into `public/` with
 `scripts/build_demo.cjs`. Vercel builds `api/framework.rs`, `api/demo.rs` and
-`api/mcp.rs` using its official Rust runtime. No environment variables or external services are required.
+`api/simulation.rs` and `api/mcp.rs` using its official Rust runtime. No environment variables or external services are required.
 
 For local development with Vercel's routing and runtime bridge:
 
@@ -99,3 +99,11 @@ Example request to `trustgraph_demo_simulate`:
 The Rust verifier blocks this case because Engineering cannot access the
 compensation source, even under an assumed valid approval. Use
 `["directory", "approved-planning"]` to test the shared-input path.
+
+## Seeded simulator
+
+`POST /api/simulation` runs one bounded scenario from `trustgraph-sim` with a
+16-bit seed. It returns ordered virtual-time events and local publication
+receipts, never external effects. This exercises the existing coordinator, not
+the generic SDK or arbitrary fault injection. The browser exposes all eight
+predefined scenarios and shows the Rust-returned trace.

@@ -1,44 +1,57 @@
+<p align="center">
+  <img src="docs/assets/trustgraph.svg" alt="TrustGraph: new outputs, same obligations. Two sources combine into a quote whose audience is the intersection of its sources." width="1200" />
+</p>
+
+<p align="center">
+  <a href="https://trustgraph-demo.vercel.app/#lab">Try the dataflow lab</a> ·
+  <a href="https://trustgraph-demo.vercel.app/#simulator">Run the simulator</a> ·
+  <a href="docs/framework.md">Read the framework guide</a> ·
+  <a href="docs/verification.md">Inspect verification scope</a>
+</p>
+
 # TrustGraph
 
-**A Rust framework for typed dataflow with permission-preserving transformations.**
+**A Rust framework that keeps source permissions attached to transformed data.**
 
-Applications combine information: an agent turns documents into a report, a
-pipeline turns tables into an export, or a function turns a request and a price
-sheet into a quote. The output is new, but the restrictions on its inputs must
-not disappear.
+A new report, quote or export doesn't arrive with a list of everything that went
+into it. TrustGraph records that list as a typed dependency graph, then checks the
+whole lineage before the output crosses a boundary.
 
-TrustGraph records **which exact data went into which operation and what came
-out**, then deterministically checks whether that derived data may flow to a
-proposed recipient. It is not a graph database, an LLM judge, or a claim that
-Rust's compiler proves arbitrary permissions.
+Not a graph database. Not an LLM judge. A deterministic permission check over
+recorded computation.
 
-```text
-Request ─────┐
-             ├─ create_quote@1 ─→ Quote ──────┐
-Price sheet ─┘                               ├─ draft_email@1 ─→ Email
-Template ───────────────────────────────────┘
-```
-
-An artifact has an identity and a data type. An operation has named input and
-output ports. An execution connects exact artifact versions through those ports.
-The quote's identity is shared by the first operation's output and the second
-operation's input, like a foreign key joining two rows. Those references form
-the graph; traversal means following them back to the recorded sources.
-
-## The invariant
-
-For the reader-set policy model:
+## The useful part is what survives
 
 ```text
-Readers(output) = intersection(Readers(each input))
-Recipients(destination) must be a subset of Readers(output)
+Source data              Typed operation              Derived data
+───────────              ───────────────              ────────────
+Price sheet ─────┐
+                ├────── create_quote@1 ─────────────── Quote
+Contract ───────┘                                       │
+                                                       └── input to the next step
 ```
 
-If one input permits Sales and Finance, and another permits only Finance, their
-combined output permits only Finance. Every output of an execution conservatively
-inherits every supplied input. The framework does not trust an agent's claim
-that it ignored a sensitive input. Approval is a separate obligation, not a way
-to erase source restrictions.
+An artifact is an exact data version. An operation declares named, typed ports.
+An execution records which artifacts connected to those ports. An output reused
+as the next input keeps the same identity. Follow those references backward and
+you reach its sources.
+
+The permission rule is deliberately small:
+
+```text
+readers(output) = ∩ readers(inputs)
+recipients(action) ⊆ readers(output)
+```
+
+A price sheet readable by **Sales + Finance**, combined with a contract readable
+by **Finance**, produces a quote readable by **Finance**. Every output inherits
+all supplied inputs. A human approval can satisfy a review requirement; it cannot
+erase the source restrictions.
+
+| Build with it | Inspect it | Try to break it |
+| --- | --- | --- |
+| Register typed operations and record their executions. | Follow exact inputs, outputs and permission decisions. | Change a permission, revoke an approval or lose an acknowledgment. |
+| [Rust SDK](crates/trustgraph-framework) | [Interactive graph](https://trustgraph-demo.vercel.app/#lab) | [Deterministic simulator](https://trustgraph-demo.vercel.app/#simulator) |
 
 ## Framework and applications
 
@@ -98,6 +111,35 @@ All data is fictional; no external action occurs.
 cargo run --locked --example framework_server
 # Open http://127.0.0.1:9082
 ```
+
+## Simulation and verification
+
+TrustGraph includes a simulator, not only an interactive graph. The new web
+**Simulator** section runs the existing journaled coordinator under seeded virtual
+time: ACL/revocation races, approval expiry, changed audiences/policies, lost
+provider acknowledgments and journal recovery. The trace shows the actual
+resolved order and local simulated publications. It does not send anything.
+
+```sh
+cargo run --locked -p trustgraph-cli -- simulate --seed 0 --count 64
+cargo run --locked -p trustgraph-cli -- check-model --depth 6
+cargo run --locked -p trustgraph-cli -- check-model --depth 6 --broken-rule
+```
+
+These are distinct layers:
+
+- **Typed-dataflow lab:** actual generic SDK checks on bounded fictional graphs.
+- **Seeded simulator:** actual legacy coordinator with declared scheduling/fault
+  scenarios, not OS threads or real network/DB fault injection.
+- **Finite state exploration:** explores a declared authorization abstraction and
+  calls the production verifier; the deliberately broken rule supplies a useful
+  counterexample control.
+- **Kani harnesses:** bounded proofs of selected production permission functions,
+  not a proof of the entire gateway, external integrations or input capture.
+
+See [verification scope and reproduction](docs/verification.md) for exact proof
+bounds and executed results. See [development checks](docs/development.md#local-checks)
+for saving and replaying simulation campaigns.
 
 ## Existing guided demo
 

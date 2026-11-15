@@ -2032,6 +2032,7 @@ dependencies = [
  "tower",
  "trustgraph-framework",
  "trustgraph-runtime",
+ "trustgraph-sim",
  "vercel_runtime",
 ]
 
