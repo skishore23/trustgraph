@@ -1,0 +1,57 @@
+# Scenario: a mailer agent drafts customer emails from the public price sheet and from private contract terms.
+# Anything sent to a customer is approved by sales first, and contract terms never leave sales and legal.
+version: 1
+
+groups:
+  sales: [leo, dana]
+  legal: [priya]
+  customers: [acme]
+
+agents: [mailer]
+
+sources:
+  price_sheet:        # shared with customers on request
+    readers: [sales, customers]
+    agents: [mailer]
+  contract_terms:     # negotiated terms: sales and legal only
+    readers: [sales, legal]
+    agents: [mailer]
+
+actions:
+  email_customer:
+    agents: [mailer]
+    audience: [customers]
+    approval: { reviewers: [sales], valid_for: 30m }
+  notify_sales:
+    agents: [mailer]
+    audience: [sales]
+  ask_legal:
+    agents: [mailer]
+    audience: [legal]
+
+tests:
+  - name: price quote email needs sales approval
+    output_from: [price_sheet]
+    agent: mailer
+    action: email_customer
+    expect: needs_approval
+  - name: contract terms never reach the customer
+    output_from: [contract_terms]
+    agent: mailer
+    action: email_customer
+    expect: deny
+  - name: price sheet mixed with contract terms never reaches the customer
+    output_from: [price_sheet, contract_terms]
+    agent: mailer
+    action: email_customer
+    expect: deny
+  - name: contract summary can go to sales
+    output_from: [contract_terms]
+    agent: mailer
+    action: notify_sales
+    expect: allow
+  - name: contract question can go to legal
+    output_from: [contract_terms]
+    agent: mailer
+    action: ask_legal
+    expect: allow

@@ -1,0 +1,57 @@
+# Scenario: a support agent answers customer tickets using a public knowledge base and private customer records.
+# Replies to customers are reviewed by support, and customer records may only go to support and billing.
+version: 1
+
+groups:
+  support: [kim, jo]
+  billing: [bea]
+  customers: [globex]
+
+agents: [support_bot]
+
+sources:
+  knowledge_base:     # public help articles
+    readers: [support, customers]
+    agents: [support_bot]
+  customer_records:   # account and payment details
+    readers: [support, billing]
+    agents: [support_bot]
+
+actions:
+  reply_to_ticket:
+    agents: [support_bot]
+    audience: [customers]
+    approval: { reviewers: [support], valid_for: 1h }
+  post_internal_note:
+    agents: [support_bot]
+    audience: [support]
+  escalate_to_billing:
+    agents: [support_bot]
+    audience: [billing]
+
+tests:
+  - name: help article answers need support review
+    output_from: [knowledge_base]
+    agent: support_bot
+    action: reply_to_ticket
+    expect: needs_approval
+  - name: customer records never reach the ticket reply
+    output_from: [customer_records, knowledge_base]
+    agent: support_bot
+    action: reply_to_ticket
+    expect: deny
+  - name: account details can be escalated to billing
+    output_from: [customer_records]
+    agent: support_bot
+    action: escalate_to_billing
+    expect: allow
+  - name: help articles cannot be escalated to billing
+    output_from: [knowledge_base]
+    agent: support_bot
+    action: escalate_to_billing
+    expect: deny
+  - name: records and articles can go in an internal note
+    output_from: [customer_records, knowledge_base]
+    agent: support_bot
+    action: post_internal_note
+    expect: allow

@@ -1,0 +1,17 @@
+# TrustGraph
+
+> TrustGraph is policy-as-code for what AI agents produce. A `trustgraph.policy.yaml` file says which sources an agent may read and where its output may go, and TrustGraph answers allow, needs approval or deny based on what the agent read. Anything the policy does not name is denied.
+
+## Start here
+
+- [Writing policies (agent guide)](docs/agents/writing-policies.md): the file format, the check, test, explain and diff loop, every diagnostic code, and the rules for proposing changes.
+- [Starter policy](crates/trustgraph-policy/starter.policy.yaml): the commented file written by `trustgraph policy init`.
+
+## Examples
+
+- [examples/policies/](examples/policies/): five complete, tested policies (slack-digest, customer-email, pull-request-bot, support-replies, multi-agent-research).
+
+## Commands
+
+- Print the JSON Schema of the policy file: `trustgraph policy schema`
+- Validate, test, explain and compare: `trustgraph policy check FILE`, `trustgraph policy test FILE`, `trustgraph policy explain FILE`, `trustgraph policy diff OLD NEW` (add `--json` for machine output)

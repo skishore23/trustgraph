@@ -1,0 +1,65 @@
+# Scenario: three agents work on market research: one searches public papers, one analyses private data, one writes summaries.
+# Each agent may read only its own sources, and a summary for partners is approved by the research team first.
+version: 1
+
+groups:
+  research: [ana, ben]
+  partners: [northwind]
+  executives: [cho]
+
+agents: [web_researcher, data_analyst, writer]
+
+sources:
+  public_papers:
+    readers: [research, partners, executives]
+    agents: [web_researcher, data_analyst, writer]
+  partner_data:       # shared with us by a partner under NDA
+    readers: [research, partners]
+    agents: [data_analyst, writer]
+  internal_financials:
+    readers: [research, executives]
+    agents: [data_analyst]
+
+actions:
+  publish_partner_brief:
+    agents: [writer, data_analyst]
+    audience: [partners]
+    approval: { reviewers: [research], valid_for: 1h }
+  brief_executives:
+    agents: [writer, data_analyst]
+    audience: [executives]
+  post_research_notes:
+    agents: [web_researcher, data_analyst]
+    audience: [research]
+
+tests:
+  - name: a brief from public papers needs research approval
+    output_from: [public_papers]
+    agent: writer
+    action: publish_partner_brief
+    expect: needs_approval
+  - name: financials never reach partners
+    output_from: [internal_financials, public_papers]
+    agent: data_analyst
+    action: publish_partner_brief
+    expect: deny
+  - name: the web researcher may not read partner data
+    output_from: [partner_data]
+    agent: web_researcher
+    action: post_research_notes
+    expect: deny
+  - name: partner data never reaches executives
+    output_from: [partner_data]
+    agent: writer
+    action: brief_executives
+    expect: deny
+  - name: financials can go to executives
+    output_from: [internal_financials]
+    agent: data_analyst
+    action: brief_executives
+    expect: allow
+  - name: the web researcher can post notes from public papers
+    output_from: [public_papers]
+    agent: web_researcher
+    action: post_research_notes
+    expect: allow

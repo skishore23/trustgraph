@@ -1,0 +1,61 @@
+# Scenario: an internal agent, digest_bot, summarises company documents into Slack digests.
+# The documents have mixed sensitivity, so what it read decides which channel it may post to.
+version: 1
+
+groups:
+  everyone: [maya, omar, sam, ravi, nina]
+  leadership: [maya, omar]
+  engineering: [sam, ravi]
+  hr: [nina]
+
+agents: [digest_bot]
+
+sources:
+  handbook:           # public inside the company
+    readers: [everyone]
+    agents: [digest_bot]
+  eng_updates:        # weekly engineering notes
+    readers: [engineering, leadership]
+    agents: [digest_bot]
+  comp_review:        # compensation review: HR and leadership only
+    readers: [hr, leadership]
+    agents: [digest_bot]
+
+actions:
+  post_all_hands:     # the whole company sees it, so a human checks it first
+    agents: [digest_bot]
+    audience: [everyone]
+    approval: { reviewers: [hr], valid_for: 1h }
+  post_eng_channel:
+    agents: [digest_bot]
+    audience: [engineering]
+  post_leadership_channel:
+    agents: [digest_bot]
+    audience: [leadership]
+
+tests:
+  - name: handbook digest to all hands needs HR sign-off
+    output_from: [handbook]
+    agent: digest_bot
+    action: post_all_hands
+    expect: needs_approval
+  - name: engineering notes can go to the engineering channel
+    output_from: [eng_updates]
+    agent: digest_bot
+    action: post_eng_channel
+    expect: allow
+  - name: compensation data never reaches engineering
+    output_from: [comp_review, eng_updates]
+    agent: digest_bot
+    action: post_eng_channel
+    expect: deny
+  - name: engineering notes never reach all hands
+    output_from: [handbook, eng_updates]
+    agent: digest_bot
+    action: post_all_hands
+    expect: deny
+  - name: compensation data may go to leadership
+    output_from: [comp_review]
+    agent: digest_bot
+    action: post_leadership_channel
+    expect: allow

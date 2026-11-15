@@ -1,0 +1,60 @@
+# Scenario: a coding agent opens pull requests using public specs, internal designs and a private security investigation.
+# Public pull requests are reviewed by engineering first, and nothing from the security investigation may leave the security team.
+version: 1
+
+groups:
+  engineering: [sam, ravi]
+  security: [tess, ivo]
+  contributors: [octo, mina]
+
+agents: [coder]
+
+sources:
+  public_specs:       # published API specs
+    readers: [engineering, security, contributors]
+    agents: [coder]
+  internal_design:    # design docs for unreleased work
+    readers: [engineering, security]
+    agents: [coder]
+  security_investigation:   # an open incident write-up
+    readers: [security]
+    agents: [coder]
+
+actions:
+  open_public_pr:     # visible to outside contributors
+    agents: [coder]
+    audience: [contributors]
+    approval: { reviewers: [engineering], valid_for: 2h }
+  open_internal_pr:
+    agents: [coder]
+    audience: [engineering]
+  post_security_note:
+    agents: [coder]
+    audience: [security]
+
+tests:
+  - name: a public PR built from public specs needs engineering review
+    output_from: [public_specs]
+    agent: coder
+    action: open_public_pr
+    expect: needs_approval
+  - name: internal designs can back an internal PR
+    output_from: [public_specs, internal_design]
+    agent: coder
+    action: open_internal_pr
+    expect: allow
+  - name: internal designs never reach a public PR
+    output_from: [public_specs, internal_design]
+    agent: coder
+    action: open_public_pr
+    expect: deny
+  - name: the security investigation never reaches an internal PR
+    output_from: [security_investigation]
+    agent: coder
+    action: open_internal_pr
+    expect: deny
+  - name: the security investigation can be noted to security
+    output_from: [security_investigation, internal_design]
+    agent: coder
+    action: post_security_note
+    expect: allow
