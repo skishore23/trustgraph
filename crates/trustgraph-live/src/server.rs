@@ -278,6 +278,7 @@ fn routes(shared: Shared) -> Router {
         .route("/api/simulate", post(simulate))
         .route("/api/graph", get(graph))
         .route("/api/work/{id}/gate", post(publication_gate))
+        .route("/api/work/{id}/confirm-failed", post(confirm_failed))
         .route("/api/connections", get(connections))
         .with_state(shared)
 }
@@ -1289,7 +1290,8 @@ async fn publish(
             let intent = w.intent(&artifact, "owner");
             let result = w
                 .gate
-                .publish(&intent, &body.context_digest, &reserve_key, now())?;
+                .publish(&intent, &body.context_digest, &reserve_key, now())
+                .map_err(runtime_error)?;
             let mut deliver = false;
             if let trustgraph_runtime::PublishResult::Operation { operation } = &result {
                 deliver = operation.state == trustgraph_runtime::OperationState::OutcomeUnknown;
@@ -1376,6 +1378,71 @@ async fn publish(
         }
     }
     Ok(Json(response))
+}
+/// Owner-only resolution of an uncertain publication whose GitHub writes never
+/// started (for example, a pre-write check failed after reservation). The
+/// staged payload is cancelled first so it can never be delivered later.
+async fn confirm_failed(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    RoutePath(id): RoutePath<String>,
+) -> WebResult {
+    let state = s.clone();
+    tokio::task::spawn_blocking(move || -> WebResult {
+        let mut w = lock(&state)?;
+        authorized(&h, &w, true)?;
+        let key = w
+            .saved
+            .jobs
+            .iter()
+            .find(|j| j.id == id)
+            .and_then(|j| j.operation.clone())
+            .ok_or_else(|| err("no publication operation for this work"))?;
+        let current = w
+            .gate
+            .state()
+            .operations
+            .get(&key)
+            .map(|op| op.state)
+            .ok_or_else(|| err("publication operation missing"))?;
+        if current != trustgraph_runtime::OperationState::FailedConfirmed {
+            if current != trustgraph_runtime::OperationState::OutcomeUnknown {
+                return Err(WebError(
+                    StatusCode::CONFLICT,
+                    "only an uncertain publication can be confirmed as failed".into(),
+                ));
+            }
+            github::GitHub::new(
+                &w.config.github_repository,
+                w.config.directory.join("publisher"),
+            )?
+            .cancel_undelivered(&key)
+            .map_err(|e| WebError(StatusCode::CONFLICT, e.to_string()))?;
+        }
+        let operation = w
+            .gate
+            .confirm_failed(&"owner".into(), &key, now())
+            .map_err(runtime_error)?;
+        record_operation(&mut w, &id, &key, operation.state)?;
+        Ok(Json(serde_json::to_value(
+            trustgraph_runtime::PublishResult::Operation {
+                operation: Box::new(operation),
+            },
+        )?))
+    })
+    .await?
+}
+fn runtime_error(e: trustgraph_runtime::Error) -> WebError {
+    match e {
+        trustgraph_runtime::Error::Conflict => WebError(
+            StatusCode::CONFLICT,
+            "conflict: this exact change already has a reserved, in-flight, published or uncertain publication, or the request does not match it".into(),
+        ),
+        trustgraph_runtime::Error::Unauthorized => {
+            WebError(StatusCode::FORBIDDEN, e.to_string())
+        }
+        other => WebError::bad(other.to_string()),
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2370,6 +2437,7 @@ mod router_tests {
             ),
             (Method::POST, "/api/work/job-1/gate", Some(review.clone())),
             (Method::POST, "/api/work/job-1/revise", Some(review)),
+            (Method::POST, "/api/work/job-1/confirm-failed", None),
             (
                 Method::POST,
                 "/api/policy",

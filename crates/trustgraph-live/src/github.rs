@@ -167,6 +167,22 @@ impl GitHub {
             && !self.attempt_path(key).exists()
             && !self.ack_path(key).exists()
     }
+    /// Permanently prevent delivery of an operation whose writes never started.
+    /// Fails if a delivery attempt (or receipt) already exists, because GitHub
+    /// may then hold the change and a failure cannot be confirmed.
+    pub fn cancel_undelivered(&self, key: &str) -> Result<()> {
+        use std::io::Write;
+        if self.ack_path(key).exists() {
+            return Err(err("publication receipt exists; it was delivered"));
+        }
+        let mut marker = private_file(&self.attempt_path(key)).map_err(|_| {
+            err("a GitHub write may have started; failure cannot be confirmed locally")
+        })?;
+        marker.write_all(br#"{"cancelled_before_delivery":true}"#)?;
+        marker.sync_all()?;
+        File::open(&self.directory)?.sync_all()?;
+        Ok(())
+    }
     /// Perform the GitHub writes for a reserved operation, outside the workspace lock.
     /// Never resends: once the first write may have started, delivery is refused.
     pub fn deliver(&self, key: &str) -> Result<Acknowledgment> {
@@ -354,5 +370,18 @@ mod tests {
         assert!(!github.deliverable("op-2"));
         assert!(github.deliver("op-2").is_err());
         assert!(github.lookup("op-2").unwrap().is_none());
+        assert!(
+            github.cancel_undelivered("op-2").is_err(),
+            "a started attempt cannot be confirmed failed"
+        );
+        let mut later = good.clone();
+        later.operation = "op-3".into();
+        assert_eq!(github.send(&later).unwrap().0, Outcome::Unknown);
+        github.cancel_undelivered("op-3").unwrap();
+        assert!(
+            !github.deliverable("op-3"),
+            "cancelled payload is never delivered"
+        );
+        assert!(github.deliver("op-3").is_err());
     }
 }

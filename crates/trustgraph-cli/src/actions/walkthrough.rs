@@ -1,7 +1,8 @@
 //! UI-driven scenarios over the same persistent approval and publication gate.
 use super::*;
 
-const SOURCE: &str = "https://factory.8090.ai/project/6b23e5ca-1d03-46a7-93dd-6a3608432db7/agents/bf1869b5-51d0-4d54-963f-b8ef8a46e312";
+const DEFAULT_SOURCE: &str = "https://factory.8090.ai/";
+const DEFAULT_COMPOSIO: &str = "https://dashboard.composio.dev/";
 
 pub(super) fn metadata(app: &App) -> Value {
     let receipt = app
@@ -12,8 +13,8 @@ pub(super) fn metadata(app: &App) -> Value {
         .filter_map(|op| op.receipt.as_ref())
         .filter(|r| !r.simulated)
         .max_by_key(|r| r.observed_at);
-    json!({"source_url":SOURCE,
-        "composio_url":"https://dashboard.composio.dev/shimikeri-kishore/~/connect/clients",
+    json!({"source_url":app.config.source_url.as_deref().unwrap_or(DEFAULT_SOURCE),
+        "composio_url":app.config.composio_dashboard_url.as_deref().unwrap_or(DEFAULT_COMPOSIO),
         "github_url":format!("https://github.com/{}/issues",app.config.github_repository),
         "verified_receipt":receipt,
         "source_label":"Saved native 8090 draft"})

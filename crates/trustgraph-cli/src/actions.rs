@@ -25,6 +25,8 @@ use trustgraph_runtime::{
     publisher::{Acknowledgment, Outcome, Payload, Publisher},
 };
 
+use trustgraph_live::auth::OwnerSessions;
+
 const TOOL: &str = "GITHUB_CREATE_AN_ISSUE";
 const COMPOSIO: &str = "https://backend.composio.dev";
 type Result<T> = std::result::Result<T, Error>;
@@ -69,6 +71,12 @@ pub struct Config {
     pub tool_schema_hash: Option<String>,
     #[serde(default)]
     pub agent_public_url: Option<String>,
+    /// Optional HTTPS link to the Composio dashboard shown in the walkthrough.
+    #[serde(default)]
+    pub composio_dashboard_url: Option<String>,
+    /// Optional HTTPS link to the native agent draft shown in the walkthrough.
+    #[serde(default)]
+    pub source_url: Option<String>,
 }
 impl Config {
     fn validate(&self) -> Result<()> {
@@ -121,6 +129,19 @@ impl Config {
         }
         if let Some(origin) = &self.agent_public_url {
             public_origin(origin)?;
+        }
+        for link in [&self.composio_dashboard_url, &self.source_url]
+            .into_iter()
+            .flatten()
+        {
+            let url = reqwest::Url::parse(link).map_err(storage)?;
+            if url.scheme() != "https"
+                || url.host_str().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+            {
+                return Err(invalid("walkthrough links must be HTTPS URLs"));
+            }
         }
         Ok(())
     }
@@ -407,8 +428,11 @@ impl Publisher for IssuePublisher {
 struct App {
     config: Config,
     gate: Gate,
-    owner: String,
+    /// Single-use launch secret and operator sessions. Never a bearer token.
+    owner: OwnerSessions,
     agent: String,
+    owner_port: u16,
+    agent_port: u16,
 }
 fn now() -> u64 {
     SystemTime::now()
@@ -441,22 +465,18 @@ fn private_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 fn capability(path: &Path) -> Result<String> {
-    if !path.exists() {
-        let value = format!(
-            "{}{}",
-            uuid::Uuid::new_v4().simple(),
-            uuid::Uuid::new_v4().simple()
-        );
-        let mut file = private_options()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .map_err(storage)?;
-        file.write_all(value.as_bytes())
-            .and_then(|_| file.sync_all())
-            .map_err(storage)?;
-    }
-    crate::mcp::read_token(path).map_err(storage)
+    trustgraph_live::auth::capability_file(path).map_err(storage)
+}
+/// Operator cookies ignore ports; scope them by state, configuration and port.
+fn owner_sessions(config: &Config, port: u16) -> OwnerSessions {
+    let scope = digest::structured(
+        "issue-operator-session",
+        &(&config.directory, config.scope()),
+    );
+    OwnerSessions::new(
+        &format!("actions_{}_{port}", &scope.0[..16]),
+        trustgraph_live::auth::SESSION_LIFETIME,
+    )
 }
 fn public_origin(value: &str) -> Result<reqwest::Url> {
     let url = reqwest::Url::parse(value).map_err(storage)?;
@@ -515,14 +535,17 @@ fn genesis(config: &Config) -> Evidence {
         revoked: BTreeSet::new(),
     }
 }
-fn open(config: Config) -> Result<Shared> {
+fn open(config: Config, owner_port: u16, agent_port: u16) -> Result<Shared> {
     config.validate()?;
     private_directory(&config.directory)?;
-    let owner = capability(&config.directory.join("owner-token"))?;
-    let agent = capability(&config.directory.join("agent-token"))?;
-    if owner == agent {
-        return Err(invalid("owner and agent capabilities must differ"));
+    // Earlier versions kept a reusable owner token on disk; operator authority
+    // is now a per-start, single-use launch secret held only in memory.
+    let legacy = config.directory.join("owner-token");
+    if fs::symlink_metadata(&legacy).is_ok() {
+        fs::remove_file(&legacy).map_err(storage)?;
     }
+    let agent = capability(&config.directory.join("agent-token"))?;
+    let owner = owner_sessions(&config, owner_port);
     let gate = Coordinator::open_with_evidence(
         DiskJournal::open(&config.directory.join("journal"))?,
         IssuePublisher::new(config.clone())?,
@@ -541,6 +564,8 @@ fn open(config: Config) -> Result<Shared> {
         gate,
         owner,
         agent,
+        owner_port,
+        agent_port,
     })))
 }
 fn intent(artifact: &ArtifactId) -> Intent {
@@ -698,14 +723,20 @@ impl IntoResponse for WebError {
     }
 }
 type WebResult = std::result::Result<Json<Value>, WebError>;
+/// Owner routes (owner port) accept only an operator session cookie. Agent
+/// routes (agent port or configured public origin) accept only the agent bearer.
 fn auth(headers: &HeaderMap, app: &App, owner: bool) -> Result<()> {
+    use trustgraph_live::auth as a;
+    let port = if owner {
+        app.owner_port
+    } else {
+        app.agent_port
+    };
     let host = headers
         .get(header::HOST)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
-    let local = host.split_once(':').is_some_and(|(name, port)| {
-        matches!(name, "localhost" | "127.0.0.1") && port.parse::<u16>().is_ok()
-    });
+    let local = a::loopback_host(headers, port).is_some();
     let remote = !owner
         && app
             .config
@@ -716,41 +747,19 @@ fn auth(headers: &HeaderMap, app: &App, owner: bool) -> Result<()> {
     if !local && !remote {
         return Err(Error::Unauthorized);
     }
-    if let Some(origin) = headers.get(header::ORIGIN)
-        && (!owner || origin.to_str().ok() != Some(format!("http://{host}").as_str()))
-    {
+    if headers.get(header::ORIGIN).is_some() && (!owner || !a::same_origin(headers, host)) {
         return Err(Error::Unauthorized);
     }
-    let bearer = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    let cookie = headers
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| {
-            s.split(';')
-                .map(str::trim)
-                .find_map(|s| s.strip_prefix(&format!("{}=", cookie_name(app))))
-        });
-    if (owner && (bearer == Some(app.owner.as_str()) || cookie == Some(app.owner.as_str())))
-        || (!owner && bearer == Some(app.agent.as_str()))
-    {
+    let allowed = if owner {
+        app.owner.valid(headers)
+    } else {
+        a::bearer(headers).is_some_and(|t| a::constant_time_eq(t.as_bytes(), app.agent.as_bytes()))
+    };
+    if allowed {
         Ok(())
     } else {
         Err(Error::Unauthorized)
     }
-}
-fn cookie_name(app: &App) -> String {
-    // Cookies are shared across ports. Keep live and preview sessions separate.
-    format!(
-        "trustgraph_actions_{}",
-        &digest::structured(
-            "issue-operator-session",
-            &(&app.config.directory, app.config.scope())
-        )
-        .0[..16]
-    )
 }
 async fn locked<F>(shared: Shared, operation: F) -> WebResult
 where
@@ -971,17 +980,25 @@ async fn session(
     let app = shared
         .lock()
         .map_err(|_| WebError(invalid("workspace unavailable")))?;
-    auth(&headers, &app, true)?;
+    use trustgraph_live::auth as a;
+    let host = a::loopback_host(&headers, app.owner_port).ok_or(Error::Unauthorized)?;
+    if !a::same_origin(&headers, host) {
+        return Err(WebError(Error::Unauthorized));
+    }
+    if app.owner.valid(&headers) {
+        return Ok((
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(json!({"authenticated":true})),
+        )
+            .into_response());
+    }
+    // Exchange the single-use launch secret once for a session cookie.
+    let cookie = a::bearer(&headers)
+        .and_then(|secret| app.owner.exchange(secret))
+        .ok_or(Error::Unauthorized)?;
     Ok((
         [
-            (
-                header::SET_COOKIE,
-                format!(
-                    "{}={}; HttpOnly; SameSite=Strict; Path=/",
-                    cookie_name(&app),
-                    app.owner
-                ),
-            ),
+            (header::SET_COOKIE, cookie),
             (header::CACHE_CONTROL, "no-store".into()),
         ],
         Json(json!({"authenticated":true})),
@@ -1038,18 +1055,27 @@ pub async fn serve(
     let config: Config = serde_json::from_slice(&fs::read(path)?)?;
     let directory = config.directory.clone();
     let mode = config.mode.clone();
-    let shared = tokio::task::spawn_blocking(move || open(config)).await??;
+    if port == agent_port {
+        return Err("operator and agent ports must differ".into());
+    }
+    let shared = tokio::task::spawn_blocking(move || open(config, port, agent_port)).await??;
     let (owner, agent) = routers(shared.clone());
     let owner_listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     let agent_listener = tokio::net::TcpListener::bind(("127.0.0.1", agent_port)).await?;
     let operator_file = directory.join("operator.html");
-    let owner_token = shared
-        .lock()
-        .map_err(|_| "workspace unavailable")?
-        .owner
-        .clone();
-    private_options().write(true).create(true).truncate(true).open(&operator_file)?.write_all(format!(
-        "<!doctype html><meta http-equiv=refresh content=\"0;url=http://127.0.0.1:{port}/#{}\">",owner_token).as_bytes())?;
+    {
+        let app = shared.lock().map_err(|_| "workspace unavailable")?;
+        let secret = app
+            .owner
+            .launch_secret()
+            .ok_or("operator launch secret unavailable")?;
+        app.owner.write_launch_file(
+            &operator_file,
+            &format!(
+                "<!doctype html><meta name=referrer content=no-referrer><meta http-equiv=refresh content=\"0;url=http://127.0.0.1:{port}/#{secret}\">"
+            ),
+        )?;
+    }
     println!(
         "TrustGraph issue actions ({mode:?}): http://127.0.0.1:{port}\nOperator sign-in: {}\nAgent API: http://127.0.0.1:{agent_port}/api/actions\nAgent token file: {}",
         operator_file.display(),
@@ -1088,6 +1114,8 @@ mod tests {
             composio_transport: Transport::ProjectApi,
             tool_schema_hash: None,
             agent_public_url: None,
+            composio_dashboard_url: None,
+            source_url: None,
         };
         if let Some(hash) = schema {
             config.composio_transport = Transport::ConnectMcp;
@@ -1110,12 +1138,27 @@ mod tests {
             genesis(&config),
         )
         .unwrap();
+        // Sign the operator in the same way a browser does: exchange the
+        // single-use launch secret once for a session cookie.
+        let owner = owner_sessions(&config, 8084);
+        let launch = owner.launch_secret().unwrap();
+        let cookie = owner.exchange(&launch).unwrap();
+        OWNER_COOKIE.with(|c| *c.borrow_mut() = cookie.split(';').next().unwrap().to_owned());
         Arc::new(Mutex::new(App {
             config,
             gate,
-            owner: OWNER.into(),
+            owner,
             agent: AGENT.into(),
+            owner_port: 8084,
+            agent_port: 8085,
         }))
+    }
+    thread_local! {
+        /// Session cookie of the most recently configured test workspace.
+        static OWNER_COOKIE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    }
+    fn owner_cookie() -> String {
+        OWNER_COOKIE.with(|c| c.borrow().clone())
     }
     fn proposal() -> Value {
         json!({"key":"wo-2-issue","title":"Fix zero-value authorization","body":"Fictional test body", "work_order":{"project_id":"project-1","id":"WO-2"}})
@@ -1127,14 +1170,22 @@ mod tests {
         path: &str,
         value: Value,
     ) -> (StatusCode, Value) {
+        // OWNER stands for the signed-in operator: it is sent as the session
+        // cookie on the operator port, never as a bearer token.
+        let builder = Request::builder().method(method).uri(path);
+        let builder = if token == OWNER {
+            builder
+                .header(header::HOST, "127.0.0.1:8084")
+                .header(header::COOKIE, owner_cookie())
+        } else {
+            builder
+                .header(header::HOST, "127.0.0.1:8085")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        };
         let response = router
             .clone()
             .oneshot(
-                Request::builder()
-                    .method(method)
-                    .uri(path)
-                    .header(header::HOST, "127.0.0.1:8085")
-                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                builder
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(value.to_string()))
                     .unwrap(),
@@ -1559,29 +1610,7 @@ mod tests {
         let mut routers_to_check = Vec::new();
         for directory in [first.path(), second.path()] {
             let (owner, _) = routers(configured(directory, "http://127.0.0.1:1"));
-            let response = owner
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/api/session")
-                        .header(header::HOST, "127.0.0.1:18084")
-                        .header(header::AUTHORIZATION, format!("Bearer {OWNER}"))
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            cookies.push(
-                response.headers()[header::SET_COOKIE]
-                    .to_str()
-                    .unwrap()
-                    .split(';')
-                    .next()
-                    .unwrap()
-                    .to_owned(),
-            );
+            cookies.push(owner_cookie());
             routers_to_check.push(owner);
         }
         assert_ne!(cookies[0].split('=').next(), cookies[1].split('=').next());
@@ -1590,7 +1619,7 @@ mod tests {
                 .oneshot(
                     Request::builder()
                         .uri("/api/actions")
-                        .header(header::HOST, "127.0.0.1:18084")
+                        .header(header::HOST, "127.0.0.1:8084")
                         .header(header::COOKIE, cookies.join("; "))
                         .body(Body::empty())
                         .unwrap(),
@@ -1599,6 +1628,125 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
         }
+    }
+
+    #[tokio::test]
+    async fn owner_routes_need_a_session_from_a_single_use_launch_secret() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = configured(directory.path(), "http://127.0.0.1:1");
+        let (owner, agent) = routers(shared.clone());
+        let launch = {
+            let mut app = shared.lock().unwrap();
+            app.owner = owner_sessions(&app.config, 8084);
+            app.owner.launch_secret().unwrap()
+        };
+        let call = |router: &Router,
+                    method: &str,
+                    path: &str,
+                    host: &str,
+                    auth: (header::HeaderName, String)| {
+            router.clone().oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(header::HOST, host)
+                    .header(auth.0, auth.1)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"revision":1,"context_digest":"x"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+        };
+        for path in [
+            "/api/actions",
+            "/api/actions/wo-2-issue/approve",
+            "/api/actions/wo-2-issue/execute",
+        ] {
+            let method = if path == "/api/actions" {
+                "GET"
+            } else {
+                "POST"
+            };
+            for token in [AGENT, launch.as_str()] {
+                let reply = call(
+                    &owner,
+                    method,
+                    path,
+                    "127.0.0.1:8084",
+                    (header::AUTHORIZATION, format!("Bearer {token}")),
+                )
+                .await
+                .unwrap();
+                assert_eq!(reply.status(), StatusCode::UNAUTHORIZED, "{path}");
+            }
+        }
+        // The agent port refuses the agent token under a wrong port.
+        let reply = call(
+            &agent,
+            "GET",
+            "/api/actions",
+            "127.0.0.1:8084",
+            (header::AUTHORIZATION, format!("Bearer {AGENT}")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply.status(), StatusCode::UNAUTHORIZED);
+        let reply = call(
+            &owner,
+            "POST",
+            "/api/session",
+            "127.0.0.1:8084",
+            (header::AUTHORIZATION, format!("Bearer {launch}")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply.status(), StatusCode::OK);
+        let cookie = reply.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict"));
+        assert!(!cookie.contains(&launch));
+        let session = cookie.split(';').next().unwrap().to_owned();
+        let again = call(
+            &owner,
+            "POST",
+            "/api/session",
+            "127.0.0.1:8084",
+            (header::AUTHORIZATION, format!("Bearer {launch}")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            again.status(),
+            StatusCode::UNAUTHORIZED,
+            "launch secret is single-use"
+        );
+        let reply = call(
+            &owner,
+            "GET",
+            "/api/actions",
+            "127.0.0.1:8084",
+            (header::COOKIE, session.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply.status(), StatusCode::OK);
+        let reply = call(
+            &owner,
+            "GET",
+            "/api/actions",
+            "127.0.0.1:9999",
+            (header::COOKIE, session),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reply.status(),
+            StatusCode::UNAUTHORIZED,
+            "owner port is strict"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1844,7 +1992,7 @@ mod tests {
             "directory":directory.path(),"github_repository":"example/demo","mode":"preview"
         }))
         .unwrap();
-        let app = open(config.clone()).unwrap();
+        let app = open(config.clone(), 8084, 8085).unwrap();
         {
             let mut app = app.lock().unwrap();
             app.gate
@@ -1852,7 +2000,7 @@ mod tests {
                 .unwrap();
         }
         drop(app);
-        let app = open(config).unwrap();
+        let app = open(config, 8084, 8085).unwrap();
         assert!(!permission_granted(&app.lock().unwrap()).unwrap());
     }
 
@@ -2158,6 +2306,8 @@ mod tests {
             composio_transport: Transport::ProjectApi,
             tool_schema_hash: None,
             agent_public_url: None,
+            composio_dashboard_url: None,
+            source_url: None,
         };
         let original = config.scope();
         for changed in [
@@ -2180,13 +2330,17 @@ mod tests {
         ] {
             assert_ne!(changed.scope(), original);
         }
-        let opened = open(config.clone()).unwrap();
+        let opened = open(config.clone(), 8084, 8085).unwrap();
         drop(opened);
         assert!(
-            open(Config {
-                github_repository: "other/repo".into(),
-                ..config
-            })
+            open(
+                Config {
+                    github_repository: "other/repo".into(),
+                    ..config
+                },
+                8084,
+                8085
+            )
             .is_err()
         );
     }
