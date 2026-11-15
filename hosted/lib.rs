@@ -52,11 +52,13 @@ fn evaluate(request: DemoRequest) -> Result<Value, Error> {
         ));
     }
     let mut story = Story::new()?;
+    // Replay without per-step views; build exactly one view at the end.
     for command in request.history {
-        story.execute(command)?;
+        story.replay(command)?;
     }
     if let Some(command) = request.command {
-        story.execute(command)
+        story.replay(command)?;
+        Ok(story.view())
     } else if let Some(comparison) = request.comparison {
         story.compare(&comparison.policy, &comparison.scenario)
     } else {

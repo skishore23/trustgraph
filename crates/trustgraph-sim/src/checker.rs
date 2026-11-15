@@ -168,6 +168,21 @@ fn materialize(base: &Evidence, s: State) -> Evidence {
     e.complete = s.complete;
     e
 }
+fn declared_readers(base: &Evidence, kind: Kind) -> Readers {
+    let mut sources = vec!["task-prompt", "roadmap"];
+    if kind == Kind::Mixed {
+        sources.push("launch-plan");
+    }
+    sources
+        .into_iter()
+        .map(|id| {
+            base.acls[&base.sources[&SourceId::from(id)].acl]
+                .readers
+                .clone()
+        })
+        .reduce(|a, b| a.intersection(&b).cloned().collect())
+        .unwrap_or_default()
+}
 fn decision_label(d: &Decision) -> String {
     match d {
         Decision::Ready { .. } => "READY".into(),
@@ -250,15 +265,12 @@ pub fn check(max_depth: u8, rule: Rule) -> Result<CheckReport, String> {
                 };
                 if allowed {
                     report.publications += 1;
-                    // Independent predicates over the finite world's literal
-                    // membership masks and exact version/destination stamp.
-                    let readers = if state.kind == Kind::Public {
-                        0b111_u8
-                    } else {
-                        0b011
-                    };
-                    let recipients = if state.audience == 0 { 0b111_u8 } else { 0b011 };
-                    let violation = if recipients & !readers != 0 {
+                    // Independent predicates over the fixture's declared source
+                    // ACLs and audience membership (plain std set operations,
+                    // not the lineage walker) and the exact version/destination stamp.
+                    let readers = declared_readers(&base, state.kind);
+                    let recipients = &base.audiences[&intent(state).audience].recipients;
+                    let violation = if !recipients.is_subset(&readers) {
                         Some("UNAUTHORIZED_AUDIENCE")
                     } else if state.approval
                         != Some(Stamp {

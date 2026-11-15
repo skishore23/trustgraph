@@ -307,11 +307,14 @@ fn apply(world: &mut World, policy: &StoryPolicy) -> Result<(), Error> {
     let revision = world.state().evidence.policy.revision;
     world.activate_policy(&"maya".into(), &version.spec.id, revision)
 }
+/// Releases are executed by a human governance principal; the agent only
+/// generates and revises work (see `verify`: agents never receive Ready).
+const RELEASER: &str = "maya";
 fn intent(id: &ArtifactId, destination: &str) -> Intent {
     Intent {
         artifact: id.clone(),
         audience: destination.into(),
-        requester: "agent".into(),
+        requester: RELEASER.into(),
     }
 }
 fn content(approved: bool) -> String {
@@ -576,7 +579,21 @@ impl Story {
             "policy_activated":false,"external_writes":0,"generation":"hypothetical","deterministic":true}),
         )
     }
+    /// Execute one command and return the full story view.
     pub fn execute(&mut self, command: Command) -> Result<Value, Error> {
+        self.replay(command)?;
+        Ok(self.view())
+    }
+    /// Execute one command without building the view. Replaying a client
+    /// history should call this per step and `view()` once at the end.
+    pub fn replay(&mut self, command: Command) -> Result<(), Error> {
+        if let Command::Approve { expected, .. } | Command::Release { expected, .. } = &command
+            && !expected.is_canonical()
+        {
+            return Err(Error::Invalid(
+                "Context digest must be 64 lowercase hexadecimal characters.".into(),
+            ));
+        }
         match command {
             Command::Activate {
                 policy,
@@ -637,10 +654,7 @@ impl Story {
                     &PrincipalId(reviewer.clone()),
                     &intent(&artifact, "engineering"),
                     &expected,
-                    &format!(
-                        "tg104-v{version}-{}",
-                        &expected.0[..16.min(expected.0.len())]
-                    ),
+                    &format!("tg104-v{version}-{}", expected.prefix(16)),
                     CLOCK,
                 )?;
                 self.events.push(format!("{reviewer} approved the exact TG-104 version {version}, destination and policy context."));
@@ -650,7 +664,7 @@ impl Story {
                 let key = format!(
                     "tg104-release-v{}-{}",
                     self.versions.len(),
-                    &expected.0[..16.min(expected.0.len())]
+                    expected.prefix(16)
                 );
                 match self.world.publish(
                     &intent(&artifact, "engineering"),
@@ -713,7 +727,7 @@ impl Story {
                 self.events.push(format!("Version {version} adds a contractor toggle. The previous exact approval does not cover these new bytes."));
             }
         }
-        Ok(self.view())
+        Ok(())
     }
     fn check_revision(&self, expected: u64) -> Result<(), Error> {
         if self.world.state().evidence.policy.revision - 1 != expected {

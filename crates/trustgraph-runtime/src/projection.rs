@@ -56,6 +56,26 @@ impl Relation {
             Self::Includes => "INCLUDES",
         }
     }
+    /// Binds existing records and merges the edge, so a retried projection
+    /// neither duplicates relationships nor creates anonymous endpoint nodes.
+    fn edge_query(self) -> String {
+        format!(
+            "UNWIND $rows AS row MATCH (a:TrustGraphRecord {{id: row.src}}), (b:TrustGraphRecord {{id: row.dst}}) MERGE (a)-[:{}]->(b)",
+            self.name()
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Relation;
+    #[test]
+    fn edge_writes_match_existing_records_and_merge_relationships() {
+        let query = Relation::Approves.edge_query();
+        assert!(query.contains("MATCH (a:TrustGraphRecord {id: row.src})"));
+        assert!(query.contains("MERGE (a)-[:APPROVES]->(b)"));
+        assert!(!query.contains("CREATE"));
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Projection {
@@ -244,11 +264,8 @@ impl HydraClient {
                     .map(|edge| json!({"src":edge.src,"dst":edge.dst}))
                     .collect();
                 // Relation identifiers are a closed enum; only values are parameters.
-                let query = format!(
-                    "UNWIND $rows AS row CREATE (a {{id: row.src}})-[:{}]->(b {{id: row.dst}})",
-                    relation.name()
-                );
-                self.mutate(&query, json!({"rows":rows})).await?;
+                self.mutate(&relation.edge_query(), json!({"rows":rows}))
+                    .await?;
             }
         }
         self.validate_projection(projection, false).await?;

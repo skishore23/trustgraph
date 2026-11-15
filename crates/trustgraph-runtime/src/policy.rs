@@ -147,7 +147,7 @@ pub fn compile(
         }
         if !readers.is_subset(&source_authority[id]) {
             return Err(invalid(
-                "policy cannot grant source access beyond its authoritative ceiling",
+                "policy cannot grant source access beyond its authoritative ceiling or an explicit source restriction",
             ));
         }
         let source = e.sources.get(id).ok_or(Error::NotFound)?;
@@ -176,20 +176,21 @@ pub fn compile(
             .into_iter()
             .filter(|id| e.principals[id].role == Role::Human)
             .collect();
-        if recipients.is_empty() || recipients != destination_authority[id].recipients {
+        // The current audience is the actual (possibly reviewer-narrowed)
+        // membership: a policy must name it exactly, so activation can neither
+        // hide recipients nor re-grant ceiling recipients or move the destination.
+        let current = e.audiences.get(id).ok_or(Error::NotFound)?;
+        if recipients.is_empty()
+            || recipients != current.recipients
+            || !recipients.is_subset(&destination_authority[id].recipients)
+        {
             return Err(invalid(
-                "destination audience must match authoritative membership; policy cannot hide actual recipients",
+                "destination audience must match actual membership; policy cannot hide or re-grant recipients",
             ));
         }
-        let mut a = destination_authority[id].clone();
+        let mut a = current.clone();
         a.recipients = recipients;
-        a.revision = e
-            .audiences
-            .get(id)
-            .ok_or(Error::NotFound)?
-            .revision
-            .checked_add(1)
-            .ok_or(Error::Conflict)?;
+        a.revision = current.revision.checked_add(1).ok_or(Error::Conflict)?;
         a.resolved = true;
         audiences.insert(id.clone(), a);
     }
@@ -235,7 +236,7 @@ impl<J: Journal, P: Publisher> Coordinator<J, P> {
         compile(
             &self.state.evidence,
             &spec,
-            &self.state.source_authority,
+            &self.state.source_bounds(),
             &self.state.destination_authority,
         )?;
         let digest = digest::structured("policy-package", &spec);
@@ -278,7 +279,7 @@ impl<J: Journal, P: Publisher> Coordinator<J, P> {
         let snapshot = compile(
             &self.state.evidence,
             &version.spec,
-            &self.state.source_authority,
+            &self.state.source_bounds(),
             &self.state.destination_authority,
         )?;
         self.commit(Event::PolicyActivated {
@@ -313,7 +314,7 @@ pub(crate) fn reduce(state: &mut State, event: &Event) -> Result<(), Error> {
             compile(
                 &state.evidence,
                 &version.spec,
-                &state.source_authority,
+                &state.source_bounds(),
                 &state.destination_authority,
             )?;
             state
@@ -341,7 +342,7 @@ pub(crate) fn reduce(state: &mut State, event: &Event) -> Result<(), Error> {
             let expected = compile(
                 &state.evidence,
                 &version.spec,
-                &state.source_authority,
+                &state.source_bounds(),
                 &state.destination_authority,
             )?;
             if expected != **snapshot {

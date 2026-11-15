@@ -57,6 +57,7 @@ impl<J: Journal, P: Publisher> Coordinator<J, P> {
                 })
                 .collect(),
             destination_authority: evidence.audiences.clone(),
+            source_restrictions: Default::default(),
         };
         for event in events.iter().skip(1) {
             reduce(&mut state, event)?;
@@ -116,15 +117,19 @@ impl<J: Journal, P: Publisher> Coordinator<J, P> {
             content,
             Origin::Source(SourceId(id.0.clone())),
         );
+        let acl_id = AclId(format!("acl-{}", id.0));
         if let Some(old) = self.state.evidence.artifacts.get(&id) {
-            return if old == &artifact {
+            // An idempotent retry must repeat the original import exactly;
+            // different readers are a conflicting claim, never silently ignored.
+            let original = self.state.evidence.acls.get(&acl_id).map(|a| &a.readers);
+            return if old == &artifact && original == Some(&readers) {
                 Ok(id)
             } else {
                 Err(Error::Conflict)
             };
         }
         let acl = Acl {
-            id: AclId(format!("acl-{}", id.0)),
+            id: acl_id,
             workspace: self.state.evidence.workspace.clone(),
             revision: 1,
             readers,
@@ -480,7 +485,7 @@ impl<J: Journal, P: Publisher> Coordinator<J, P> {
             .state
             .destination_authority
             .get(&audience.id)
-            .is_some_and(|ceiling| audience.recipients.is_subset(&ceiling.recipients))
+            .is_some_and(|ceiling| within_destination_authority(&audience, ceiling))
         {
             return Err(Error::Unauthorized);
         }
@@ -490,10 +495,7 @@ impl<J: Journal, P: Publisher> Coordinator<J, P> {
             .audiences
             .get(&audience.id)
             .ok_or(Error::NotFound)?;
-        if audience.workspace != old.workspace
-            || audience.revision != old.revision
-            || !audience.destination.starts_with("sim://northstar/")
-        {
+        if audience.workspace != old.workspace || audience.revision != old.revision {
             return Err(Error::Conflict);
         }
         audience.revision = audience.revision.checked_add(1).ok_or(Error::Conflict)?;
@@ -518,6 +520,25 @@ impl<J: Journal, P: Publisher> Coordinator<J, P> {
             .get(id)
             .ok_or(Error::NotFound)?
             .clone();
+        let e = &self.state.evidence;
+        let remaining_approvers = e
+            .policy
+            .approvers
+            .iter()
+            .filter(|a| *a != id)
+            .filter(|a| {
+                e.principals.get(*a).is_some_and(|p| {
+                    p.enabled && p.role == Role::Human && p.workspace == e.workspace
+                })
+            })
+            .count();
+        if id.0 == crate::policy::administrator(e)
+            || (e.policy.approvers.contains(id) && remaining_approvers == 0)
+        {
+            return Err(Error::Invalid(
+                "cannot disable the policy administrator or the last enabled approver".into(),
+            ));
+        }
         principal.enabled = false;
         self.commit(Event::PrincipalUpdated { principal })
     }
@@ -547,6 +568,18 @@ impl<J: Journal, P: Publisher> Coordinator<J, P> {
             }
         };
         if verified.context().digest() != *expected {
+            return Err(Error::Conflict);
+        }
+        // Caller keys only deduplicate retries. The same bytes may not be sent
+        // to the same audience and destination again under a fresh key while an
+        // earlier operation published, may have published, or is in flight.
+        let context = verified.context();
+        if publication_in_flight(
+            &self.state,
+            &context.artifact_hash,
+            &context.audience.id,
+            &context.audience.destination,
+        ) {
             return Err(Error::Conflict);
         }
         let mut operation = Operation {
@@ -631,6 +664,67 @@ impl<J: Journal, P: Publisher> Coordinator<J, P> {
         }
         Ok(operation)
     }
+    /// Operator resolution of an `OutcomeUnknown` operation. A reviewer (human
+    /// approver) may confirm failure only when the publisher's read-only lookup
+    /// definitively reports no delivery for this operation key. The resolution
+    /// is journaled with its actor; afterwards the (artifact, audience,
+    /// destination) publication guard no longer counts this operation.
+    pub fn confirm_failed(
+        &mut self,
+        actor: &PrincipalId,
+        key: &str,
+        now: u64,
+    ) -> Result<Operation, Error> {
+        self.reviewer(actor)?;
+        let operation = self
+            .state
+            .operations
+            .get(key)
+            .ok_or(Error::NotFound)?
+            .clone();
+        match operation.state {
+            OperationState::FailedConfirmed => return Ok(operation),
+            OperationState::OutcomeUnknown => {}
+            _ => return Err(Error::Conflict),
+        }
+        if self.publisher.lookup(key)?.is_some() {
+            // Delivered after all: reconcile records the receipt instead.
+            return Err(Error::Conflict);
+        }
+        self.commit(Event::OperationFailureConfirmed {
+            key: key.into(),
+            confirmed_by: actor.clone(),
+            at: now,
+        })?;
+        Ok(self.state.operations[key].clone())
+    }
+}
+/// Whether any operation for these exact bytes, audience and destination is
+/// published, may have been published, or is still in flight.
+pub(crate) fn publication_in_flight(
+    state: &State,
+    artifact_hash: &digest::Digest,
+    audience: &AudienceId,
+    destination: &str,
+) -> bool {
+    state.operations.values().any(|op| {
+        op.context.artifact_hash == *artifact_hash
+            && op.context.audience.id == *audience
+            && op.context.audience.destination == destination
+            && matches!(
+                op.state,
+                OperationState::Reserved
+                    | OperationState::Dispatching
+                    | OperationState::Published
+                    | OperationState::OutcomeUnknown
+            )
+    })
+}
+/// Reviewer audience changes may narrow recipients but never move the
+/// destination or exceed the authoritative membership.
+fn within_destination_authority(audience: &Audience, ceiling: &Audience) -> bool {
+    audience.recipients.is_subset(&ceiling.recipients)
+        && audience.destination == ceiling.destination
 }
 pub(crate) fn validate_key(key: &str) -> Result<(), Error> {
     if key.is_empty()
@@ -753,12 +847,15 @@ fn reduce(state: &mut State, event: &Event) -> Result<(), Error> {
             }
             source.acl = acl.id.clone();
             e.acls.insert(acl.id.clone(), acl.clone());
+            state
+                .source_restrictions
+                .insert(source.id.clone(), acl.readers.clone());
         }
         Event::AudienceUpdated { audience } => {
             if !state
                 .destination_authority
                 .get(&audience.id)
-                .is_some_and(|ceiling| audience.recipients.is_subset(&ceiling.recipients))
+                .is_some_and(|ceiling| within_destination_authority(audience, ceiling))
             {
                 return Err(Error::Conflict);
             }
@@ -826,6 +923,26 @@ fn reduce(state: &mut State, event: &Event) -> Result<(), Error> {
                 .operations
                 .insert(operation.key.clone(), *operation.clone());
             crate::submissions::link_operation(state, operation)?;
+        }
+        Event::OperationFailureConfirmed {
+            key,
+            confirmed_by,
+            at,
+        } => {
+            if !e.principals.get(confirmed_by).is_some_and(|p| {
+                p.enabled
+                    && p.role == Role::Human
+                    && p.workspace == e.workspace
+                    && e.policy.approvers.contains(confirmed_by)
+            }) {
+                return Err(Error::Unauthorized);
+            }
+            let operation = state.operations.get_mut(key).ok_or(Error::NotFound)?;
+            if operation.state != OperationState::OutcomeUnknown || operation.receipt.is_some() {
+                return Err(Error::Conflict);
+            }
+            operation.state = OperationState::FailedConfirmed;
+            operation.updated_at = *at;
         }
     }
     Ok(())

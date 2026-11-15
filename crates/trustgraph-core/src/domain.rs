@@ -33,6 +33,7 @@ pub enum Role {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Principal {
     pub id: PrincipalId,
     pub workspace: WorkspaceId,
@@ -48,6 +49,7 @@ pub enum Origin {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Artifact {
     pub id: ArtifactId,
     pub logical_id: String,
@@ -74,6 +76,7 @@ impl Artifact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Acl {
     pub id: AclId,
     pub workspace: WorkspaceId,
@@ -83,6 +86,7 @@ pub struct Acl {
 
 /// Current permission pointer for an immutable source content revision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Source {
     pub id: SourceId,
     pub workspace: WorkspaceId,
@@ -101,6 +105,7 @@ pub enum InputRole {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InputUse {
     pub occurrence: String,
     pub artifact: ArtifactId,
@@ -109,6 +114,7 @@ pub struct InputUse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub complete: bool,
     pub provider: String,
@@ -117,6 +123,7 @@ pub struct Manifest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Transformation {
     pub id: TransformationId,
     pub workspace: WorkspaceId,
@@ -126,6 +133,7 @@ pub struct Transformation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Audience {
     pub id: AudienceId,
     pub workspace: WorkspaceId,
@@ -137,6 +145,7 @@ pub struct Audience {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Policy {
     pub workspace: WorkspaceId,
     pub revision: u64,
@@ -148,6 +157,7 @@ pub struct Policy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Context {
     pub workspace: WorkspaceId,
     pub artifact: ArtifactId,
@@ -165,6 +175,7 @@ impl Context {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Approval {
     pub id: ApprovalId,
     pub signer: PrincipalId,
@@ -174,6 +185,7 @@ pub struct Approval {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Evidence {
     pub workspace: WorkspaceId,
     pub complete: bool,
@@ -189,6 +201,7 @@ pub struct Evidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Intent {
     pub artifact: ArtifactId,
     pub audience: AudienceId,

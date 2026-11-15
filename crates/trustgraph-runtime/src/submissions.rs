@@ -167,6 +167,20 @@ impl<J: Journal, P: Publisher> Coordinator<J, P> {
                 operation: Box::new(operation),
             });
         }
+        // Refuse before recording a fresh approval when these bytes are already
+        // published or in flight to this destination under another key.
+        let evidence = &self.state.evidence;
+        if let (Some(artifact), Some(audience)) = (
+            evidence.artifacts.get(request.artifact()),
+            evidence.audiences.get(&request.audience),
+        ) && crate::engine::publication_in_flight(
+            &self.state,
+            &artifact.hash,
+            &audience.id,
+            &audience.destination,
+        ) {
+            return Err(Error::Conflict);
+        }
         let intent = Intent {
             artifact: request.artifact().clone(),
             audience: request.audience,

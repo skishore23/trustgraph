@@ -157,19 +157,8 @@ fn audience<'a>(
     id: &AudienceId,
     step: &str,
 ) -> Result<&'a Audience, Box<Conflict>> {
-    e.audiences
-        .get(id)
-        .filter(|a| {
-            a.id == *id
-                && a.workspace == e.workspace
-                && a.resolved
-                && !a.recipients.is_empty()
-                && a.recipients.iter().all(|id| {
-                    e.principals
-                        .get(id)
-                        .is_some_and(|p| p.id == *id && p.workspace == e.workspace && p.enabled)
-                })
-        })
+    crate::verifier::resolve_audience(e, id)
+        .ok()
         .ok_or_else(|| {
             problem(
                 PlanCode::AudienceUnknown,
