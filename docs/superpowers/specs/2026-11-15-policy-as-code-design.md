@@ -22,7 +22,7 @@ Approval can satisfy a review rule; it can never widen who may read a source.
 1. One policy file format that a person or an agent can write correctly on the
    first or second try.
 2. Tooling that lets an agent check its own policy without a human: validate,
-   test, explain, diff — all with machine-readable output.
+   test, simulate, explain, diff — all with machine-readable output.
 3. A language-neutral way to use the engine: a local service over HTTP and MCP.
 4. A README and one demo that explain problem → policy → decision in under a
    minute.
@@ -213,6 +213,41 @@ Plus read-only `explain_artifact` (lineage and current readers) and
   `allow`. TrustGraph does not perform the action. This limit is stated in the
   README.
 
+## One runtime, driven by the simulator
+
+Owner requirement: the simulator must run the runtime itself, not a model of it.
+
+- **The runtime core is a deterministic state machine.** Input: the active
+  policy and a stream of events (register source, record output, check,
+  approve, revoke, propose / activate policy, clock tick). Output: decisions
+  and journal entries. No clock, network or disk inside it; all three are
+  passed in.
+- **`serve` = core + real I/O** (wall clock, HTTP / MCP, journal file).
+- **The simulator = the same core + fake I/O**: a seeded clock, a seeded
+  interleaving of concurrent agents and injected faults (crash between journal
+  write and reply, torn journal tail, restart and replay, policy change between
+  a check and the host's act, approval expiry, revocation races). A failing
+  seed replays exactly.
+- **Invariants checked on every simulated step:**
+  1. No `allow` ever names a recipient outside the readers of every source in
+     the output's lineage under the policy active at that moment.
+  2. No approval survives a change to its sources or its action rule.
+  3. Crash + replay reaches the same state and the same next decisions.
+  4. Narrowing a source applies to everything already derived from it.
+  5. Nothing an agent token can call changes the active policy.
+- **`trustgraph policy simulate FILE [--seed N --count K --json]`** runs a
+  user's own policy through seeded scenarios generated from it (including
+  proposed-policy activations mid-run) and reports any violation with its seed.
+  Also exposed as the MCP tool `policy_simulate`, so an agent can run it on a
+  policy it drafted.
+- The demo page gets a Simulator panel that calls the same code through the
+  hosted endpoint.
+- Stated limit: the simulator covers TrustGraph's decisions and state. It
+  cannot cover what a host does after `allow`.
+- The existing `trustgraph-sim` for the older coordinator stays with the
+  reference gateway. Reuse its seeded-schedule, trace and replay machinery
+  where practical (left to the builder).
+
 ## Repository changes
 
 Move to `examples/integrations/composio-github-issues/` (owner's decision:
@@ -281,9 +316,11 @@ The existing story and simulator pages stay reachable by link.
 
 1. Move the Composio / 8090 flow under `examples/integrations/`.
 2. Policy module + CLI commands + worked examples + agent guide.
-3. `serve` (HTTP, then MCP) + Python client example.
-4. Hosted endpoint + demo page.
-5. README and docs rewrite, written last so it only describes what exists.
+3. Deterministic runtime core + simulator + `policy simulate`.
+4. `serve` (HTTP, then MCP) on that core + operator page + Python client
+   example.
+5. Hosted endpoint + demo page (with Simulator panel).
+6. README and docs rewrite, written last so it only describes what exists.
 
 ## Left to the builder
 
