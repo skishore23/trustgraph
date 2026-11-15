@@ -21,7 +21,8 @@ This is part 1 of 3. Part 2: `trustgraph serve` (HTTP, MCP, operator page). Part
 - Decisions are deterministic; no LLM or natural-language rule anywhere.
 - Anything not named in the policy is denied.
 - An agent-callable event can never change the active policy.
-- Do not change the Kani harnesses in `crates/trustgraph-core/src/permissions.rs`.
+- Do not change the existing Kani harnesses in `crates/trustgraph-core/src/permissions.rs`. New decision logic follows the same pattern: a small allocation-free kernel in `trustgraph-core` with Kani harnesses (Task 2A), called by the policy crate and the engine rather than reimplemented.
+- Kani is not installed locally. New harnesses must compile under `cargo check -p trustgraph-core` and are verified by the `Bounded permission proofs` workflow; do not record a proof result in `docs/verification.md` until a CI run has produced it.
 - The reference applications (`trustgraph-runtime` PolicySpec, `trustgraph-live` WorkPolicy, story demo) keep their own formats; do not migrate them.
 - Do not touch `README.md` beyond fixing links broken by Task 1.
 - Commit messages end with a blank line, then `Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>`.
@@ -114,13 +115,57 @@ Rules the builder cannot infer:
 
 ---
 
+### Task 2A: Decision and approval-window kernels with Kani harnesses
+
+**Files:**
+- Create: `crates/trustgraph-core/src/decision.rs`
+- Modify: `crates/trustgraph-core/src/lib.rs` (`pub mod decision;`), `docs/verification.md` (add the new harnesses to the harness table with their property and bounds; add no result rows)
+
+**Interfaces:**
+- Produces:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Facts { pub action_known: bool, pub agent_known: bool, pub sources_known: bool,
+    pub has_sources: bool, pub agent_listed: bool, pub agent_may_use_inputs: bool,
+    pub recipients_in_audience: bool, pub audience_in_readers: bool,
+    pub approval_required: bool, pub approval_live: bool }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gate { UnknownAction, UnknownAgent, UnknownSource, EmptyOutput, AgentNotListed,
+    AgentCannotUseSource, RecipientsOutsideAudience, AudienceOutsideReaders, NeedsApproval, Allowed }
+pub const fn gate(facts: Facts) -> Gate;          // first failing fact, in the enum's order
+impl Gate { pub const fn is_denial(self) -> bool; pub const fn code(self) -> &'static str; }
+/// True exactly when issued_at <= now < issued_at + valid_for, with no overflow, and not voided.
+pub const fn approval_live(issued_at: u64, valid_for: u64, now: u64, voided: bool) -> bool;
+```
+
+`Gate::code` returns the snake_case codes Task 3 lists (`unknown_action` … `audience_outside_readers`, `needs_approval`, `allowed`). No allocation, no panics, no arithmetic that can overflow (`now - issued_at < valid_for` after checking `issued_at <= now`).
+
+- [ ] **Step 1: Write failing unit tests** in the module (`#[cfg(test)]`), each looping over all 1 024 `Facts` values:
+  - `allowed_requires_every_fact`: `gate(f) == Allowed` exactly when the eight permission facts are all true and (`!approval_required || approval_live`).
+  - `approval_never_overrides_a_denial`: for every `f`, if `gate(f).is_denial()` then `gate` with `approval_live` and `approval_required` set to any of the four combinations is the same denial.
+  - `needs_approval_only_when_otherwise_allowed`: `gate(f) == NeedsApproval` exactly when the eight facts hold, approval is required and not live.
+  - `first_failing_fact_wins`: with `action_known == false` the gate is `UnknownAction` whatever else is set, and so on down the order.
+  - `approval_window_edges`: live at `issued_at` and at `issued_at + valid_for - 1`; not live at `issued_at - 1`, at `issued_at + valid_for`, when voided, or when `valid_for == 0`; `approval_live(u64::MAX, u64::MAX, u64::MAX, false)` is true and does not panic.
+- [ ] **Step 2:** Run `cargo test -p trustgraph-core decision`; expect compile failure.
+- [ ] **Step 3:** Implement `gate`, `Gate::is_denial`, `Gate::code`, `approval_live`.
+- [ ] **Step 4:** Add `#[cfg(kani)] mod proofs` with these harnesses, using `kani::any()` for every field and no `kani::assume` beyond what is stated:
+  - `gate_allows_only_when_every_fact_holds` (the first unit test as a symbolic property).
+  - `approval_cannot_turn_a_denial_into_allow` (the second).
+  - `needs_approval_implies_otherwise_allowed` (the third).
+  - `approval_window_is_exact_and_overflow_free`: for arbitrary `u64` inputs, `approval_live(i, v, n, false) == ((i as u128) <= (n as u128) && (n as u128) < (i as u128) + (v as u128))`, and voided is always false.
+- [ ] **Step 5:** `cargo test -p trustgraph-core` passes; `cargo check -p trustgraph-core --all-targets` and clippy are clean (the `cfg(kani)` code is covered by the workspace `check-cfg`). Add the four harnesses to the table in `docs/verification.md` with property and bounds ("all 1 024 fact combinations; arbitrary u64 times") and a line saying results are recorded after the CI run.
+- [ ] **Step 6:** Commit: `Add proof-friendly decision and approval-window kernels with Kani harnesses`.
+
+---
+
 ### Task 3: Pure decisions, inline tests and lints
 
 **Files:**
 - Create: `crates/trustgraph-policy/src/decide.rs`, `src/lint.rs`, `tests/decide.rs`
 
 **Interfaces:**
-- Consumes: Task 2 types; `trustgraph_core::permissions::{intersect, can_flow}`.
+- Consumes: Task 2 types; `trustgraph_core::permissions::{intersect, can_flow}`; `trustgraph_core::decision::{Facts, Gate, gate}`.
 - Produces:
 
 ```rust
@@ -136,7 +181,7 @@ pub fn run_tests(policy: &Policy) -> Vec<TestResult>;
 pub fn lint(policy: &Policy) -> Vec<Diagnostic>;        // Warnings, except reviewers_cannot_read which is an Error
 ```
 
-Decision order and `code` values (first match wins): `unknown_action`, `unknown_agent`, `unknown_source`, `empty_output` (no sources), `agent_not_listed_for_action`, `agent_cannot_use_source`, `recipients_outside_audience`, `audience_outside_readers`, then `needs_approval` (rule has approval) or `allowed`. Reader intersection and the subset check must call the two `trustgraph_core::permissions` kernels on expanded people; do not reimplement them. `audience_outside_readers` fills `blocking` with one entry per source that excludes at least one recipient, and its `reason` reads: ``denied: `salaries` is readable by hr only; engineering (ravi, sam) is not included``.
+`decide` computes the ten `Facts`, calls `gate`, and takes `verdict` and `code` from the returned `Gate`; it must not contain its own ordering logic (pass `approval_live: false`, since a pure query has no approval). Decision order and `code` values (first match wins): `unknown_action`, `unknown_agent`, `unknown_source`, `empty_output` (no sources), `agent_not_listed_for_action`, `agent_cannot_use_source`, `recipients_outside_audience`, `audience_outside_readers`, then `needs_approval` (rule has approval) or `allowed`. Reader intersection and the subset check must call the two `trustgraph_core::permissions` kernels on expanded people; do not reimplement them. `audience_outside_readers` fills `blocking` with one entry per source that excludes at least one recipient, and its `reason` reads: ``denied: `salaries` is readable by hr only; engineering (ravi, sam) is not included``.
 
 Lints (codes): `no_tests`, `source_unusable` (no agent may use it), `action_unsatisfiable` (no single source could ever satisfy its audience), `reviewers_cannot_read` (no reviewer is a reader of any source that could flow to the action; **Error** severity, per the spec — such a rule can never be approved), `unused_group`, `unused_agent`. The spec's "approver who is also the only agent" lint is dropped: Task 2's `name_collision` rule already makes it impossible.
 
@@ -295,6 +340,7 @@ Semantics the builder cannot infer:
 - `RegisterSource`: the name must be in the active policy (`unknown_source`). The artifact id is stable for the same name and digest.
 - `RecordOutput`: unknown agent, unknown input artifact, or an input the agent may not use is `Rejected` with codes `unknown_agent`, `unknown_artifact`, `agent_cannot_use_source`. 1–64 inputs. Map to the framework by registering one operation per `(step, input count)` with ports `in0…`, schema `any`, executor = the agent.
 - `Check` returns `Reply::Decision`. Its `verdict`, `code`, `reason` and `blocking` must equal `decide(policy, query)` for the artifact's source names — call `decide` for the reason and blocking, and call `Graph::check_action` for the verdict; if the two verdicts disagree, return `Deny` with code `engine_mismatch`. The decision `id` is the framework context digest for `Allow` / `NeedsApproval`, and a hash of the query for `Deny`. A `NeedsApproval` decision is remembered so it can be approved.
+- Approval expiry, revocation and voiding go through `trustgraph_core::decision::approval_live`; the engine keeps `issued_at`, `valid_for` and a voided flag per approval and does not compare times itself.
 - `Approve`: `reviewer` must be in the rule's reviewers, a reader of the output and not the agent (`reviewer_not_allowed`); unknown decision is `unknown_decision`. A later `Check` of the same query returns `Allow` with `expires_at` until the approval expires, is revoked or is voided.
 - `ProposePolicy`: parse errors, lint Errors or failing inline tests → `Rejected{code:"invalid_policy"}`. Otherwise store it; the id is the policy digest. Never changes the active policy.
 - `ActivatePolicy`: unknown proposal → `unknown_proposal`. On success: revision + 1; refresh every registered source's readers from the new policy by source name (a source no longer in the policy gets an empty reader set); reset every action rule (a removed action gets an empty actor set); drop every approval and remembered decision.
