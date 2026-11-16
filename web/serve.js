@@ -1,14 +1,98 @@
 // trustgraph serve operator page. Builds plain DOM (no HTML strings), talks
-// only to this origin, and signs in once with the launch file's secret.
+// only to this origin, and signs in with the launch file's single-use secret.
+// The session id lives in sessionStorage (this origin and port only) and is
+// sent as X-TrustGraph-Operator; there is no cookie.
 'use strict';
 
 (function () {
+  var SESSION_KEY = 'trustgraph-operator-session';
+  var REPLACED = 'Signed out: a newer operator session was started. If that was not you, stop the server.';
+  var SIGNED_OUT = 'Not signed in. Open the newest operator launch file (operator.html in the state directory); each one works once.';
+  var LINK_USED = 'This sign-in link is not valid or was already used. If you did not use it, stop the server: someone else holds the operator session.';
+
+  function list(names) {
+    return names && names.length ? names.join(', ') : 'nobody';
+  }
+
+  function shortId(id) {
+    return String(id || '').slice(0, 12);
+  }
+
+  // Exactly what an approval grants, repeated in the confirmation step.
+  function approvalSummary(p) {
+    return 'Approve: ' + p.agent + ' may ' + p.action + ' to ' + list(p.recipients) +
+      ', from ' + list(p.sources) + ' (decision ' + shortId(p.decision) + '…).';
+  }
+
+  function signedOutMessage(result) {
+    var code = result && result.data && result.data.error && result.data.error.code;
+    return code === 'operator_session_replaced' ? REPLACED : SIGNED_OUT;
+  }
+
+  // Never re-render the lists under the operator's pointer or focus: hold
+  // the newest state and say so, until they ask or stop interacting.
+  function createScheduler(options) {
+    var queued = null;
+    function show(state, focusKey) {
+      queued = null;
+      options.queued(false);
+      options.render(state, focusKey);
+    }
+    return {
+      offer: function (state, force, focusKey) {
+        if (!force && options.interacting()) {
+          queued = state;
+          options.queued(true);
+          return false;
+        }
+        show(state, focusKey);
+        return true;
+      },
+      flush: function () {
+        if (queued === null) return false;
+        show(queued);
+        return true;
+      },
+      hasQueued: function () { return queued !== null; }
+    };
+  }
+
+  var api = {
+    approvalSummary: approvalSummary,
+    createScheduler: createScheduler,
+    list: list,
+    shortId: shortId,
+    signedOutMessage: signedOutMessage
+  };
+  if (typeof module === 'object' && module.exports) {
+    module.exports = api;
+    return;
+  }
+
   var REFRESH_MS = 4000;
   var last = '';
-  var confirming = null; // proposal id awaiting the in-page confirmation
+  var confirming = null; // 'approve:<id>' or 'activate:<id>' awaiting confirmation
   var busy = false;
+  var pointerInside = false;
+  var memorySession = null;
 
   function $(id) { return document.getElementById(id); }
+
+  function getSession() {
+    try {
+      var stored = window.sessionStorage.getItem(SESSION_KEY);
+      if (stored) return stored;
+    } catch (e) { /* storage blocked: fall back to memory */ }
+    return memorySession;
+  }
+
+  function setSession(value) {
+    memorySession = value || null;
+    try {
+      if (value) window.sessionStorage.setItem(SESSION_KEY, value);
+      else window.sessionStorage.removeItem(SESSION_KEY);
+    } catch (e) { /* storage blocked: memory only */ }
+  }
 
   function el(tag, text, cls) {
     var node = document.createElement(tag);
@@ -31,10 +115,6 @@
     n.hidden = !text;
   }
 
-  function list(names) {
-    return names && names.length ? names.join(', ') : 'nobody';
-  }
-
   function clock(seconds) {
     var d = new Date(seconds * 1000);
     var pad = function (n) { return (n < 10 ? '0' : '') + n; };
@@ -43,7 +123,9 @@
   }
 
   function request(method, path, body) {
-    var options = { method: method, credentials: 'same-origin', headers: {} };
+    var options = { method: method, credentials: 'omit', headers: {} };
+    var session = getSession();
+    if (session) options.headers['X-TrustGraph-Operator'] = session;
     if (body !== undefined) {
       options.headers['Content-Type'] = 'application/json';
       options.body = JSON.stringify(body);
@@ -65,6 +147,10 @@
     busy = true;
     request('POST', path, body).then(function (result) {
       busy = false;
+      if (result.status === 401) {
+        setSession(null);
+        return signedOut(signedOutMessage(result));
+      }
       notice(result.status === 200 ? done : message(result));
       load(true);
     }, function () {
@@ -77,19 +163,41 @@
     container.appendChild(el('p', text, 'muted'));
   }
 
+  function confirmStep(item, key, question, yesLabel, onYes) {
+    item.appendChild(el('p', question));
+    item.appendChild(button(yesLabel, 'yes:' + key, true, function () {
+      confirming = null;
+      onYes();
+    }));
+    item.appendChild(button('Cancel', 'cancel:' + key, false, function () {
+      confirming = null;
+      load(true, key);
+    }));
+  }
+
   function renderPending(items) {
     var box = $('pending');
     box.replaceChildren();
     if (!items.length) return empty(box, 'Nothing is waiting.');
     items.forEach(function (p) {
+      var key = 'approve:' + p.decision;
       var item = el('div', null, 'item');
       item.appendChild(el('p', p.agent + ' wants ' + p.action + ' → ' + list(p.recipients)));
       item.appendChild(el('p', 'derived from: ' + list(p.sources)));
       item.appendChild(el('p', p.reason, 'muted'));
-      item.appendChild(el('p', 'asked ' + clock(p.requested_at), 'muted'));
-      item.appendChild(button('Approve', 'approve:' + p.decision, true, function () {
-        act('/v1/operator/approve', { decision: p.decision }, 'Approved. ' + p.agent + ' may now ' + p.action + '.');
-      }));
+      item.appendChild(el('p', 'asked ' + clock(p.requested_at) + ' · decision ' + shortId(p.decision), 'muted'));
+      if (!p.can_approve) {
+        item.appendChild(el('p', p.cannot_approve || 'you are not a reviewer for this action', 'muted'));
+      } else if (confirming === key) {
+        confirmStep(item, key, approvalSummary(p), 'Approve now', function () {
+          act('/v1/operator/approve', { decision: p.decision }, 'Approved. ' + p.agent + ' may now ' + p.action + '.');
+        });
+      } else {
+        item.appendChild(button('Approve', key, true, function () {
+          confirming = key;
+          load(true, 'yes:' + key);
+        }));
+      }
       box.appendChild(item);
     });
   }
@@ -101,7 +209,7 @@
     items.forEach(function (a) {
       var item = el('div', null, 'item');
       item.appendChild(el('p', a.agent + ' may ' + a.action + ' → ' + list(a.recipients)));
-      item.appendChild(el('p', 'until ' + clock(a.expires_at), 'muted'));
+      item.appendChild(el('p', 'until ' + clock(a.expires_at) + ' · decision ' + shortId(a.decision), 'muted'));
       item.appendChild(button('Revoke', 'revoke:' + a.decision, false, function () {
         act('/v1/operator/revoke', { decision: a.decision }, 'Revoked.');
       }));
@@ -109,13 +217,20 @@
     });
   }
 
+  function proposer(p) {
+    if (p.origin === 'operator') return 'Proposed by you';
+    if (p.origin === 'file') return 'From the policy file (it changed on disk; not applied)';
+    return 'Proposed by agent ' + p.from;
+  }
+
   function renderProposals(items) {
     var box = $('proposals');
     box.replaceChildren();
     if (!items.length) return empty(box, 'No proposals.');
     items.forEach(function (p) {
+      var key = 'activate:' + p.proposal;
       var item = el('div', null, 'item');
-      item.appendChild(el('p', p.from === 'operator' ? 'Proposed by you' : 'Proposed by ' + p.from));
+      item.appendChild(el('p', proposer(p) + ' · ' + shortId(p.proposal)));
       if (p.widens) item.appendChild(el('p', 'This gives more people access.', 'warn'));
       String(p.explanation || '').split('\n').forEach(function (line) {
         if (line.trim()) item.appendChild(el('p', line));
@@ -128,20 +243,14 @@
         changes.appendChild(el('li', tag + c.subject + ': ' + c.summary, c.kind === 'widens' ? 'warn' : ''));
       });
       item.appendChild(changes);
-      if (confirming === p.proposal) {
-        item.appendChild(el('p', 'Activate this policy? Every approval is voided and agents must ask again.'));
-        item.appendChild(button('Activate now', 'activate-now:' + p.proposal, true, function () {
-          confirming = null;
+      if (confirming === key) {
+        confirmStep(item, key, 'Activate this policy? Every approval is voided and agents must ask again.', 'Activate now', function () {
           act('/v1/operator/activate', { proposal: p.proposal }, 'Activated. Agent tokens follow the new policy.');
-        }));
-        item.appendChild(button('Cancel', 'cancel:' + p.proposal, false, function () {
-          confirming = null;
-          load(true, 'activate:' + p.proposal);
-        }));
+        });
       } else {
-        item.appendChild(button('Activate', 'activate:' + p.proposal, true, function () {
-          confirming = p.proposal;
-          load(true, 'activate-now:' + p.proposal);
+        item.appendChild(button('Activate', key, true, function () {
+          confirming = key;
+          load(true, 'yes:' + key);
         }));
       }
       box.appendChild(item);
@@ -154,6 +263,7 @@
     var policy = state.policy;
     $('who').textContent = 'Operator ' + state.operator + '. Policy revision ' + policy.revision +
       (policy.source === 'file' ? ', from the policy file.' : ', activated in service.');
+    $('clock').hidden = !state.clock_behind;
     $('signed-in').hidden = false;
     renderPending(state.pending);
     renderApprovals(state.approvals);
@@ -164,6 +274,17 @@
     }
   }
 
+  function interacting() {
+    var lists = $('lists');
+    return pointerInside || (lists.contains(document.activeElement) && document.activeElement !== lists);
+  }
+
+  var scheduler = createScheduler({
+    render: render,
+    interacting: interacting,
+    queued: function (on) { $('updated').hidden = !on; }
+  });
+
   function signedOut(text) {
     $('signed-in').hidden = true;
     $('who').textContent = text;
@@ -171,9 +292,14 @@
   }
 
   function load(force, focusKey) {
+    if (!getSession()) {
+      signedOut(SIGNED_OUT);
+      return Promise.resolve();
+    }
     return request('GET', '/v1/operator/state').then(function (result) {
       if (result.status === 401) {
-        return signedOut('Not signed in. Open the operator launch file that trustgraph serve printed; it works once per start.');
+        setSession(null);
+        return signedOut(signedOutMessage(result));
       }
       if (result.status !== 200) return signedOut(message(result));
       var state = result.data;
@@ -183,7 +309,7 @@
       // Re-render only on change, so focus and reading position stay put.
       if (force || text !== last) {
         last = text;
-        render(state, focusKey);
+        scheduler.offer(state, force, focusKey);
       }
     }, function () {
       signedOut('The server did not answer. Is trustgraph serve still running?');
@@ -197,18 +323,28 @@
     history.replaceState(null, '', location.pathname);
     return fetch('/session', {
       method: 'POST',
-      credentials: 'same-origin',
+      credentials: 'omit',
       headers: { Authorization: 'Bearer ' + match[1] }
     }).then(function (response) {
-      if (response.status !== 200) notice('This launch link was already used. Restart trustgraph serve for a new one.');
+      return response.json().catch(function () { return {}; }).then(function (data) {
+        if (response.status === 200 && data.session) setSession(data.session);
+        else notice(LINK_USED);
+      });
     }, function () {});
   }
 
   document.addEventListener('DOMContentLoaded', function () {
+    var lists = $('lists');
+    lists.addEventListener('mouseenter', function () { pointerInside = true; });
+    lists.addEventListener('mouseleave', function () { pointerInside = false; });
     $('refresh').addEventListener('click', function (event) {
       event.preventDefault();
       notice('');
       load(true);
+    });
+    $('updated').addEventListener('click', function (event) {
+      event.preventDefault();
+      if (!scheduler.flush()) load(true);
     });
     connect().then(function () { return load(true); });
     setInterval(function () {

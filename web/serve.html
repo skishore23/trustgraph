@@ -13,10 +13,12 @@
 <h1>TrustGraph</h1>
 <p id="who">Connecting.</p>
 <p id="notice" class="notice" hidden></p>
+<p id="clock" class="notice" hidden>The system clock is behind the journal. Approvals are refused until it catches up; everything else works.</p>
 
 <div id="signed-in" hidden>
-<p><a href="/" id="refresh">Refresh</a> <span class="muted">(updates every few seconds)</span></p>
+<p><a href="/" id="refresh">Refresh</a> <span class="muted">(updates every few seconds)</span> <a href="/" id="updated" class="muted" hidden>updated — refresh</a></p>
 
+<div id="lists">
 <h2>Waiting for approval</h2>
 <div id="pending"></div>
 
@@ -25,6 +27,7 @@
 
 <h2>Proposed policies</h2>
 <div id="proposals"></div>
+</div>
 </div>
 </main>
 </body>

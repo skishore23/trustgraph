@@ -1747,6 +1747,7 @@ dependencies = [
  "clap",
  "getrandom",
  "http-body-util",
+ "libc",
  "reqwest",
  "rmcp",
  "serde",

@@ -20,9 +20,13 @@ enum Command {
     },
     /// Serve the policy runtime to agents over HTTP and MCP, with an operator page.
     Serve {
-        /// The policy file in force at start (it re-applies only when it changed).
+        /// The policy file. It is applied on the first start only; later, a changed
+        /// file is stored as a proposal for the operator.
         #[arg(long)]
         policy: PathBuf,
+        /// Apply the policy file at start even when it differs from the active policy.
+        #[arg(long)]
+        activate_policy_file: bool,
         /// The person who approves, revokes and activates; must be in a group of the policy.
         #[arg(long)]
         operator: String,
@@ -40,6 +44,12 @@ enum Command {
         /// Journal size, in bytes, past which agent writes are refused.
         #[arg(long, default_value_t = trustgraph_cli::serve::DEFAULT_MAX_JOURNAL_BYTES)]
         max_journal_bytes: u64,
+        /// Journal bytes each agent may cause while the server runs.
+        #[arg(long, default_value_t = trustgraph_cli::serve::DEFAULT_AGENT_JOURNAL_BYTES)]
+        agent_journal_bytes: u64,
+        /// Artifacts each agent may create while the server runs.
+        #[arg(long, default_value_t = trustgraph_cli::serve::DEFAULT_AGENT_ARTIFACTS)]
+        agent_artifacts: u64,
     },
 }
 #[tokio::main]
@@ -52,17 +62,23 @@ async fn main() {
             state,
             port,
             allow_state_in_repository,
+            activate_policy_file,
             max_artifacts,
             max_journal_bytes,
+            agent_journal_bytes,
+            agent_artifacts,
         } => {
             let options = trustgraph_cli::serve::Options {
                 policy,
                 operator,
                 state,
                 allow_state_in_repository,
+                activate_policy_file,
                 limits: trustgraph_cli::serve::Limits {
                     max_artifacts,
                     max_journal_bytes,
+                    agent_journal_bytes,
+                    agent_artifacts,
                     ..Default::default()
                 },
             };

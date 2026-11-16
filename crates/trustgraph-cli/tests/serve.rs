@@ -117,40 +117,53 @@ impl<J: ServeJournal> Harness<J> {
         self.send(request).await
     }
 
-    /// Exchange the launch secret for the operator's session cookie.
-    async fn login(&self) -> String {
-        let secret = self.server.launch_secret().expect("unused launch secret");
+    /// Exchange a launch secret for an operator session id.
+    async fn login_with(&self, secret: &str) -> (u16, Value) {
         let response = self
             .client
             .post(format!("{}/session", self.base))
-            .bearer_auth(&secret)
+            .bearer_auth(secret)
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), 200);
-        let cookie = response.headers()["set-cookie"]
-            .to_str()
-            .unwrap()
-            .to_string();
-        assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict"));
-        cookie.split(';').next().unwrap().to_string()
+        let status = response.status().as_u16();
+        assert!(
+            !response.headers().contains_key("set-cookie"),
+            "no cookie, ever"
+        );
+        (status, response.json().await.unwrap_or(Value::Null))
     }
 
-    async fn op_post(&self, path: &str, cookie: &str, body: Value) -> (u16, Value) {
+    /// Sign in with the current launch secret; the operator session id.
+    async fn login(&self) -> String {
+        let secret = self.server.launch_secret().expect("a launch secret");
+        let (status, body) = self.login_with(&secret).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body["expires_at"].is_u64());
+        let session = body["session"].as_str().unwrap().to_string();
+        assert_eq!(session.len(), 64);
+        session
+    }
+
+    async fn op_post(&self, path: &str, session: &str, body: Value) -> (u16, Value) {
         let request = self
             .client
             .post(format!("{}{path}", self.base))
-            .header("cookie", cookie)
+            .header("x-trustgraph-operator", session)
             .json(&body);
         self.send(request).await
     }
 
-    async fn op_state(&self, cookie: &str) -> Value {
+    async fn op_get(&self, path: &str, session: &str) -> (u16, Value) {
         let request = self
             .client
-            .get(format!("{}/v1/operator/state", self.base))
-            .header("cookie", cookie);
-        let (status, body) = self.send(request).await;
+            .get(format!("{}{path}", self.base))
+            .header("x-trustgraph-operator", session);
+        self.send(request).await
+    }
+
+    async fn op_state(&self, session: &str) -> Value {
+        let (status, body) = self.op_get("/v1/operator/state", session).await;
         assert_eq!(status, 200, "{body}");
         body
     }
@@ -314,7 +327,8 @@ async fn identity_comes_only_from_the_token() {
         (status, body["error"]["code"].as_str()),
         (403, Some("agent_cannot_use_source"))
     );
-    // The mailer cannot build on the planner's sources.
+    // The mailer cannot build on, read about or check the planner's
+    // outputs: to the mailer they do not exist.
     let (status, body) = h
         .post(
             "/v1/outputs",
@@ -324,14 +338,20 @@ async fn identity_comes_only_from_the_token() {
         .await;
     assert_eq!(
         (status, body["error"]["code"].as_str()),
-        (403, Some("agent_cannot_use_source"))
+        (404, Some("unknown_artifact"))
     );
     let (status, _) = h.get(&format!("/v1/artifacts/{only}"), Some(&mailer)).await;
-    assert_eq!(status, 403);
-    // Checking as the mailer is the mailer's check, whatever the artifact.
+    assert_eq!(status, 404);
+    let (status, body) = h
+        .post(
+            "/v1/check",
+            Some(&mailer),
+            json!({"artifact": only, "action": "post_to_slack"}),
+        )
+        .await;
     assert_eq!(
-        h.check(&mailer, &only, "post_to_slack").await["verdict"],
-        "deny"
+        (status, body["error"]["code"].as_str()),
+        (404, Some("unknown_artifact"))
     );
 
     // No body field can name an agent.
@@ -383,7 +403,7 @@ async fn identity_comes_only_from_the_token() {
 }
 
 #[tokio::test]
-async fn operator_routes_need_the_session_cookie() {
+async fn operator_routes_need_the_session_header() {
     let dir = tempfile::tempdir().unwrap();
     let h = memory(dir.path(), Limits::default()).await;
     let mailer = h.token("mailer");
@@ -409,23 +429,46 @@ async fn operator_routes_need_the_session_cookie() {
     }
     assert_eq!(h.server.launch_secret().as_deref(), Some(secret.as_str()));
 
-    let cookie = h.login().await;
-    assert!(!cookie.contains(&secret));
+    let session = h.login().await;
+    assert_ne!(session, secret);
     // Single use.
-    let (status, _) = h.post("/session", Some(&secret), json!({})).await;
+    let (status, reply) = h.post("/session", Some(&secret), json!({})).await;
     assert_eq!(status, 401);
-    // A forged cookie holding the launch secret is not a session.
-    let forged = format!("{}={secret}", cookie.split('=').next().unwrap());
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("stop the server")
+    );
+    // The launch secret is not a session.
     let (status, _) = h
-        .op_post("/v1/operator/propose", &forged, json!({"policy": NEXT}))
+        .op_post("/v1/operator/propose", &secret, json!({"policy": NEXT}))
         .await;
     assert_eq!(status, 401);
 
-    h.op_state(&cookie).await;
+    h.op_state(&session).await;
     let expected = [404, 404, 404, 200];
     for ((path, body), want) in routes.iter().zip(expected) {
-        let (status, reply) = h.op_post(path, &cookie, body.clone()).await;
+        let (status, reply) = h.op_post(path, &session, body.clone()).await;
         assert_eq!(status, want, "{path}: {reply}");
+    }
+    // An agent token next to a valid session is still refused, on every route.
+    let state = h
+        .client
+        .get(format!("{}/v1/operator/state", h.base))
+        .header("x-trustgraph-operator", &session)
+        .bearer_auth(&mailer);
+    assert_eq!(h.send(state).await.0, 401);
+    for (path, body) in &routes {
+        let request = h
+            .client
+            .post(format!("{}{path}", h.base))
+            .header("x-trustgraph-operator", &session)
+            .bearer_auth(&mailer)
+            .json(body);
+        let (status, reply) = h.send(request).await;
+        assert_eq!(status, 401, "{path}");
+        assert_eq!(reply["error"]["code"], "operator_session_required");
     }
     // The page itself is plain and strict.
     let response = h.client.get(format!("{}/", h.base)).send().await.unwrap();
@@ -584,6 +627,7 @@ async fn restart_restores_artifacts_decisions_activation_and_tokens() {
         operator: OPERATOR.into(),
         state: Some(state.clone()),
         allow_state_in_repository: false,
+        activate_policy_file: false,
         limits: Limits::default(),
     };
 
@@ -622,7 +666,7 @@ async fn restart_restores_artifacts_decisions_activation_and_tokens() {
     assert!(!dir.path().join("state/tokens/planner.token").exists());
     h.stop().await;
 
-    // A changed policy file wins at the next start.
+    // A changed policy file never takes effect by itself.
     std::fs::write(
         &policy,
         STARTER.replace("customers: [acme]", "customers: [acme, beta]"),
@@ -631,8 +675,8 @@ async fn restart_restores_artifacts_decisions_activation_and_tokens() {
     let h = launch(|port| serve::start(options(), port).unwrap()).await;
     let cookie = h.login().await;
     let state = h.op_state(&cookie).await;
-    assert_eq!(state["policy"]["source"], "file");
-    assert_eq!(state["policy"]["revision"], 3);
+    assert_eq!(state["policy"]["source"], "activated");
+    assert_eq!(state["policy"]["revision"], 2);
     h.stop().await;
 }
 
@@ -646,6 +690,7 @@ async fn start_refuses_bad_operators_and_repository_state() {
         operator: operator.into(),
         state: Some(state),
         allow_state_in_repository: false,
+        activate_policy_file: false,
         limits: Limits::default(),
     };
     for operator in ["mailer", "nobody", "sales"] {
@@ -653,7 +698,7 @@ async fn start_refuses_bad_operators_and_repository_state() {
             .err()
             .unwrap();
         assert_eq!(error.code, 2, "{operator}");
-        assert!(error.message.contains("--operator"));
+        assert!(error.message.contains("--operator"), "{}", error.message);
     }
     // A state directory inside the repository that holds the policy.
     std::fs::create_dir(dir.path().join(".git")).unwrap();
@@ -1012,4 +1057,650 @@ async fn mcp_tools_share_the_api_and_its_identity() {
         )
         .await;
     assert_eq!(simulated["structuredContent"]["ok"], true, "{simulated}");
+}
+
+// ----- the security review's findings -----
+
+impl<J: ServeJournal> Harness<J> {
+    /// A POST with the raw response body, for byte-for-byte comparisons.
+    async fn raw_post(&self, path: &str, token: &str, body: Value) -> (u16, String) {
+        let response = self
+            .client
+            .post(format!("{}{path}", self.base))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        (response.status().as_u16(), response.text().await.unwrap())
+    }
+
+    async fn raw_get(&self, path: &str, token: &str) -> (u16, String) {
+        let response = self
+            .client
+            .get(format!("{}{path}", self.base))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        (response.status().as_u16(), response.text().await.unwrap())
+    }
+
+    async fn check_to(&self, token: &str, artifact: &str, recipients: &[&str]) -> Value {
+        let (status, body) = self
+            .post(
+                "/v1/check",
+                Some(token),
+                json!({"artifact": artifact, "action": "email_customer", "recipients": recipients}),
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        body
+    }
+}
+
+/// The secret inside a launch file.
+fn launch_secret_in(path: &Path) -> String {
+    let html = std::fs::read_to_string(path).unwrap();
+    let start = html.find("#/connect/").unwrap() + "#/connect/".len();
+    html[start..start + 64].to_string()
+}
+
+#[tokio::test]
+async fn the_operator_session_is_a_header_one_at_a_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = memory(dir.path(), Limits::default()).await;
+    let launch = h.server.write_launch_file().unwrap();
+    let first_secret = launch_secret_in(&launch);
+
+    let (status, body) = h.login_with(&first_secret).await;
+    assert_eq!(status, 200, "{body}");
+    let first = body["session"].as_str().unwrap().to_string();
+    h.op_state(&first).await;
+
+    // A new single-use launch file replaces the used one; the old secret is dead.
+    let second_secret = launch_secret_in(&launch);
+    assert_ne!(second_secret, first_secret);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&launch).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    assert_eq!(h.login_with(&first_secret).await.0, 401);
+
+    // Without the header, even with the right Host and Origin: 401. The
+    // session id as a cookie (any name) authorises nothing.
+    let origin = format!("http://127.0.0.1:{}", h.port);
+    for cookie in [
+        format!("trustgraph_owner_{}={first}", h.port),
+        format!("trustgraph_owner={first}"),
+        format!("session={first}"),
+    ] {
+        let request = h
+            .client
+            .get(format!("{}/v1/operator/state", h.base))
+            .header("origin", &origin)
+            .header("cookie", cookie);
+        let (status, body) = h.send(request).await;
+        assert_eq!(status, 401, "{body}");
+        assert_eq!(body["error"]["code"], "operator_session_required");
+        let request = h
+            .client
+            .post(format!("{}/v1/operator/propose", h.base))
+            .header("origin", &origin)
+            .json(&json!({"policy": NEXT}));
+        assert_eq!(h.send(request).await.0, 401);
+    }
+
+    // A second sign-in ends the first session.
+    let (status, body) = h.login_with(&second_secret).await;
+    assert_eq!(status, 200);
+    let second = body["session"].as_str().unwrap().to_string();
+    let (status, body) = h.op_get("/v1/operator/state", &first).await;
+    assert_eq!(status, 401);
+    assert_eq!(body["error"]["code"], "operator_session_replaced");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("If that was not you, stop the server")
+    );
+    let (status, _) = h
+        .op_post("/v1/operator/approve", &first, json!({"decision": "d"}))
+        .await;
+    assert_eq!(status, 401);
+    h.op_state(&second).await;
+    assert_ne!(launch_secret_in(&launch), second_secret);
+
+    // The page itself is only the static shell.
+    let response = h.client.get(format!("{}/", h.base)).send().await.unwrap();
+    let html = response.text().await.unwrap();
+    assert_eq!(html, serve::PAGE_HTML);
+}
+
+fn restart_options(policy: &Path, state: &Path, activate: bool) -> serve::Options {
+    serve::Options {
+        policy: policy.to_path_buf(),
+        operator: OPERATOR.into(),
+        state: Some(state.to_path_buf()),
+        allow_state_in_repository: false,
+        activate_policy_file: activate,
+        limits: Limits::default(),
+    }
+}
+
+#[tokio::test]
+async fn a_changed_policy_file_waits_for_the_operator() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = dir.path().join("trustgraph.policy.yaml");
+    let state = dir.path().join("state");
+    std::fs::write(&policy, STARTER).unwrap();
+    let start = |activate: bool| {
+        let (policy, state) = (policy.clone(), state.clone());
+        move |port| serve::start(restart_options(&policy, &state, activate), port).unwrap()
+    };
+
+    let h = launch(start(false)).await;
+    let mailer = h.token("mailer");
+    let sheet = h.source(&mailer, "price_sheet", "prices").await;
+    let email = h.output(&mailer, &[&sheet], "quote").await;
+    // `beta` is nobody under the starter policy.
+    assert_eq!(
+        h.check_to(&mailer, &email, &["beta"]).await["verdict"],
+        "deny"
+    );
+    assert!(h.server.startup_report().is_empty());
+    h.stop().await;
+
+    // Unchanged file: nothing to propose.
+    let h = launch(start(false)).await;
+    let session = h.login().await;
+    assert_eq!(h.op_state(&session).await["proposals"], json!([]));
+    assert!(h.server.startup_report().is_empty());
+    h.stop().await;
+
+    // An agent widens the file and waits for a restart: nothing changes.
+    let widened = STARTER.replace("customers: [acme]", "customers: [acme, beta]");
+    std::fs::write(&policy, &widened).unwrap();
+    let h = launch(start(false)).await;
+    let report = h.server.startup_report().join("\n");
+    assert!(report.contains("NOT applied"), "{report}");
+    assert!(report.contains("WIDENS"), "{report}");
+    assert!(report.contains("--activate-policy-file"), "{report}");
+    let session = h.login().await;
+    let state = h.op_state(&session).await;
+    assert_eq!(state["policy"]["revision"], 1);
+    assert_eq!(state["policy"]["source"], "file");
+    let proposal = &state["proposals"][0];
+    assert_eq!(proposal["origin"], "file");
+    assert_eq!(proposal["from"], "file");
+    assert_eq!(proposal["widens"], true);
+    let id = proposal["proposal"].as_str().unwrap().to_string();
+    let (_, active) = h.get("/v1/policy", Some(&mailer)).await;
+    assert!(!active["policy"].as_str().unwrap().contains("beta"));
+    assert_eq!(
+        h.check_to(&mailer, &email, &["beta"]).await["verdict"],
+        "deny"
+    );
+    h.stop().await;
+
+    // Restarting again does not propose it twice.
+    let h = launch(start(false)).await;
+    let session = h.login().await;
+    let state = h.op_state(&session).await;
+    assert_eq!(state["proposals"].as_array().unwrap().len(), 1);
+    // The operator activates it from the page.
+    let (status, reply) = h
+        .op_post("/v1/operator/activate", &session, json!({"proposal": id}))
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["revision"], 2);
+    assert_eq!(
+        h.check_to(&mailer, &email, &["beta"]).await["verdict"],
+        "needs_approval"
+    );
+    h.stop().await;
+
+    // `--activate-policy-file` applies a changed file at start.
+    std::fs::write(&policy, STARTER).unwrap();
+    let h = launch(start(true)).await;
+    let report = h.server.startup_report().join("\n");
+    assert!(report.contains("Applied the policy file"), "{report}");
+    let session = h.login().await;
+    let state = h.op_state(&session).await;
+    assert_eq!(state["policy"]["revision"], 3);
+    assert_eq!(state["policy"]["source"], "file");
+    assert_eq!(
+        h.check_to(&mailer, &email, &["beta"]).await["verdict"],
+        "deny"
+    );
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn the_operator_is_checked_against_the_active_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = dir.path().join("p.yaml");
+    let state = dir.path().join("state");
+    std::fs::write(&policy, STARTER).unwrap();
+    let h =
+        launch(|port| serve::start(restart_options(&policy, &state, false), port).unwrap()).await;
+    h.stop().await;
+    // A file naming a new person does not make them an operator.
+    std::fs::write(
+        &policy,
+        STARTER.replace("sales: [leo]", "sales: [leo, mallory]"),
+    )
+    .unwrap();
+    let mut options = restart_options(&policy, &state, false);
+    options.operator = "mallory".into();
+    let error = serve::start(options, 1).err().unwrap();
+    assert_eq!(error.code, 2);
+    assert!(error.message.contains("active policy"), "{}", error.message);
+}
+
+/// A clock the test moves by hand.
+#[derive(Default)]
+struct TestClock {
+    wall: std::sync::atomic::AtomicU64,
+    monotonic: std::sync::atomic::AtomicU64,
+}
+
+impl serve::Clock for TestClock {
+    fn wall(&self) -> u64 {
+        self.wall.load(Ordering::SeqCst)
+    }
+    fn monotonic(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.monotonic.load(Ordering::SeqCst))
+    }
+}
+
+async fn clocked(state: &Path, journal_at: u64, clock: Arc<TestClock>) -> Harness<MemoryJournal> {
+    let runtime = Runtime::open(MemoryJournal::new(), STARTER, journal_at).unwrap();
+    let state = state.to_path_buf();
+    launch(move |port| {
+        Server::with_clock(runtime, settings(port, &state, Limits::default()), clock).unwrap()
+    })
+    .await
+}
+
+#[tokio::test]
+async fn approvals_expire_on_monotonic_time_whatever_the_wall_clock_says() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(TestClock::default());
+    clock.wall.store(1_000_000, Ordering::SeqCst);
+    let h = clocked(dir.path(), 0, clock.clone()).await;
+    let mailer = h.token("mailer");
+    let sheet = h.source(&mailer, "price_sheet", "prices").await;
+    let email = h.output(&mailer, &[&sheet], "quote").await;
+    let decision = h.check(&mailer, &email, "email_customer").await["decision"].clone();
+    let session = h.login().await;
+    let state = h.op_state(&session).await;
+    assert_eq!(state["pending"][0]["can_approve"], true);
+    assert_eq!(state["clock_behind"], false);
+    let (status, approved) = h
+        .op_post(
+            "/v1/operator/approve",
+            &session,
+            json!({"decision": decision}),
+        )
+        .await;
+    assert_eq!(status, 200, "{approved}");
+    assert_eq!(approved["expires_at"], 1_000_000 + 30 * 60);
+
+    // The wall clock jumps back a day: the approval does not live longer.
+    clock.wall.store(1_000_000 - 86_400, Ordering::SeqCst);
+    clock.monotonic.store(30 * 60 - 1, Ordering::SeqCst);
+    assert_eq!(
+        h.check(&mailer, &email, "email_customer").await["verdict"],
+        "allow"
+    );
+    clock.monotonic.store(30 * 60 + 1, Ordering::SeqCst);
+    assert_eq!(
+        h.check(&mailer, &email, "email_customer").await["verdict"],
+        "needs_approval"
+    );
+}
+
+#[tokio::test]
+async fn a_journal_from_the_future_refuses_approvals_until_the_clock_catches_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(TestClock::default());
+    clock.wall.store(1_000_000, Ordering::SeqCst);
+    let future = 4_000_000_000;
+    let h = clocked(dir.path(), future, clock.clone()).await;
+    let mailer = h.token("mailer");
+    let sheet = h.source(&mailer, "price_sheet", "prices").await;
+    let email = h.output(&mailer, &[&sheet], "quote").await;
+    let pending = h.check(&mailer, &email, "email_customer").await;
+    assert_eq!(pending["verdict"], "needs_approval", "checks still answer");
+    let session = h.login().await;
+    assert_eq!(h.op_state(&session).await["clock_behind"], true);
+    let body = json!({"decision": pending["decision"]});
+    let (status, reply) = h
+        .op_post("/v1/operator/approve", &session, body.clone())
+        .await;
+    assert_eq!(status, 409, "{reply}");
+    assert_eq!(reply["error"]["code"], "clock_behind");
+
+    clock.wall.store(future, Ordering::SeqCst);
+    let (status, reply) = h.op_post("/v1/operator/approve", &session, body).await;
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(h.op_state(&session).await["clock_behind"], false);
+}
+
+#[tokio::test]
+async fn an_artifact_the_agent_may_not_use_looks_like_no_artifact() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = memory(dir.path(), Limits::default()).await;
+    let planner = h.token("planner");
+    let mailer = h.token("mailer");
+    // A real salaries artifact; the mailer could derive its id from a guess.
+    let salaries = h.source(&planner, "salaries", "nina: 120k").await;
+    let random = "ab".repeat(32);
+    let size = h.server.journal_size();
+
+    let mut answers = Vec::new();
+    for id in [&salaries, &random] {
+        let probes = [
+            h.raw_get(&format!("/v1/artifacts/{id}"), &mailer).await,
+            h.raw_post(
+                "/v1/check",
+                &mailer,
+                json!({"artifact": id, "action": "email_customer"}),
+            )
+            .await,
+            h.raw_post(
+                "/v1/outputs",
+                &mailer,
+                json!({"inputs": [id], "step": "s", "content": "c"}),
+            )
+            .await,
+        ];
+        let mut tools = Vec::new();
+        for (tool, arguments) in [
+            ("explain_artifact", json!({"artifact": id})),
+            ("check", json!({"artifact": id, "action": "email_customer"})),
+            (
+                "record_output",
+                json!({"inputs": [id], "step": "s", "content": "c"}),
+            ),
+        ] {
+            let result = h.tool(&mailer, tool, arguments).await;
+            assert_eq!(result["isError"], true);
+            tools.push(result);
+        }
+        answers.push((probes, tools));
+    }
+    let (real, fake) = (&answers[0], &answers[1]);
+    for (a, b) in real.0.iter().zip(&fake.0) {
+        assert_eq!(a, b, "byte-identical HTTP answers");
+        assert_eq!(a.0, 404);
+        assert!(a.1.contains("\"unknown_artifact\""), "{}", a.1);
+    }
+    assert_eq!(real.1, fake.1, "identical MCP answers");
+    assert_eq!(real.1[0]["structuredContent"]["status"], 404);
+    assert_eq!(h.server.journal_size(), size, "nothing was journaled");
+
+    // The planner, who may use it, still gets real answers.
+    let (status, _) = h
+        .get(&format!("/v1/artifacts/{salaries}"), Some(&planner))
+        .await;
+    assert_eq!(status, 200);
+}
+
+#[tokio::test]
+async fn one_agent_cannot_spend_another_agents_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = Limits {
+        agent_journal_bytes: 4_000,
+        ..Limits::default()
+    };
+    let h = memory(dir.path(), limits).await;
+    let mailer = h.token("mailer");
+    let planner = h.token("planner");
+    let sheet = h.source(&mailer, "price_sheet", "prices").await;
+    let email = h.output(&mailer, &[&sheet], "quote").await;
+    let mut refused = None;
+    for _ in 0..100 {
+        let (status, body) = h
+            .post(
+                "/v1/check",
+                Some(&mailer),
+                json!({"artifact": email, "action": "email_customer"}),
+            )
+            .await;
+        if status != 200 {
+            refused = Some((status, body));
+            break;
+        }
+    }
+    let (status, body) = refused.expect("the journal-bytes quota bites");
+    assert_eq!(status, 507);
+    assert_eq!(body["error"]["code"], "quota_exceeded");
+    // The planner's own budget is untouched.
+    let roadmap = h.source(&planner, "roadmap", "q3").await;
+    let only = h.output(&planner, &[&roadmap], "summary").await;
+    assert_eq!(
+        h.check(&planner, &only, "post_to_slack").await["verdict"],
+        "allow"
+    );
+    // Requests refused before the engine are not journaled.
+    let size = h.server.journal_size();
+    let (status, _) = h
+        .post(
+            "/v1/sources",
+            Some(&planner),
+            json!({"source": "price_sheet", "content": "x"}),
+        )
+        .await;
+    assert_eq!(status, 403);
+    let (status, _) = h
+        .post(
+            "/v1/outputs",
+            Some(&planner),
+            json!({"inputs": [], "step": "s", "content": "c"}),
+        )
+        .await;
+    assert_eq!(status, 422);
+    assert_eq!(h.server.journal_size(), size);
+}
+
+#[tokio::test]
+async fn artifact_quotas_count_only_new_artifacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = Limits {
+        agent_artifacts: 2,
+        ..Limits::default()
+    };
+    let h = memory(dir.path(), limits).await;
+    let mailer = h.token("mailer");
+    let sheet = h.source(&mailer, "price_sheet", "one").await;
+    let email = h.output(&mailer, &[&sheet], "quote").await;
+    // At the cap: re-registering the same content and checking still work.
+    let size = h.server.journal_size();
+    assert_eq!(h.source(&mailer, "price_sheet", "one").await, sheet);
+    assert_eq!(h.output(&mailer, &[&sheet], "quote").await, email);
+    assert_eq!(
+        h.server.journal_size(),
+        size,
+        "idempotent calls are not journaled"
+    );
+    assert_eq!(
+        h.check(&mailer, &email, "email_customer").await["verdict"],
+        "needs_approval"
+    );
+    let (status, body) = h
+        .post(
+            "/v1/sources",
+            Some(&mailer),
+            json!({"source": "price_sheet", "content": "two"}),
+        )
+        .await;
+    assert_eq!(
+        (status, &body["error"]["code"]),
+        (507, &json!("quota_exceeded"))
+    );
+    // Another agent is not affected.
+    h.source(&h.token("planner"), "roadmap", "q3").await;
+}
+
+#[tokio::test]
+async fn check_works_at_the_server_artifact_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = Limits {
+        max_artifacts: 2,
+        ..Limits::default()
+    };
+    let h = memory(dir.path(), limits).await;
+    let mailer = h.token("mailer");
+    let sheet = h.source(&mailer, "price_sheet", "one").await;
+    let email = h.output(&mailer, &[&sheet], "quote").await;
+    assert_eq!(
+        h.check(&mailer, &email, "email_customer").await["verdict"],
+        "needs_approval"
+    );
+}
+
+#[tokio::test]
+async fn localhost_is_accepted_and_other_hosts_are_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = memory(dir.path(), Limits::default()).await;
+    let mailer = h.token("mailer");
+    use tower::ServiceExt;
+    let router = serve::router(h.server.clone());
+    let request = |host: String| {
+        axum::http::Request::builder()
+            .uri("/v1/policy")
+            .header("host", host)
+            .header("authorization", format!("Bearer {mailer}"))
+            .body(axum::body::Body::empty())
+            .unwrap()
+    };
+    for host in [
+        format!("localhost:{}", h.port),
+        format!("127.0.0.1:{}", h.port),
+    ] {
+        let response = router.clone().oneshot(request(host.clone())).await.unwrap();
+        assert_eq!(response.status(), 200, "{host}");
+    }
+    for host in [
+        format!("localhost:{}", h.port.wrapping_add(1)),
+        format!("[::1]:{}", h.port),
+        format!("0.0.0.0:{}", h.port),
+        format!("example.com:{}", h.port),
+        "localhost".to_string(),
+    ] {
+        let response = router.clone().oneshot(request(host.clone())).await.unwrap();
+        assert_eq!(response.status(), 403, "{host}");
+    }
+}
+
+/// A journal whose append panics when the flag is set.
+struct Panicky {
+    inner: MemoryJournal,
+    panic: Arc<AtomicBool>,
+}
+
+impl Journal for Panicky {
+    fn load(&mut self) -> Result<Vec<Record>, JournalError> {
+        self.inner.load()
+    }
+    fn append(&mut self, record: &Record) -> Result<(), JournalError> {
+        if self.panic.load(Ordering::SeqCst) {
+            panic!("injected panic while the runtime is locked");
+        }
+        self.inner.append(record)
+    }
+}
+
+impl ServeJournal for Panicky {
+    fn size(&self) -> Option<u64> {
+        self.inner.size()
+    }
+}
+
+#[tokio::test]
+async fn a_poisoned_runtime_answers_503() {
+    let dir = tempfile::tempdir().unwrap();
+    let panic = Arc::new(AtomicBool::new(false));
+    let journal = Panicky {
+        inner: MemoryJournal::new(),
+        panic: panic.clone(),
+    };
+    let runtime = Runtime::open(journal, STARTER, 0).unwrap();
+    let state = dir.path().to_path_buf();
+    let h = launch(move |port| {
+        Server::new(runtime, settings(port, &state, Limits::default())).unwrap()
+    })
+    .await;
+    let mailer = h.token("mailer");
+    panic.store(true, Ordering::SeqCst);
+    let (status, _) = h
+        .post(
+            "/v1/sources",
+            Some(&mailer),
+            json!({"source": "price_sheet", "content": "one"}),
+        )
+        .await;
+    assert_eq!(status, 500);
+    panic.store(false, Ordering::SeqCst);
+    for (status, body) in [
+        h.get("/v1/policy", Some(&mailer)).await,
+        h.get("/", None).await,
+    ] {
+        assert_eq!(status, 503);
+        assert_eq!(body["error"]["code"], "restart_required");
+    }
+}
+
+#[tokio::test]
+async fn mcp_is_rate_limited_and_helpers_have_their_own_lower_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = memory(dir.path(), Limits::default()).await;
+    let mailer = h.token("mailer");
+    let simulate = json!({"policy": STARTER, "count": 1, "steps": 1});
+    let mut codes = Vec::new();
+    for _ in 0..3 {
+        let result = h.tool(&mailer, "policy_simulate", simulate.clone()).await;
+        codes.push(result["structuredContent"]["error"]["code"].clone());
+    }
+    assert_eq!(codes, [Value::Null, Value::Null, json!("rate_limited")]);
+    // Over HTTP too, and the other agent keeps its own budget.
+    let (status, body) = h
+        .post("/v1/policy/simulate", Some(&mailer), simulate.clone())
+        .await;
+    assert_eq!(
+        (status, &body["error"]["code"]),
+        (429, &json!("rate_limited"))
+    );
+    let planner = h.token("planner");
+    assert_eq!(
+        h.tool(&planner, "policy_simulate", simulate).await["isError"],
+        false
+    );
+    // Non-helper tools are not charged to the helper lanes.
+    let sheet = h
+        .tool(
+            &mailer,
+            "register_source",
+            json!({"source": "price_sheet", "content": "p"}),
+        )
+        .await;
+    assert_eq!(sheet["isError"], false, "{sheet}");
+
+    // The general request limit applies to /mcp as a whole.
+    let dir = tempfile::tempdir().unwrap();
+    let limits = Limits {
+        rate_per_second: 0.01,
+        burst: 2.0,
+        ..Limits::default()
+    };
+    let h = memory(dir.path(), limits).await;
+    let mailer = h.token("mailer");
+    for _ in 0..2 {
+        assert_eq!(h.mcp(Some(&mailer), "tools/list", json!({})).await.0, 200);
+    }
+    assert_eq!(h.mcp(Some(&mailer), "tools/list", json!({})).await.0, 429);
 }

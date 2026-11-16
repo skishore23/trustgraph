@@ -24,6 +24,9 @@ clap.workspace = true
 tokio.workspace = true
 axum.workspace = true
 rmcp = { version = "=3.10.0", default-features = false, features = ["server", "transport-streamable-http-server"] }
+[target.'cfg(unix)'.dependencies]
+# O_NOFOLLOW / O_NONBLOCK for token and launch files.
+libc = "0.2"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 reqwest = { version = "0.12", default-features = false, features = ["json"] }

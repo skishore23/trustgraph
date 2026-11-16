@@ -7,7 +7,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 const SUFFIX: &str = ".token";
@@ -74,30 +74,41 @@ pub(crate) fn private_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 /// The existing well-formed token, or `None` when the file is missing or
-/// malformed. A link or non-regular file is an error.
+/// malformed. A link or non-regular file is an error. The file is opened
+/// once, without following a link (and without blocking on a FIFO), and
+/// every check and the permission fix use that handle.
 fn read_existing(path: &Path) -> std::io::Result<Option<String>> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(m) => m,
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let not_regular =
+        || std::io::Error::other(format!("{} must be a regular file", path.display()));
+    let mut file = match options.open(path) {
+        Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        #[cfg(unix)]
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(not_regular()),
         Err(e) => return Err(e),
     };
+    let metadata = file.metadata()?;
     if !metadata.is_file() {
-        return Err(std::io::Error::other(format!(
-            "{} must be a regular file",
-            path.display()
-        )));
+        return Err(not_regular());
     }
     if metadata.len() != 64 {
         return Ok(None);
     }
-    let text = fs::read_to_string(path).unwrap_or_default();
-    if !well_formed(&text) {
+    let mut text = String::new();
+    if file.read_to_string(&mut text).is_err() || !well_formed(&text) {
         return Ok(None);
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
     Ok(Some(text))
 }
@@ -107,14 +118,7 @@ fn write_new(path: &Path) -> std::io::Result<String> {
     let token = random_token()?;
     let temp = path.with_extension("token.tmp");
     let _ = fs::remove_file(&temp);
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&temp)?;
+    let mut file = super::auth::private_create(&temp)?;
     file.write_all(token.as_bytes())?;
     file.sync_all()?;
     fs::rename(&temp, path)?;
