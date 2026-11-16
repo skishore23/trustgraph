@@ -59,6 +59,8 @@ def _check_url(url: str, allow_insecure: bool) -> str:
     parts = urllib.parse.urlsplit(url)
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise ValueError(f"not an http(s) URL: {url!r}")
+    if parts.query or parts.fragment or "?" in url or "#" in url:
+        raise ValueError("the URL must not have a query or fragment")
     if parts.username is not None or parts.password is not None:
         raise ValueError("the URL must not carry credentials; pass `token` or `token_file`")
     if parts.scheme == "http" and not allow_insecure and not _is_loopback(parts.hostname):

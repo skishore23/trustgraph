@@ -146,35 +146,61 @@ class Session:
     # -- hand-off --------------------------------------------------------
 
     def handoff(self) -> str:
-        """An opaque token carrying what this session has seen, for another agent's session."""
+        """An opaque token carrying what this session has seen, for another agent's session.
+
+        Raises ``session_broken`` on a broken session: a hand-off is only ever
+        written from a session that is not broken (see ``persist``)."""
         self._usable()
         return _token(self.seen)
+
+    def persist(self, stored: str | None = None) -> str:
+        """The token to keep where this conversation is kept, merged with ``stored``.
+
+        Unlike ``handoff`` it never raises: it is the union of ``stored`` and
+        everything this session has seen, and if this session (or ``stored``)
+        is broken it carries a broken marker, so a session restored from it is
+        refused too. Saving it can never shed an artifact or a broken marker.
+        """
+        return merge_tokens(stored, _token(self.seen, self._broken))
 
     def receive(self, token: str) -> None:
         """Carry what another agent's session had seen.
 
         The receiving agent must be cleared (listed in ``agents``) for every
-        source the token carries. If it is not, or the token is malformed, this
-        raises and the session refuses all further writes and checks.
+        source the token carries. If it is not, the token is malformed, or it
+        carries a broken marker, this raises and the session refuses all
+        further reads, writes, checks and hand-offs.
         """
         try:
-            ids = _parse(token)
-            for artifact in ids:
-                self.client.explain(artifact)
+            ids, broken = _parse(token)
         except TrustGraphError as e:
             self.mark_broken(f"a hand-off could not be received ({e.code}); start a new session")
             raise
-        for artifact in ids:
+        for artifact in ids:  # kept even on failure, so that `persist` never sheds them
             self._add(Artifact(artifact))
+        try:
+            if broken is not None:
+                raise TrustGraphError("session_broken", f"the carried session was broken: {broken}")
+            for artifact in ids:
+                self.client.explain(artifact)
+        except TrustGraphError as e:
+            self.mark_broken(
+                f"the carried session was broken: {broken}" if broken is not None
+                else f"a hand-off could not be received ({e.code}); start a new session"
+            )
+            raise
         self.carried = True
 
 
-def _token(ids: Iterable[str]) -> str:
-    payload = json.dumps({"artifacts": list(ids)}, separators=(",", ":")).encode()
+def _token(ids: Iterable[str], broken: str | None = None) -> str:
+    body: dict[str, Any] = {"artifacts": list(ids)}
+    if broken is not None:
+        body["broken"] = broken
+    payload = json.dumps(body, separators=(",", ":")).encode()
     return _PREFIX + base64.urlsafe_b64encode(payload).decode().rstrip("=")
 
 
-def _parse(token: str) -> list[str]:
+def _parse(token: str) -> tuple[list[str], str | None]:
     try:
         if not isinstance(token, str) or not token.startswith(_PREFIX):
             raise ValueError("prefix")
@@ -183,9 +209,37 @@ def _parse(token: str) -> list[str]:
         ids = payload["artifacts"]
         if not isinstance(ids, list) or not all(isinstance(i, str) and _ID.match(i) for i in ids):
             raise ValueError("artifacts")
-        return ids
-    except (ValueError, KeyError, TypeError, binascii.Error):
+        broken = payload.get("broken")
+        if broken is not None and not isinstance(broken, str):
+            raise ValueError("broken")
+        return ids, broken
+    except (ValueError, KeyError, TypeError, AttributeError, binascii.Error):
         raise TrustGraphError("invalid_handoff", "not a TrustGraph hand-off token") from None
+
+
+def merge_tokens(*tokens: str | None) -> str:
+    """The union of tokens: every artifact any of them carries, and a broken
+    marker if any of them is broken or cannot be read. Empty values are
+    ignored; with nothing to merge the result is ``""``.
+
+    It never yields a token carrying fewer artifacts than an input, so it is
+    safe as a reducer for state that keeps a token (LangGraph:
+    ``Annotated[str, merge_tokens]``)."""
+    ids: dict[str, None] = {}
+    broken: str | None = None
+    found = False
+    for token in tokens:
+        if not token:
+            continue
+        found = True
+        try:
+            more, why = _parse(token)
+        except TrustGraphError:
+            more, why = [], "an unreadable hand-off token was merged into this one"
+        ids.update(dict.fromkeys(more))
+        if broken is None:
+            broken = why
+    return _token(ids, broken) if found else ""
 
 
 def session(carry: str | None = None) -> Session:

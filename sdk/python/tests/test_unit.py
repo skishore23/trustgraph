@@ -25,6 +25,7 @@ class Fake:
         self.verdict = verdict
         self.fail: Exception | None = None
         self.status: tuple[int, bytes] | None = None
+        self.unknown: set[str] = set()  # artifact ids the server does not know (404 on explain)
         self.n = 0
 
     def __call__(self, method: str, url: str, headers: dict[str, str], body: bytes | None, timeout: float):
@@ -40,6 +41,8 @@ class Fake:
                 "blocking": [{"source": "salaries", "readers": ["hr"], "excluded": ["sam"]}], "expires_at": None,
             }).encode()
         if path.startswith("/v1/artifacts/"):
+            if path[-64:] in self.unknown:
+                return 404, b'{"error":{"code":"unknown_artifact","message":"no"}}'
             return 200, json.dumps({"artifact": path[-64:], "sources": ["s"], "readers": []}).encode()
         self.n += 1
         return 200, json.dumps({"artifact": f"{self.n:064x}"}).encode()
@@ -424,3 +427,87 @@ def test_a_str_recipient_is_one_name() -> None:
         s.act("post", "x", "sam")
         post("y", to="ravi")
     assert [b["recipients"] for b in fake.bodies("/v1/check")] == [["sam"], ["ravi"]]
+
+
+@pytest.mark.parametrize("url", ["http://127.0.0.1:8787/?x=1", "http://127.0.0.1:8787#@evil.com", "https://h/a?"])
+def test_urls_with_a_query_or_fragment_are_refused(url: str) -> None:
+    with pytest.raises(ValueError):
+        Client(url, token="t")
+
+
+# -- persisted tokens never shed ---------------------------------------------
+
+
+def test_broken_sessions_persist_a_marker_and_never_hand_off() -> None:
+    fake = Fake()
+    s = client(fake).session()
+    s.read("salaries", "x")
+    fake.unknown.add("f" * 64)
+    with pytest.raises(TrustGraphError):
+        s.receive(trustgraph._session._token(["f" * 64]))
+    with pytest.raises(TrustGraphError) as e:
+        s.handoff()
+    assert e.value.code == "session_broken"
+    stored = s.persist()
+    ids, broken = trustgraph._session._parse(stored)
+    assert set(ids) == {f"{1:064x}", "f" * 64} and broken
+    restored = client(Fake()).session()
+    with pytest.raises(TrustGraphError) as e:
+        restored.receive(stored)
+    assert e.value.code == "session_broken" and restored.broken
+
+
+def test_merge_tokens_is_a_union_and_broken_is_sticky() -> None:
+    from trustgraph._session import _parse, _token
+
+    a, b = _token(["a" * 64]), _token(["b" * 64], "lost a read")
+    assert trustgraph.merge_tokens("", None) == ""
+    assert _parse(trustgraph.merge_tokens(a, "")) == (["a" * 64], None)
+    assert _parse(trustgraph.merge_tokens(a, b)) == (["a" * 64, "b" * 64], "lost a read")
+    assert _parse(trustgraph.merge_tokens(b, _token([])))[1] == "lost a read"
+    assert _parse(trustgraph.merge_tokens(a, "garbage"))[1]  # unreadable counts as broken
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_no_sequence_of_operations_sheds_a_read(seed: int) -> None:
+    """Over random sequences of (read, failed receive, save, load), as the integrations
+    use them, a session that is not broken carries every artifact ever read, and once a
+    broken session was saved every session loaded later is broken."""
+    import random
+
+    from trustgraph._session import _token
+
+    rng = random.Random(seed)
+    fake = Fake()
+    c = client(fake)
+    s, stored, ever, saved_broken = c.session(), None, set(), False
+    for step in range(30):
+        op = rng.choice(["read", "fail_receive", "save", "load"])
+        if op == "read":
+            try:
+                s.read("salaries", f"row {step}")
+                ever.add(s.seen[-1])
+            except TrustGraphError:
+                assert s.broken
+            stored = s.persist(stored)  # the integrations save after every read
+        elif op == "fail_receive":
+            bad = f"{10_000 + step:064x}"
+            fake.unknown.add(bad)
+            with pytest.raises(TrustGraphError):
+                s.receive(_token([bad]))
+        elif op == "save":
+            stored = s.persist(stored)
+        else:
+            s = c.session()
+            if stored:
+                try:
+                    s.receive(stored)
+                except TrustGraphError:
+                    pass
+        saved_broken = saved_broken or bool(stored and trustgraph._session._parse(stored)[1])
+        if s.broken is None:
+            assert ever <= set(s.seen)
+            if op == "load":
+                assert not saved_broken
+        if op == "load" and saved_broken:
+            assert s.broken
