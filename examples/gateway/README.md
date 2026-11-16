@@ -34,7 +34,20 @@ planner slack__post_message #engineering: error: TrustGraph gateway: `post_to_en
 planner slack__post_message #engineering, plus Channel #all-company: error: TrustGraph gateway: `Channel` is not an argument the gateway forwards for this tool (it forwards: channel, text); the call was not forwarded (invalid_arguments)
 ```
 
+The gateway starts with one warning, which is expected here:
+
+```text
+warning: tools.slack.post_message.arguments: not constrained by any `when`: text; each is hashed into the checked output and shown to the approver, but can hold anything, so it must not be able to choose who the call reaches
+```
+
+`text` is the message; `channel` decides who the post reaches, and its rule
+matches it exactly (`when` values in `acts` rules match exactly unless the
+rule asks for `type: email`, `glob` or `path`). Stop the gateway with Ctrl-C:
+it stops both fake upstreams and removes their private `HOME` directories.
+
 `SLACK_BOT_TOKEN=demo-slack-token-0001 trustgraph gateway check --config
 examples/gateway/gateway.yaml --policy examples/gateway/gateway.policy.yaml`
 says the same in plain English, including the upstream arguments the config
-does not forward (`blocks, thread`). See [docs/gateway.md](../../docs/gateway.md).
+does not forward (`blocks, thread`). It runs the fake upstream to ask for its
+tools; add `--offline` to check only the config and policy. See
+[docs/gateway.md](../../docs/gateway.md).

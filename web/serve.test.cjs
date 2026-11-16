@@ -139,13 +139,11 @@ const page = require('./serve.js');
   assert.deepEqual(lines.map(l => l.text), [
     'gateway call: slack__post_message → brief_leadership → maya',
     'forwarded arguments, exactly:',
-    'channel:',
-    '#leadership',
-    'text:',
-    'Q3\\u202e plan\n… truncated — 500 more characters',
+    'channel: #leadership',
+    'text: Q3\\u202e plan [… truncated — 500 more characters]',
     'SHA-256 of the full arguments: ' + 'ab'.repeat(32),
   ]);
-  assert.equal(lines[3].cls, 'value');
+  assert.equal(lines[2].cls, 'value');
   assert.match(page.approvalSummary(p), /as one call of slack__post_message with arguments abababababab…/);
 
   // After a restart the gateway no longer has it: the page says to retry.
@@ -154,6 +152,77 @@ const page = require('./serve.js');
   assert.match(goneLines[1].text, /must retry it before it can be approved/);
   assert.deepEqual(page.confirmableKeys({ pending: [gone], proposals: [] }), [], 'no Approve for it');
   assert.deepEqual(page.callLines({ action: 'x' }), [], 'not a gateway call');
+}
+
+// An argument value is one row: newline, carriage return and tab show as
+// escapes, a backslash is doubled, and invisible characters (soft hyphen,
+// Hangul filler, tag characters, which need the u flag) are escaped too.
+{
+  const cp = String.fromCodePoint;
+  assert.equal(page.argumentValue('a\nb\rc\td'), 'a\\nb\\rc\\td');
+  assert.equal(page.argumentValue('C:\\new'), 'C:\\\\new', 'a literal backslash-n is not a newline');
+  assert.equal(page.neutralise('sam' + cp(0xad) + '@corp.com'), 'sam\\xad@corp.com');
+  assert.equal(page.neutralise('x' + cp(0x3164) + cp(0x115f) + cp(0xffa0)), 'x\\u3164\\u115f\\uffa0');
+  assert.equal(page.neutralise('#eng' + cp(0xe0041) + cp(0xe007f)), '#eng\\u{e0041}\\u{e007f}');
+  assert.equal(page.neutralise('a' + cp(0x1f600) + 'b'), 'a' + cp(0x1f600) + 'b', 'other astral text is itself');
+  assert.equal(page.neutralise('x' + cp(0x2064) + cp(0x206f)), 'x\\u2064\\u206f');
+}
+
+// The arguments the matched rule constrains (who the call reaches) come
+// first, by their real values, in the block and in the confirmation step.
+{
+  const p = {
+    agent: 'planner',
+    action: 'post_to_engineering',
+    recipients: ['ravi', 'sam'],
+    sources: ['roadmap'],
+    decision: 'e'.repeat(64),
+    gateway: {
+      tool: 'slack__post_message',
+      held: true,
+      sha256: 'cd'.repeat(32),
+      arguments: [
+        { name: 'channel', value: '#engineering', more: 0, constrained: true },
+        { name: 'text', value: 'line one\nline two', more: 0, constrained: false },
+        { name: 'thread', value: '42', more: 0, constrained: false },
+      ],
+    },
+  };
+  const lines = page.callLines(p);
+  assert.deepEqual(lines.map(l => l.text), [
+    'gateway call: slack__post_message → post_to_engineering → ravi, sam',
+    'matched by the rule, so who it reaches:',
+    'channel: #engineering',
+    'every other forwarded argument, exactly:',
+    'text: line one\\nline two',
+    'thread: 42',
+    'SHA-256 of the full arguments: ' + 'cd'.repeat(32),
+  ]);
+  assert.deepEqual(lines.filter(l => l.cls === 'value').length, 3, 'one row per argument');
+  assert.equal(
+    page.approvalSummary(p),
+    'Approve: planner may post_to_engineering to ravi, sam, from roadmap, as one call of slack__post_message where channel: #engineering with arguments cdcdcdcdcdcd… (decision eeeeeeeeeeee…).'
+  );
+}
+
+// A blocked agent (connection mode) gets its own Clear; a blocked session
+// that is listed is ended in the sessions list.
+{
+  const state = {
+    pending: [],
+    proposals: [],
+    gateway: {
+      mode: 'connection', problems: [],
+      sessions: [{ session: 'conn:abc', agent: 'planner', sources: ['roadmap'] }],
+      connections: [],
+      blocked: ['agent:planner', 'conn:abc'],
+    },
+  };
+  const entries = page.blockedEntries(state);
+  assert.deepEqual(entries.map(e => [e.id, e.clearable]), [['agent:planner', true], ['conn:abc', false]]);
+  assert.match(entries[0].text, /^Agent planner refused a hand-off: none of its connections, current or new, may act/);
+  assert.deepEqual(page.confirmableKeys(state), ['end:conn:abc', 'clear:agent:planner']);
+  assert.deepEqual(page.blockedEntries({ gateway: { sessions: [] } }), []);
 }
 
 // Open connections can be ended; an agent at the cap is named.

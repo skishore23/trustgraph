@@ -27,6 +27,7 @@ SLACK_BOT_TOKEN=demo-slack-token-0001 target/debug/trustgraph gateway \
 ```
 
 ```text
+warning: tools.slack.post_message.arguments: not constrained by any `when`: text; each is hashed into the checked output and shown to the approver, but can hold anything, so it must not be able to choose who the call reaches
 upstream `slack`: fake_upstream: starting with credential [redacted]
 trustgraph gateway: upstream `slack`: connected, 12 tools
 trustgraph gateway: upstream `drive`: connected, 12 tools
@@ -59,12 +60,18 @@ planner slack__post_message #engineering: error: TrustGraph gateway: `post_to_en
 planner slack__post_message #engineering, plus Channel #all-company: error: TrustGraph gateway: `Channel` is not an argument the gateway forwards for this tool (it forwards: channel, text); the call was not forwarded (invalid_arguments)
 ```
 
-Neither `post_message` call reached the chat server.
+Neither `post_message` call reached the chat server. The warning is
+expected: `text` is the message, which the approver reads; it does not
+choose who the post reaches (`channel` does, and the rule matches it
+exactly). Stop the gateway with Ctrl-C or SIGTERM: it stops its stdio
+upstreams and removes their private `HOME` directories.
 
 Check a config against a policy before you start the gateway. When the
 variables an upstream needs are set, `gateway check` also connects to it
 and compares the arguments the config forwards with the ones the upstream
-tool takes:
+tool takes. Connecting to a stdio upstream means **running its configured
+`command`** on this machine; pass `--offline` to check only the config and
+the policy (the upstream checks are then skipped, and the output says so):
 
 ```sh
 SLACK_BOT_TOKEN=demo-slack-token-0001 trustgraph gateway check \
@@ -72,6 +79,7 @@ SLACK_BOT_TOKEN=demo-slack-token-0001 trustgraph gateway check \
 ```
 
 ```text
+upstream `slack`: fake_upstream: starting with credential [redacted]
 Sessions: connection (each MCP connection is one session; it assumes the host opens a new connection per task with a fresh agent context, and that the agent cannot reconnect at will: a client that reconnects by itself starts with an empty session. Use `session: agent` when the host cannot guarantee that).
 Upstreams: drive (runs target/debug/examples/fake_upstream), slack (runs target/debug/examples/fake_upstream).
 Agents see 4 tools; every other upstream tool is invisible and uncallable:
@@ -82,16 +90,18 @@ Agents see 4 tools; every other upstream tool is invisible and uncallable:
     otherwise: `unmatched` (usable by planner)
     forwards only the arguments: path; a call with any other is refused
   slack__post_message is an action, checked against everything the session read before it is forwarded; the output checked is every forwarded argument:
-    when `channel` matches `#engineering`: `post_to_engineering`, content `text` (reaches ravi, sam)
+    when `channel` is exactly `#engineering`: `post_to_engineering`, content `text` (reaches ravi, sam)
     otherwise: blocked, never forwarded
     a call from a session that has read nothing is refused (nothing_read)
     forwards only the arguments: channel, text; a call with any other is refused
     upstream arguments NOT forwardable: blocks, thread
   trustgraph__handoff and trustgraph__receive pass what a session carries to another agent's session
+warning: tools.slack.post_message.arguments: not constrained by any `when`: text; each is hashed into the checked output and shown to the approver, but can hold anything, so it must not be able to choose who the call reaches
 ```
 
-`gateway check` runs each stdio upstream it can to ask for its tools. Run
-it where you would run the gateway.
+`gateway check` runs each stdio upstream whose variables are set here, to
+ask for its tools, so run it where you would run the gateway, and only on a
+config whose commands you trust; with `--offline` it runs nothing.
 
 ## Connecting agents
 
@@ -163,10 +173,16 @@ tools:
   slack.post_message:
     arguments: [channel, text]  # required for acts: a call with any other argument is refused
     acts:
-      - when: { channel: "#engineering" }
+      - when: { channel: "#engineering" }   # exact: the value must be `#engineering`
         action: post_to_engineering
         content: text           # shown to the operator; the check covers every argument
     otherwise: block            # the only value: an unmatched call is never forwarded
+  slack.send_email:
+    arguments: [to, subject, body]
+    acts:
+      - when: { to: { pattern: "*@corp.com", type: email } }   # a strict address at corp.com
+        action: email_staff
+        content: body
   drive.search:
     passthrough: true
     arguments: [query]
@@ -186,10 +202,16 @@ tools:
   value. An upstream result that contains one, as is or JSON-escaped, is
   withheld. A stdio upstream gets the variables in its `env`, a minimal
   `PATH` (the program's own directory, `/usr/bin` and `/bin`) and a private,
-  empty `HOME` directory (mode 0700, removed when the connection ends); it
-  never gets the gateway's `HOME` or the rest of its environment. That is
-  not isolation: see [Threat model](#threat-model). Its stderr is printed
-  with every secret value replaced by `[redacted]`.
+  empty `HOME` directory, `$TMPDIR/trustgraph-upstream-*` (mode 0700). It is
+  removed when the connection ends, and when the gateway exits on SIGINT or
+  SIGTERM, which stops every stdio upstream first. Beside each one is a lock
+  file (`….lock`) the gateway keeps locked while it uses the directory. One
+  that a killed gateway left behind (owned by your user, lock file present
+  and not locked) is removed when a gateway next starts; one whose lock a
+  running gateway holds, or one with no lock file, is never touched. The
+  child never gets the gateway's `HOME` or the rest of its environment.
+  That is not isolation: see [Threat model](#threat-model). Its stderr is
+  printed with every secret value replaced by `[redacted]`.
 - **Tools.** Only the tools listed under `tools:` exist for agents. They are
   named `upstream.tool` in the config, and agents see them as
   `upstream__tool`. Every other tool on an upstream is invisible and
@@ -204,7 +226,14 @@ tools:
   one the upstream tool takes (`inputSchema.properties`) when the upstream
   publishes a schema; the gateway checks this at start, on every call and
   in `gateway check`, which also prints the upstream arguments that are not
-  forwardable.
+  forwardable. When the schema declares a `type` for an argument (`string`,
+  `number`, `integer`, `boolean`, `array`, `object` or `null`, or a list of
+  them, and an `array`'s `items.type`), a call whose value has another JSON
+  type is refused with `invalid_arguments`: an object or a list where the
+  upstream takes a string (`text: {"channel": "#all-company"}`) never
+  reaches it. This is a small, strict check of the top-level arguments, not
+  a JSON Schema validator; an argument with no declared `type` is not
+  checked.
 - **reads.** The tool's results are a policy source. The first rule whose
   `when` matches gives the source; otherwise `otherwise` does. `otherwise`
   must be at least as restrictive as every rule's source: the people who may
@@ -213,7 +242,9 @@ tools:
   in `gateway check`; if a policy activation breaks it later, the tool is
   closed (`tool_misconfigured`) until it is fixed.
 - **acts.** The tool is a policy action. The first rule whose `when` matches
-  gives the action. A call that matches no rule is blocked. `content` names
+  gives the action; a `when` value matches exactly unless the rule gives a
+  `type` (see [How `when` matches](#how-when-matches)). A call that matches
+  no rule is blocked. `content` names
   the argument the operator sees as the content; it is only a label. The
   output that is checked is always every forwarded argument (see
   [What a call does](#what-a-call-does)). `allow_without_reads: true` lets a
@@ -230,26 +261,74 @@ an earlier rule of the same tool matches every call it would.
 
 ### How `when` matches
 
-A `when` rule names arguments and a glob for each, as `argument: glob` or
-`argument: {glob: …, type: path|text}`. All must match. A glob is
-case-sensitive. `*` matches any run of characters and `?` one character,
-but neither matches `/`, `,`, `;`, whitespace, `<`, `>`, `"` or a control
-character; `**` is `*` that also matches `/`. Every other character is
-itself. So `*@corp.com` does not match `x@evil.com, y@corp.com`.
+**The policy audience is only as true as the `when` rule that maps a call
+to an action.** The policy says `post_to_engineering` reaches engineering;
+the gateway believes that only because a rule says a call with `channel:
+"#engineering"` is `post_to_engineering`. A rule loose enough to match a
+value that reaches someone else sends the output to people the policy never
+checked. Match recipient arguments exactly, or with `type: email`.
+
+A `when` rule names arguments and a pattern for each, as `argument:
+pattern` or `argument: {pattern: …, type: …}`. All must match. The types:
+
+| `type` | matches | default for |
+|---|---|---|
+| `exact` | the value equals the pattern byte for byte; no wildcards | `acts` rules |
+| `email` | a strict email address: `name@domain` (that address; the domain ignoring case) or `*@domain` (any valid local part at exactly that domain) | — |
+| `glob` | a glob (below) | — |
+| `path` | a glob over a path; odd path forms never match (below) | `reads` rules |
+
+On an `acts` rule, a pattern that contains `*` or `?` without an explicit
+`type: glob`, `email` or `path` is a config error, so a wildcard on a
+recipient is always a choice you made:
+
+```yaml
+  slack.send_email:
+    arguments: [to, subject, body]
+    acts:
+      - when: { to: { pattern: "*@corp.com", type: email } }   # not `to: "*@corp.com"`
+        action: email_staff
+        content: body
+```
+
+`type: email` accepts only ASCII, exactly one `@`, a local part of letters,
+digits and `._+-` with no leading, trailing or doubled dot, and a domain of
+dot-separated labels of letters, digits and `-`. Anything a mail parser
+could read as another address never matches: comments
+(`x@evil.com(@corp.com`), a second `@` (`x@evil.com@corp.com`), `%` and `!`
+routes, quoted local parts, encoded words (`=?utf-8?q?…?=@corp.com`),
+address literals, and subdomains (`*@corp.com` does not match
+`x@mail.corp.com`).
+
+A glob is case-sensitive. `*` matches any run of characters and `?` one
+character, but neither matches `/`, `,`, `;`, whitespace, `<`, `>`, `"` or a
+control character; `**` is `*` that also matches `/`. Every other character
+is itself. A glob is weak for a recipient: `*@corp.com` matches
+`x@evil.com@corp.com`, which a mail server may deliver to `evil.com`. The
+gateway and `gateway check` warn about every `type: glob` on an `acts` rule.
 
 An argument value matches when it is a string that matches, or a non-empty
 list whose every element is a string that matches. An object, a number, or
 a list with anything else in it never matches.
 
-Matching fails closed. A value does not match if it is longer than 4,096
-bytes, if it contains a control character (NUL included), or if it has a
-`..` segment (split on `/` and `\`). An argument of `type: path` (the
-default in `reads` rules; `text` is the default in `acts` rules) also does
-not match if it contains `%`, `~`, `\` or a character that is not ASCII, if
-it starts with `/` or `./`, or if it has an empty segment (`//`) or a `.`
-segment. Such a call falls to `otherwise`. The upstream may decode,
-expand or normalise a path the gateway saw as `Product/%2e%2e/HR/x` into one
-no rule meant.
+Matching fails closed, for every type. A value does not match if it is
+longer than 4,096 bytes, if it has a `..` segment (split on `/` and `\`), or
+if it contains a control, format or separator character (Unicode categories
+Cc, Cf, Zl and Zp: NUL, zero-width spaces and joiners, bidirectional
+controls, the soft hyphen and the like), a Hangul filler (U+115F, U+1160,
+U+3164, U+FFA0) or a tag character (U+E0000 to U+E007F). A pattern that
+holds one is a config error. An argument of `type: path` also does not
+match if it contains `%`, `~`, `\` or a character that is not ASCII, if it
+starts with `/` or `./`, or if it has an empty segment (`//`) or a `.`
+segment. Such a call falls to `otherwise`. The upstream may decode, expand
+or normalise a path the gateway saw as `Product/%2e%2e/HR/x` into one no
+rule meant.
+
+The gateway and `gateway check` also warn about an `acts` rule with no
+`when` (every call to the tool is that action, whatever its arguments), and
+name each allow-listed argument of an `acts` tool that no `when` constrains:
+it is part of the checked output and shown to the approver, but it can hold
+anything, so it must not be one that chooses who the call reaches.
 
 Classification trusts the upstream's own naming. A link, alias, symlink or
 id on the upstream can make `Product/roadmap.md` return other content. That
@@ -277,7 +356,8 @@ rule should name only paths whose content you know.
   retries exactly the same call; the gateway forwards it and uses the
   approval up (a journaled revoke), so the same call again needs a new
   approval. A call with any argument changed is a different output and a
-  new decision. Two retries at once release one call.
+  new decision. Two retries at once release one call; the other is held
+  again, with its arguments, and can be approved like the first.
 - **Nothing read.** An action from a session that has read nothing is refused
   with `nothing_read`. With `allow_without_reads: true` on the tool (agent
   mode only), it is forwarded without a check, because the runtime cannot
@@ -287,10 +367,16 @@ rule should name only paths whose content you know.
 - **Untracked passthrough.** Forwarded and returned as is.
 
 For a call the gateway holds for approval, the operator page shows the tool,
-the action, the recipients and every forwarded argument, each value cut at
-2,000 characters with a "truncated — N more characters" marker, and the
-SHA-256 of the full canonical arguments. Argument text is shown as text,
-with control, bidirectional and invisible characters shown as escapes. The
+the action and the recipients; then the arguments the matched rule's `when`
+names, by their real values (`channel: #engineering`), because they decide
+who the call reaches; then every other forwarded argument, sorted by name,
+one per row, each value cut at 2,000 characters with a "truncated — N more
+characters" marker; and the SHA-256 of the full canonical arguments. The
+confirmation step repeats the matched arguments. Argument text is shown as
+text: newline, carriage return and tab as `\n`, `\r` and `\t` (and a
+backslash doubled), and control, bidirectional and invisible characters
+(the soft hyphen, Hangul fillers, tag characters and other format
+characters included) as escapes such as `‮` or `\u{e0041}`. The
 arguments are kept in memory only, never in the journal. After a restart
 the gateway no longer has them: the page says the agent must retry the call,
 and offers no Approve for it (the server refuses one too) until it does.
@@ -364,6 +450,25 @@ Every agent sees two more tools:
   then, and the receiving session may no longer act: every later action is
   refused with `session_blocked` until the operator ends the session.
   Refusing a hand-off never leaves the receiver freer than accepting it.
+
+What a refusal blocks depends on the session mode:
+
+- **`session: agent`.** The session is the agent's, so the agent may not act
+  on any connection until the operator ends its session.
+- **`session: connection`.** A session is one connection, so blocking only
+  it would let the agent act freely from a new connection. The gateway
+  therefore also blocks the agent as a whole: none of its connections,
+  current or new, may act (`agent_blocked`) until the operator clears the
+  block with **Clear block** on the operator page. The refusing connection's
+  own session stays blocked until it is ended. Use `session: agent` when
+  agents hand off: there the block and what was read both follow the agent.
+
+Blocks on agents (and agent-mode sessions) are kept in
+`<state>/gateway.blocked`, written atomically (a new 0600 file, never
+through a link, renamed into place), so they survive a restart. The gateway
+does not start if that file exists but cannot be read or is not a JSON list
+of session ids: ignoring it would unblock. Fix it, or remove it to unblock
+everything it held.
 
 The gateway makes and checks tokens with an HMAC key kept 0600 in
 `<state>/gateway.secret`. A token names the agent that issued it and the

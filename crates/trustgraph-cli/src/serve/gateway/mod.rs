@@ -160,13 +160,58 @@ struct HeldCall {
     content: Option<String>,
     arguments: JsonObject,
     sha256: String,
+    /// The arguments the matched rule's `when` names: who the call reaches.
+    constrained: BTreeSet<String>,
 }
 
+/// Held calls by decision id, each with the generation it was held at.
+/// Identical calls share a decision id, so a call released by an approval
+/// may already have been held again by a concurrent identical retry that
+/// was refused; the generation lets the release leave that one alone.
 #[derive(Default)]
 struct Held {
-    calls: BTreeMap<String, HeldCall>,
+    calls: BTreeMap<String, (u64, HeldCall)>,
     /// Decision ids, oldest first.
     order: VecDeque<String>,
+    /// The generation the next hold gets.
+    next: u64,
+}
+
+impl Held {
+    /// The generation now: every call held from here on is newer.
+    fn generation(&self) -> u64 {
+        self.next
+    }
+
+    fn hold(&mut self, decision: &str, call: HeldCall) {
+        let generation = self.next;
+        self.next += 1;
+        if self
+            .calls
+            .insert(decision.to_string(), (generation, call))
+            .is_none()
+        {
+            self.order.push_back(decision.to_string());
+        }
+        while self.order.len() > MAX_HELD_CALLS {
+            if let Some(old) = self.order.pop_front() {
+                self.calls.remove(&old);
+            }
+        }
+    }
+
+    /// Forget the call an approval released: only if it was held before
+    /// `before`, the generation when the releasing call's check began.
+    fn release(&mut self, decision: &str, before: u64) {
+        if self
+            .calls
+            .get(decision)
+            .is_some_and(|(generation, _)| *generation < before)
+        {
+            self.calls.remove(decision);
+            self.order.retain(|d| d != decision);
+        }
+    }
 }
 
 /// What the server's operator routes see of the gateway.
@@ -197,7 +242,7 @@ impl Shared {
     fn block(&self, session: &str) {
         let mut blocked = lock(&self.blocked);
         if blocked.insert(session.to_string()) {
-            save_blocked(&self.blocked_path, &blocked);
+            save_blocked_or_warn(&self.blocked_path, &blocked);
         }
     }
 
@@ -205,28 +250,21 @@ impl Shared {
         let mut blocked = lock(&self.blocked);
         let was = blocked.remove(session);
         if was {
-            save_blocked(&self.blocked_path, &blocked);
+            save_blocked_or_warn(&self.blocked_path, &blocked);
         }
         was
     }
 
     fn hold(&self, decision: &str, call: HeldCall) {
-        let mut held = lock(&self.held);
-        if held.calls.insert(decision.to_string(), call).is_none() {
-            held.order.push_back(decision.to_string());
-        }
-        while held.order.len() > MAX_HELD_CALLS {
-            if let Some(old) = held.order.pop_front() {
-                held.calls.remove(&old);
-            }
-        }
+        lock(&self.held).hold(decision, call);
     }
 
-    fn release(&self, decision: &str) {
-        let mut held = lock(&self.held);
-        if held.calls.remove(decision).is_some() {
-            held.order.retain(|d| d != decision);
-        }
+    fn held_generation(&self) -> u64 {
+        lock(&self.held).generation()
+    }
+
+    fn release(&self, decision: &str, before: u64) {
+        lock(&self.held).release(decision, before);
     }
 
     /// Close an MCP session in the background.
@@ -242,34 +280,80 @@ impl Shared {
     }
 }
 
-fn load_blocked(path: &Path, mode: SessionMode) -> BTreeSet<String> {
-    let set: BTreeSet<String> = std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default();
-    // Connection sessions end with the process; agent sessions survive it.
-    set.into_iter()
-        .filter(|s| mode == SessionMode::Agent && s.starts_with("agent:"))
-        .collect()
+/// Largest `gateway.blocked` read.
+const MAX_BLOCKED_BYTES: u64 = 4 << 20;
+
+/// The blocked set kept across restarts: `agent:` entries (an agent-mode
+/// session, or, in connection mode, an agent blocked as a whole).
+/// Connection sessions end with the process. A missing file is an empty
+/// set; any other problem (unreadable, a link, not a regular file, not a
+/// JSON list of strings) is an error: starting anyway would unblock.
+pub fn load_blocked(path: &Path) -> Result<BTreeSet<String>, String> {
+    use std::io::Read;
+    let fail = |why: &dyn std::fmt::Display| {
+        format!(
+            "cannot read {}: {why}; the gateway does not start, because ignoring it would unblock every session it blocks. Fix the file, or remove it to unblock them all",
+            path.display()
+        )
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(e) => return Err(fail(&e)),
+    };
+    let metadata = file.metadata().map_err(|e| fail(&e))?;
+    if !metadata.is_file() || metadata.len() > MAX_BLOCKED_BYTES {
+        return Err(fail(&"not a regular file under 4 MiB"));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_BLOCKED_BYTES)
+        .read_to_end(&mut bytes)
+        .map_err(|e| fail(&e))?;
+    let set: BTreeSet<String> = serde_json::from_slice(&bytes)
+        .map_err(|e| fail(&format!("not a JSON list of session ids ({e})")))?;
+    Ok(set
+        .into_iter()
+        .filter(|s| s.starts_with("agent:"))
+        .collect())
 }
 
-fn save_blocked(path: &Path, blocked: &BTreeSet<String>) {
-    let text = serde_json::to_vec(blocked).unwrap_or_default();
-    let tmp = path.with_extension("tmp");
-    let written = std::fs::write(&tmp, text).and_then(|()| {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-        }
-        std::fs::rename(&tmp, path)
-    });
-    if let Err(e) = written {
+/// Write the blocked set atomically: a new 0600 temp file (never through a
+/// link), synced, then renamed over the old one.
+pub fn save_blocked(path: &Path, blocked: &BTreeSet<String>) -> std::io::Result<()> {
+    use std::io::Write;
+    let text = serde_json::to_vec(blocked).map_err(std::io::Error::other)?;
+    let tmp = path.with_extension("blocked.tmp");
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut file = crate::serve::auth::private_create(&tmp)?;
+    file.write_all(&text)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path)
+}
+
+fn save_blocked_or_warn(path: &Path, blocked: &BTreeSet<String>) {
+    if let Err(e) = save_blocked(path, blocked) {
         eprintln!(
             "trustgraph gateway: cannot write {}: {e}; a blocked session is still blocked until this process ends",
             path.display()
         );
     }
+}
+
+/// The blocked-set key of an agent as a whole.
+fn agent_key(agent: &str) -> String {
+    format!("agent:{agent}")
 }
 
 /// An argument value as the operator sees it: its text when it is a
@@ -282,6 +366,26 @@ fn shown_argument(name: &str, value: &Value) -> Value {
     let total = text.chars().count();
     let shown: String = text.chars().take(SHOWN_CHARS).collect();
     json!({"name": name, "value": shown, "more": total.saturating_sub(SHOWN_CHARS)})
+}
+
+/// A held call's arguments as the operator sees them: those the matched
+/// rule's `when` constrains (who the call reaches) first, marked
+/// `constrained`, then the rest; each group sorted by name.
+fn shown_arguments(call: &HeldCall) -> Vec<Value> {
+    let canonical = canonical_map(&call.arguments);
+    let (first, rest): (Vec<_>, Vec<_>) = canonical
+        .iter()
+        .partition(|(name, _)| call.constrained.contains(name.as_str()));
+    first
+        .into_iter()
+        .map(|entry| (entry, true))
+        .chain(rest.into_iter().map(|entry| (entry, false)))
+        .map(|((name, value), constrained)| {
+            let mut shown = shown_argument(name, value);
+            shown["constrained"] = Value::Bool(constrained);
+            shown
+        })
+        .collect()
 }
 
 impl GatewayView for Shared {
@@ -371,13 +475,14 @@ impl GatewayView for Shared {
         }
     }
 
+    fn blocked(&self) -> Vec<String> {
+        lock(&self.blocked).iter().cloned().collect()
+    }
+
     fn held_call(&self, decision: &str) -> Option<Value> {
         let held = lock(&self.held);
-        let call = held.calls.get(decision)?;
-        let arguments: Vec<Value> = canonical_map(&call.arguments)
-            .iter()
-            .map(|(name, value)| shown_argument(name, value))
-            .collect();
+        let (_, call) = held.calls.get(decision)?;
+        let arguments = shown_arguments(call);
         Some(json!({
             "tool": call.tool,
             "action": call.action,
@@ -454,8 +559,9 @@ pub fn canonical_arguments(arguments: &JsonObject) -> Vec<u8> {
 
 /// What a checked action call may do.
 enum Forward {
-    /// Allowed; `Some(decision)` when an approval allowed it and was used up.
-    Checked(Option<String>),
+    /// Allowed; `Some((decision, generation))` when an approval allowed it
+    /// and was used up, with the held-call generation before the check.
+    Checked(Option<(String, u64)>),
     /// `allow_without_reads` and the session has read nothing.
     Unchecked,
 }
@@ -506,6 +612,86 @@ pub fn schema_report(
     (problems, unforwarded)
 }
 
+/// The JSON type name of a value, as a schema names it.
+fn json_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(n) if n.is_i64() || n.is_u64() => "integer",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// True when `value` is of the schema type `declared`. An integer is also
+/// a number; nothing else converts.
+fn of_type(declared: &str, value: &Value) -> bool {
+    let actual = json_type(value);
+    actual == declared || (declared == "number" && actual == "integer")
+}
+
+/// A small, strict check of a call's top-level arguments against the
+/// `type` each property of the upstream's input schema declares: a value
+/// whose JSON type contradicts it is refused, so the upstream never gets,
+/// say, an object where it takes a string (and maybe reads a recipient out
+/// of it). `type` may be one name or a list of names; for an `array`, an
+/// `items.type` is checked on every element. A property with no `type` is
+/// not checked: this is not a JSON Schema validator.
+pub fn check_schema_types(
+    published: &rmcp::model::Tool,
+    arguments: &JsonObject,
+) -> Result<(), String> {
+    let Some(properties) = published
+        .input_schema
+        .get("properties")
+        .and_then(Value::as_object)
+    else {
+        return Ok(());
+    };
+    let declared = |schema: &Value| -> Option<Vec<String>> {
+        match schema.get("type")? {
+            Value::String(t) => Some(vec![t.clone()]),
+            Value::Array(ts) => Some(
+                ts.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect(),
+            ),
+            _ => Some(Vec::new()),
+        }
+    };
+    for (name, value) in arguments {
+        let Some(schema) = properties.get(name) else {
+            continue;
+        };
+        let Some(types) = declared(schema) else {
+            continue;
+        };
+        if !types.iter().any(|t| of_type(t, value)) {
+            return Err(format!(
+                "`{name}` is of JSON type {}, but the upstream tool declares it {}",
+                json_type(value),
+                types.join(" or ")
+            ));
+        }
+        if let (Value::Array(items), Some(item_types)) =
+            (value, schema.get("items").and_then(&declared))
+            && let Some(bad) = items
+                .iter()
+                .find(|item| !item_types.iter().any(|t| of_type(t, item)))
+        {
+            return Err(format!(
+                "an element of `{name}` is {}, but the upstream tool declares its elements {}",
+                json_type(bad),
+                item_types.join(" or ")
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Build the gateway over a server: check the config against the active
 /// policy, resolve secrets with `lookup`, open the hand-off key, end
 /// sessions that do not survive a restart, and hook into the operator page.
@@ -539,8 +725,13 @@ pub fn attach<J: ServeJournal>(
         manager.session_config.keep_alive = None;
     }
     let blocked_path = server.settings.state_dir.join(BLOCKED_FILE);
-    let blocked = load_blocked(&blocked_path, config.session);
-    save_blocked(&blocked_path, &blocked);
+    let blocked = load_blocked(&blocked_path).map_err(|e| vec![e])?;
+    save_blocked(&blocked_path, &blocked).map_err(|e| {
+        vec![format!(
+            "cannot write {}: {e}; the gateway does not start without a place to keep blocked sessions",
+            blocked_path.display()
+        )]
+    })?;
     let shared = Arc::new(Shared {
         config,
         conns: Mutex::new(Connections::default()),
@@ -769,13 +960,20 @@ impl<J: ServeJournal> Gateway<J> {
                     };
                     let shared = self.shared.clone();
                     let receiver = session.clone();
+                    let whole = agent_key(&agent);
                     let value = self
                         .blocking(move |g| g.receive(&agent, &session, &token))
                         .await
                         .inspect_err(|_| {
                             // Refusing a hand-off must never leave the
-                            // receiver freer than accepting it.
+                            // receiver freer than accepting it. In
+                            // connection mode a new connection is a new
+                            // session, so the agent as a whole is blocked
+                            // too, until the operator clears it.
                             shared.block(&receiver);
+                            if receiver != whole {
+                                shared.block(&whole);
+                            }
                         })?;
                     Ok(structured(value))
                 }
@@ -793,7 +991,13 @@ impl<J: ServeJournal> Gateway<J> {
                             format!("{why}; the call was not forwarded"),
                         )
                     })?;
-                    self.published_ok(&tool).await?;
+                    let published = self.published_ok(&tool).await?;
+                    check_schema_types(&published, &arguments).map_err(|why| {
+                        ToolFail::new(
+                            "invalid_arguments",
+                            format!("{why}; the call was not forwarded"),
+                        )
+                    })?;
                     self.call_tool(agent, session, tool, arguments).await
                 }
             }
@@ -803,8 +1007,8 @@ impl<J: ServeJournal> Gateway<J> {
     }
 
     /// The upstream still publishes `tool`, with a schema under the cap that
-    /// takes every argument the config forwards.
-    async fn published_ok(&self, tool: &Tool) -> Result<(), ToolFail> {
+    /// takes every argument the config forwards; what it publishes.
+    async fn published_ok(&self, tool: &Tool) -> Result<rmcp::model::Tool, ToolFail> {
         let upstream = self
             .upstreams
             .get(&tool.upstream)
@@ -813,18 +1017,17 @@ impl<J: ServeJournal> Gateway<J> {
             .tools()
             .await
             .map_err(|e| ToolFail::upstream(e, &tool.upstream))?;
-        let found = published.iter().find(|t| t.name == tool.name);
-        if found.is_none() {
+        let Some(found) = published.into_iter().find(|t| t.name == tool.name) else {
             return Err(ToolFail::not_available());
-        }
-        let (problems, _) = schema_report(tool, found);
+        };
+        let (problems, _) = schema_report(tool, Some(&found));
         if !problems.is_empty() {
             for p in &problems {
                 eprintln!("trustgraph gateway: {p}; the tool is closed");
             }
             return Err(ToolFail::misconfigured(tool));
         }
-        Ok(())
+        Ok(found)
     }
 
     async fn call_tool(
@@ -882,6 +1085,7 @@ impl<J: ServeJournal> Gateway<J> {
                     content: rule.content.clone(),
                     sha256: sha256_hex(&canonical_arguments(&arguments)),
                     arguments: arguments.clone(),
+                    constrained: rule.when.iter().map(|m| m.argument.clone()).collect(),
                 };
                 let allow_without_reads = *allow_without_reads;
                 let tool2 = tool.clone();
@@ -895,7 +1099,9 @@ impl<J: ServeJournal> Gateway<J> {
                         "trustgraph gateway: `{}` was called with nothing read and forwarded without a check (allow_without_reads)",
                         tool.exposed
                     ),
-                    Forward::Checked(Some(decision)) => self.shared.release(&decision),
+                    Forward::Checked(Some((decision, before))) => {
+                        self.shared.release(&decision, before)
+                    }
                     Forward::Checked(None) => {}
                 }
                 Ok(self.forward(&tool, arguments).await?.0)
@@ -1066,6 +1272,12 @@ impl<J: ServeJournal> Gateway<J> {
                 "this session was handed a token it refused, so it may not act; the operator must end the session on the operator page",
             ));
         }
+        if self.shared.is_blocked(&agent_key(agent)) {
+            return Err(ToolFail::new(
+                "agent_blocked",
+                "this agent was handed a token it refused, so none of its connections may act; the operator must clear the block on the operator page",
+            ));
+        }
         let carried = {
             let rt = self.server.lock()?;
             self.session_live(session)?;
@@ -1113,6 +1325,9 @@ impl<J: ServeJournal> Gateway<J> {
             .ok_or_else(|| ToolFail::new("internal", "no artifact id"))?
             .to_string();
         let action = call.action.clone();
+        // Before the check: a concurrent identical call refused after it is
+        // held at a later generation, and the release leaves it alone.
+        let before = self.shared.held_generation();
         let decision = self.server.check_once(
             agent,
             CheckRequest {
@@ -1129,7 +1344,7 @@ impl<J: ServeJournal> Gateway<J> {
         let extra = Some(json!({"decision": id, "verdict": decision["verdict"].clone()}));
         match decision["verdict"].as_str() {
             Some("allow") => Ok(Forward::Checked(
-                (decision["consumed"] == true).then_some(id),
+                (decision["consumed"] == true).then_some((id, before)),
             )),
             Some("needs_approval") => {
                 self.shared.hold(&id, call);
@@ -1292,6 +1507,12 @@ pub async fn main(options: super::Options, config_path: PathBuf, port: u16) -> i
     for warning in config::warnings(&config) {
         eprintln!("warning: {warning}");
     }
+    let stale = upstream::remove_stale_homes(&std::env::temp_dir());
+    if stale > 0 {
+        eprintln!(
+            "trustgraph gateway: removed {stale} private upstream HOME directories a stopped gateway left behind"
+        );
+    }
     let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
         Ok(l) => l,
         Err(e) => {
@@ -1321,6 +1542,20 @@ pub async fn main(options: super::Options, config_path: PathBuf, port: u16) -> i
             return 1;
         }
     };
+    let code = serve_gateway(&gateway, &server, &config_path, listener, port).await;
+    // Every exit path stops the stdio children and removes their private
+    // HOME directories before the process ends.
+    gateway.upstreams.shutdown().await;
+    code
+}
+
+async fn serve_gateway(
+    gateway: &Arc<Gateway<FileJournal>>,
+    server: &Server<FileJournal>,
+    config_path: &Path,
+    listener: tokio::net::TcpListener,
+    port: u16,
+) -> i32 {
     let problems = gateway.verify_upstreams().await;
     if !problems.is_empty() {
         eprintln!(
@@ -1332,7 +1567,7 @@ pub async fn main(options: super::Options, config_path: PathBuf, port: u16) -> i
         }
         return 1;
     }
-    if let Err(code) = super::banner(&server, port, "TrustGraph gateway", "/gateway/mcp") {
+    if let Err(code) = super::banner(server, port, "TrustGraph gateway", "/gateway/mcp") {
         return code;
     }
     println!(
@@ -1340,13 +1575,14 @@ pub async fn main(options: super::Options, config_path: PathBuf, port: u16) -> i
         gateway.config().session.as_str(),
         gateway.config().tools.len() + 2
     );
-    super::run(listener, router(gateway)).await
+    super::run(listener, router(gateway.clone())).await
 }
 
 /// `trustgraph gateway check`: validate `gateway.yaml` against a policy and
-/// say in plain English what it does. Upstreams whose variables are set
-/// here are contacted to check argument names. Returns the exit code.
-pub async fn check(config_path: &Path, policy_path: &Path) -> i32 {
+/// say in plain English what it does. Unless `offline`, upstreams whose
+/// variables are set here are contacted (stdio ones are run) to check
+/// argument names. Returns the exit code.
+pub async fn check(config_path: &Path, policy_path: &Path, offline: bool) -> i32 {
     let config = match load_config(config_path) {
         Ok(c) => c,
         Err(problems) => {
@@ -1379,7 +1615,22 @@ pub async fn check(config_path: &Path, policy_path: &Path) -> i32 {
         .iter()
         .map(ToString::to_string)
         .collect();
-    let (published, contact) = contact_upstreams(&config).await;
+    let (published, contact) = if offline {
+        let contact = Contact {
+            notes: vec![
+                "note: --offline: no upstream was contacted and no stdio command was run, so the checks against what upstreams publish (tool names, argument names, schema size) were skipped".into(),
+            ],
+            missing: config::env_names(&config)
+                .into_iter()
+                .filter(|n| std::env::var_os(n).is_none())
+                .collect(),
+            ..Contact::default()
+        };
+        let published = config.upstreams.keys().map(|n| (n.clone(), None)).collect();
+        (published, contact)
+    } else {
+        contact_upstreams(&config).await
+    };
     for tool in config.tools.values() {
         if let Some(Some(tools)) = published.get(&tool.upstream) {
             let found = tools.iter().find(|t| t.name == tool.name);
@@ -1487,11 +1738,25 @@ fn people(names: &BTreeSet<String>) -> String {
 
 fn when_text(when: &[config::Matcher]) -> String {
     if when.is_empty() {
-        "always".into()
+        "always (every call, whatever its arguments)".into()
     } else {
         let parts: Vec<String> = when
             .iter()
-            .map(|m| format!("`{}` matches `{}`", m.argument, m.glob))
+            .map(|m| match m.kind {
+                config::MatchType::Exact => format!("`{}` is exactly `{}`", m.argument, m.pattern),
+                config::MatchType::Email if m.pattern.starts_with("*@") => format!(
+                    "`{}` is a plain email address at exactly `{}`",
+                    m.argument,
+                    &m.pattern[2..]
+                ),
+                config::MatchType::Email => {
+                    format!("`{}` is the email address `{}`", m.argument, m.pattern)
+                }
+                config::MatchType::Glob => {
+                    format!("`{}` matches the glob `{}`", m.argument, m.pattern)
+                }
+                config::MatchType::Path => format!("`{}` matches `{}`", m.argument, m.pattern),
+            })
             .collect();
         format!("when {}", parts.join(" and "))
     }
@@ -1632,4 +1897,78 @@ pub fn summary(
         "  {HANDOFF_TOOL} and {RECEIVE_TOOL} pass what a session carries to another agent's session"
     ));
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn call(text: &str) -> HeldCall {
+        HeldCall {
+            tool: "slack__post_message".into(),
+            action: "brief_leadership".into(),
+            content: None,
+            arguments: json!({"text": text}).as_object().cloned().unwrap(),
+            sha256: "00".into(),
+            constrained: BTreeSet::new(),
+        }
+    }
+
+    /// The interleaving of two identical retries after one approval: the
+    /// winner's check uses the approval up, the loser's check (after it)
+    /// is refused and holds the call again, and only then is the winner's
+    /// release applied. The loser's call must still be held.
+    #[test]
+    fn a_release_never_forgets_a_call_held_again_after_its_check() {
+        let mut held = Held::default();
+        held.hold("d1", call("first"));
+        let winner_before = held.generation();
+        held.hold("d1", call("again"));
+        held.release("d1", winner_before);
+        let (_, kept) = held.calls.get("d1").expect("the loser's call is kept");
+        assert_eq!(kept.arguments["text"], "again");
+        assert_eq!(held.order.len(), 1);
+        // A release with nothing newer forgets it.
+        let before = held.generation();
+        held.release("d1", before);
+        assert!(held.calls.is_empty() && held.order.is_empty());
+        // A release of a decision never held, or already gone, is a no-op.
+        held.release("d2", u64::MAX);
+        assert!(held.calls.is_empty());
+    }
+
+    #[test]
+    fn the_operator_sees_the_constrained_arguments_first() {
+        let mut held = call("x");
+        held.arguments = json!({"body": "b", "subject": "s", "to": "sam@corp.com", "cc": "c"})
+            .as_object()
+            .cloned()
+            .unwrap();
+        held.constrained = ["to".to_string(), "cc".to_string()].into();
+        let shown = shown_arguments(&held);
+        let order: Vec<(&str, bool)> = shown
+            .iter()
+            .map(|a| (a["name"].as_str().unwrap(), a["constrained"] == true))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                ("cc", true),
+                ("to", true),
+                ("body", false),
+                ("subject", false)
+            ]
+        );
+        assert_eq!(shown[1]["value"], "sam@corp.com");
+    }
+
+    #[test]
+    fn held_calls_are_capped_oldest_first() {
+        let mut held = Held::default();
+        for i in 0..MAX_HELD_CALLS + 3 {
+            held.hold(&format!("d{i}"), call("x"));
+        }
+        assert_eq!(held.calls.len(), MAX_HELD_CALLS);
+        assert!(!held.calls.contains_key("d0") && held.calls.contains_key("d3"));
+    }
 }

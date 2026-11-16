@@ -51,12 +51,24 @@ enum GatewayCommand {
         #[arg(long)]
         allow_insecure: bool,
     },
-    /// Validate a gateway config against a policy and say what it does.
+    /// Validate a gateway config against a policy and say what it does; this
+    /// RUNS configured stdio upstream commands unless --offline is given.
+    ///
+    /// Unless --offline is given, `check` connects to every configured upstream
+    /// whose environment variables are set here, to compare the arguments the
+    /// config forwards with the ones each upstream tool takes. That RUNS every
+    /// such stdio upstream's configured `command`, with its configured
+    /// environment, on this machine. Pass --offline to check only the config
+    /// and the policy.
     Check {
         #[arg(long)]
         config: PathBuf,
         #[arg(long)]
         policy: PathBuf,
+        /// Do not connect to any upstream (no stdio command is run); the checks
+        /// against what upstreams publish are skipped and reported as skipped.
+        #[arg(long)]
+        offline: bool,
     },
 }
 
@@ -134,9 +146,14 @@ async fn main() {
             ..
         } => gateway::bridge::run(&url, &token_file, allow_insecure).await,
         Command::Gateway {
-            command: Some(GatewayCommand::Check { config, policy }),
+            command:
+                Some(GatewayCommand::Check {
+                    config,
+                    policy,
+                    offline,
+                }),
             ..
-        } => gateway::check(&config, &policy).await,
+        } => gateway::check(&config, &policy, offline).await,
         Command::Gateway {
             command: None,
             config,

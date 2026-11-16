@@ -146,7 +146,7 @@ tools:
   slack.send_email:
     arguments: [to, subject, body]
     acts:
-      - when: {{ to: "*@corp.com" }}
+      - when: {{ to: {{ pattern: "*@corp.com", type: email }} }}
         action: email_staff
         content: body
   slack.env_names:
@@ -1503,10 +1503,18 @@ tools:
     let config::Kind::Acts { rules, .. } = &config.tools["drive__post"].kind else {
         panic!()
     };
-    assert!(rules[0].when[0].path);
+    assert_eq!(rules[0].when[0].kind, config::MatchType::Path);
     let warnings = config::warnings(&config);
-    assert_eq!(warnings.len(), 1, "{warnings:#?}");
-    assert_eq!(warnings[0].path, "tools.drive.read_file.reads[1]");
+    let paths: Vec<&str> = warnings.iter().map(|w| w.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        [
+            "tools.drive.post.arguments",
+            "tools.drive.read_file.reads[1]"
+        ],
+        "{warnings:#?}"
+    );
+    assert!(warnings[0].message.contains("body"), "{}", warnings[0]);
     // A path-typed argument with a leading `/` never matches.
     let args = json!({"to": "/srv/x", "body": "b"});
     assert!(!config::when_matches(
@@ -1805,9 +1813,15 @@ async fn c1_recipient_globs_do_not_cross_separators_and_arrays_must_all_match() 
                 json!({"to": to, "body": "Q3"}),
             )
             .await;
-        assert_eq!(error_code(&sent), "blocked", "{to}: {sent}");
+        // The upstream declares `to` a string: a list or an object is
+        // refused before matching; a string that does not match is blocked.
+        let expected = if to.is_string() {
+            "blocked"
+        } else {
+            "invalid_arguments"
+        };
+        assert_eq!(error_code(&sent), expected, "{to}: {sent}");
     }
-    assert!(slack_calls(&h).is_empty(), "{:?}", slack_calls(&h));
     let sent = h
         .call(
             &planner,
@@ -1815,7 +1829,408 @@ async fn c1_recipient_globs_do_not_cross_separators_and_arrays_must_all_match() 
             json!({"to": ["a@corp.com", "b@corp.com"], "body": "Q3"}),
         )
         .await;
+    assert_eq!(error_code(&sent), "invalid_arguments", "{sent}");
+    assert!(
+        text(&sent)
+            .contains("`to` is of JSON type array, but the upstream tool declares it string"),
+        "{sent}"
+    );
+    assert!(slack_calls(&h).is_empty(), "{:?}", slack_calls(&h));
+}
+
+#[tokio::test]
+async fn m6_values_whose_json_type_contradicts_the_upstream_schema_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = memory(dir.path(), "connection").await;
+    let planner = h.connect("planner").await;
+    ok(&h.read(&planner, "Product/roadmap.md").await);
+    for text_value in [
+        json!({"channel": "#all-company"}),
+        json!(["#all-company"]),
+        json!(1),
+        json!(1.5),
+        json!(true),
+        json!(null),
+    ] {
+        let sent = h
+            .call(
+                &planner,
+                "slack__post_message",
+                json!({"channel": "#engineering", "text": text_value}),
+            )
+            .await;
+        assert_eq!(
+            error_code(&sent),
+            "invalid_arguments",
+            "{text_value}: {sent}"
+        );
+        assert!(text(&sent).contains("`text` is of JSON type"), "{sent}");
+    }
+    let read = h
+        .call(
+            &planner,
+            "drive__read_file",
+            json!({"path": ["Product/roadmap.md"]}),
+        )
+        .await;
+    assert_eq!(error_code(&read), "invalid_arguments", "{read}");
+    assert!(slack_calls(&h).is_empty(), "{:?}", slack_calls(&h));
+    assert_eq!(calls(&h.drive.log, "read_file").len(), 1);
+    ok(&h.post(&planner, "#engineering", "roadmap only").await);
+}
+
+#[test]
+fn m6_the_schema_type_check_is_small_and_strict() {
+    let tool = |properties: Value| {
+        rmcp::model::Tool::new(
+            "t",
+            "t",
+            json!({"type": "object", "properties": properties})
+                .as_object()
+                .cloned()
+                .unwrap(),
+        )
+    };
+    let args = |v: Value| v.as_object().cloned().unwrap();
+    let t = tool(json!({
+        "s": {"type": "string"},
+        "i": {"type": "integer"},
+        "n": {"type": "number"},
+        "b": {"type": "boolean"},
+        "o": {"type": ["string", "null"]},
+        "a": {"type": "array", "items": {"type": "string"}},
+        "free": {"description": "no type: not checked"},
+    }));
+    for good in [
+        json!({"s": "x", "i": 3, "n": 3, "b": false}),
+        json!({"n": 2.5, "o": null, "a": ["x", "y"], "free": {"any": 1}}),
+        json!({"o": "x", "a": [], "undeclared": 1}),
+    ] {
+        assert!(
+            gateway::check_schema_types(&t, &args(good.clone())).is_ok(),
+            "{good}"
+        );
+    }
+    for bad in [
+        json!({"s": {"channel": "#all-company"}}),
+        json!({"s": ["x"]}),
+        json!({"s": 1}),
+        json!({"i": "3"}),
+        json!({"i": 3.5}),
+        json!({"n": "3"}),
+        json!({"b": "true"}),
+        json!({"o": 1}),
+        json!({"a": "x"}),
+        json!({"a": ["x", 1]}),
+        json!({"a": [["x"]]}),
+    ] {
+        assert!(
+            gateway::check_schema_types(&t, &args(bad.clone())).is_err(),
+            "{bad}"
+        );
+    }
+}
+
+/// Recipient values a mail parser may read as an address outside the
+/// domain (the third review's reproduction), and invisible-character tricks.
+const SPOOFED_RECIPIENTS: &[&str] = &[
+    "x@evil.com(@corp.com",
+    "x@evil.com@corp.com",
+    "x%evil.com@corp.com",
+    "evil.com!x@corp.com",
+    "=?utf-8?q?x@evil.com?=@corp.com",
+    "x@evil.com\u{2063}@corp.com",
+    "\"x@evil.com\"@corp.com",
+    "x@EVIL.COM?@corp.com",
+    "x@[1.2.3.4]@corp.com",
+    "sam@corp.com\u{200b}",
+    "sam\u{00ad}@corp.com",
+    "sam@corp.com\u{e0041}",
+    "sam\u{3164}@corp.com",
+    "sam@corp.com.",
+    ".sam@corp.com",
+    "sam@sub.corp.com",
+    "sam@corp.com.evil.com",
+];
+
+async fn email_to<J: ServeJournal>(h: &Gw<J>, agent: &Agent, to: Value) -> Value {
+    h.call(agent, "slack__send_email", json!({"to": to, "body": "Q3"}))
+        .await
+}
+
+#[tokio::test]
+async fn i1_spoofed_recipients_are_refused_under_type_email() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = memory(dir.path(), "connection").await;
+    let planner = h.connect("planner").await;
+    ok(&h.read(&planner, "Product/roadmap.md").await);
+    for to in SPOOFED_RECIPIENTS {
+        let sent = email_to(&h, &planner, json!(to)).await;
+        assert_eq!(error_code(&sent), "blocked", "{to:?}: {sent}");
+    }
+    assert!(slack_calls(&h).is_empty(), "{:?}", slack_calls(&h));
+    for to in ["sam@corp.com", "x+y@CORP.com", "first.last-1@corp.com"] {
+        let sent = email_to(&h, &planner, json!(to)).await;
+        assert_eq!(ok(&sent), "sent", "{to}");
+    }
+    assert_eq!(slack_calls(&h).len(), 3);
+}
+
+#[tokio::test]
+async fn i1_acts_rules_match_exactly_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let h = launch_with(
+        dir.path(),
+        "connection",
+        move |port| {
+            let runtime = Runtime::open(MemoryJournal::new(), POLICY, 0).unwrap();
+            Server::new(runtime, settings(port, &state, Limits::default())).unwrap()
+        },
+        |text| {
+            text.replace(
+                r#"to: { pattern: "*@corp.com", type: email }"#,
+                r#"to: "sam@corp.com""#,
+            )
+        },
+    )
+    .await;
+    let planner = h.connect("planner").await;
+    ok(&h.read(&planner, "Product/roadmap.md").await);
+    for to in SPOOFED_RECIPIENTS.iter().copied().chain([
+        "SAM@corp.com",
+        "sam@CORP.COM",
+        " sam@corp.com",
+        "x@corp.com",
+    ]) {
+        let sent = email_to(&h, &planner, json!(to)).await;
+        assert_eq!(error_code(&sent), "blocked", "{to:?}: {sent}");
+    }
+    assert!(slack_calls(&h).is_empty(), "{:?}", slack_calls(&h));
+    let sent = email_to(&h, &planner, json!("sam@corp.com")).await;
     assert_eq!(ok(&sent), "sent");
+}
+
+#[test]
+fn i1_matcher_types_and_their_config_errors() {
+    let email = |p: &str| config::Matcher {
+        argument: "to".into(),
+        pattern: p.into(),
+        kind: config::MatchType::Email,
+    };
+    for to in SPOOFED_RECIPIENTS {
+        assert!(
+            !config::value_matches(&email("*@corp.com"), &json!(to)),
+            "{to:?}"
+        );
+        assert!(
+            !config::value_matches(&email("sam@corp.com"), &json!(to)),
+            "{to:?}"
+        );
+    }
+    assert!(config::value_matches(
+        &email("*@corp.com"),
+        &json!("sam@Corp.Com")
+    ));
+    assert!(config::value_matches(
+        &email("sam@corp.com"),
+        &json!("sam@CORP.com")
+    ));
+    assert!(!config::value_matches(
+        &email("sam@corp.com"),
+        &json!("Sam@corp.com")
+    ));
+    // A list matches only when every element does.
+    assert!(!config::value_matches(&email("*@corp.com"), &json!([])));
+    assert!(config::value_matches(
+        &email("*@corp.com"),
+        &json!(["a@corp.com", "b_c@corp.com"])
+    ));
+    assert!(!config::value_matches(
+        &email("*@corp.com"),
+        &json!(["sam@corp.com", "x@evil.com@corp.com"])
+    ));
+    assert!(!config::value_matches(
+        &email("*@corp.com"),
+        &json!(["a@corp.com", 1])
+    ));
+    let exact = config::Matcher {
+        argument: "to".into(),
+        pattern: "sam@corp.com".into(),
+        kind: config::MatchType::Exact,
+    };
+    assert!(config::value_matches(
+        &exact,
+        &json!(["sam@corp.com", "sam@corp.com"])
+    ));
+    assert!(!config::value_matches(
+        &exact,
+        &json!(["sam@corp.com", "x@corp.com"])
+    ));
+    assert!(!config::value_matches(&exact, &json!("SAM@corp.com")));
+    assert!(!config::value_matches(
+        &exact,
+        &json!({"to": "sam@corp.com"})
+    ));
+    // Invisible characters never match, whatever the type.
+    for kind in [
+        config::MatchType::Exact,
+        config::MatchType::Glob,
+        config::MatchType::Path,
+    ] {
+        let m = config::Matcher {
+            argument: "a".into(),
+            pattern: "x*".into(),
+            kind,
+        };
+        for odd in [
+            "x\u{200b}",
+            "x\u{00ad}",
+            "x\u{3164}",
+            "x\u{e0001}",
+            "x\u{2028}",
+            "x\u{feff}",
+        ] {
+            assert!(!config::value_matches(&m, &json!(odd)), "{kind:?} {odd:?}");
+        }
+    }
+    let text = |when: &str| {
+        format!(
+            "version: 1
+upstreams:
+  slack: {{ command: [x] }}
+tools:
+  slack.send_email:
+    arguments: [to, body]
+    acts:
+      - when: {when}
+        action: email_staff
+"
+        )
+    };
+    for (when, needle) in [
+        (r#"{ to: "*@corp.com" }"#, "type: email"),
+        (
+            r#"{ to: { pattern: "*@corp.com", type: exact } }"#,
+            "type: email",
+        ),
+        (r#"{ to: "?am@corp.com" }"#, "type: glob"),
+        (
+            r#"{ to: { pattern: "x@evil.com@corp.com", type: email } }"#,
+            "email pattern",
+        ),
+        (
+            r#"{ to: { pattern: "*@*.com", type: email } }"#,
+            "email pattern",
+        ),
+        (
+            r#"{ to: { pattern: "a", type: text } }"#,
+            "no longer a type",
+        ),
+        (r#"{ to: { pattern: "a", glob: "b" } }"#, "not both"),
+        ("{ to: \"sam@corp.com\\u200b\" }", "invisible"),
+    ] {
+        let problems = config::parse(&text(when)).unwrap_err();
+        assert!(
+            problems.iter().any(
+                |p| p.path.starts_with("tools.slack.send_email.acts[0].when.to")
+                    && p.message.contains(needle)
+            ),
+            "{when}: {problems:#?}"
+        );
+    }
+    // Typed patterns parse; a glob on an action and a free argument warn.
+    let config = config::parse(&text(r#"{ to: { glob: "*@corp.com", type: glob } }"#)).unwrap();
+    let warnings: Vec<String> = config::warnings(&config)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("acts[0].when.to") && w.contains("type: glob")),
+        "{warnings:#?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("send_email.arguments") && w.contains("body")),
+        "{warnings:#?}"
+    );
+    let config = config::parse(&text("{}")).unwrap();
+    let warnings: Vec<String> = config::warnings(&config)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert!(
+        warnings.iter().any(|w| w.contains("acts[0]")
+            && w.contains(
+                "every call to this tool is treated as `email_staff` whatever its arguments"
+            )),
+        "{warnings:#?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("to, body") || w.contains("body, to")),
+        "{warnings:#?}"
+    );
+    // A reads rule still defaults to `type: path`.
+    let reads = "version: 1
+upstreams:
+  drive: { url: \"https://d.example.com/mcp\" }
+tools:
+  drive.read_file:
+    reads:
+      - when: { path: \"Product/**\" }
+        source: roadmap
+    otherwise: unmatched
+";
+    let config = config::parse(reads).unwrap();
+    let config::Kind::Reads { rules, .. } = &config.tools["drive__read_file"].kind else {
+        panic!()
+    };
+    assert_eq!(rules[0].when[0].kind, config::MatchType::Path);
+}
+
+#[test]
+fn i1_gateway_check_prints_the_matchers_and_warns() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("gateway.yaml");
+    std::fs::write(
+        &config_path,
+        config_text(
+            "https://drive.example.com/mcp",
+            Path::new("/dev/null"),
+            "agent",
+        )
+        .replace(
+            "        action: brief_leadership\n",
+            "        action: brief_leadership\n      - action: post_to_engineering\n",
+        ),
+    )
+    .unwrap();
+    let policy_path = dir.path().join("policy.yaml");
+    std::fs::write(&policy_path, POLICY).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_trustgraph"))
+        .args(["gateway", "check", "--offline", "--config"])
+        .arg(&config_path)
+        .arg("--policy")
+        .arg(&policy_path)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    for expected in [
+        "when `channel` is exactly `#engineering`: `post_to_engineering`",
+        "when `to` is a plain email address at exactly `corp.com`: `email_staff`",
+        "always (every call, whatever its arguments): `post_to_engineering`",
+        "warning: tools.slack.post_message.acts[2]: no `when`: every call to this tool is treated as `post_to_engineering` whatever its arguments",
+        "warning: tools.slack.post_message.arguments: not constrained by any `when`: text, thread",
+        "warning: tools.slack.send_email.arguments: not constrained by any `when`: body, subject",
+    ] {
+        assert!(stdout.contains(expected), "{expected:?} not in:\n{stdout}");
+    }
 }
 
 #[tokio::test]
@@ -1924,7 +2339,12 @@ async fn c2_the_operator_sees_the_arguments_of_a_held_call() {
     let arguments = call["arguments"].as_array().unwrap();
     assert_eq!(arguments[0]["name"], "channel");
     assert_eq!(arguments[0]["value"], "#leadership");
+    assert_eq!(
+        arguments[0]["constrained"], true,
+        "the rule's `when` names it"
+    );
     assert_eq!(arguments[1]["name"], "text");
+    assert_eq!(arguments[1]["constrained"], false);
     let shown = arguments[1]["value"].as_str().unwrap();
     assert_eq!(shown.chars().count(), 2000);
     assert!(long.starts_with(shown));
@@ -2163,6 +2583,138 @@ async fn a_refused_hand_off_leaves_the_receiver_unable_to_act() {
 }
 
 #[tokio::test]
+async fn m2_in_connection_mode_a_refused_hand_off_blocks_the_whole_agent_until_cleared() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = memory(dir.path(), "connection").await;
+    let operator = h.login().await;
+    let planner = h.connect("planner").await;
+    ok(&h.read(&planner, "Product/roadmap.md").await);
+    let refused = h
+        .call(&planner, gateway::RECEIVE_TOOL, json!({"token": "garbage"}))
+        .await;
+    assert_eq!(error_code(&refused), "invalid_handoff");
+    // A new connection is a new session, but the agent is blocked.
+    let fresh = h.connect("planner").await;
+    ok(&h.read(&fresh, "Product/roadmap.md").await);
+    let post = h.post(&fresh, "#engineering", "roadmap only").await;
+    assert_eq!(error_code(&post), "agent_blocked", "{post}");
+    assert!(slack_calls(&h).is_empty());
+    // Another agent is not affected.
+    let scout = h.connect("scout").await;
+    ok(&h.read(&scout, "Public/benchmarks.md").await);
+    ok(&h.post(&scout, "#engineering", "bench").await);
+    let state = h.op_state(&operator).await;
+    let blocked: Vec<&str> = state["gateway"]["blocked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(blocked.contains(&"agent:planner"), "{blocked:?}");
+    // Kept across a restart.
+    let saved = gateway::load_blocked(&h.state.join("gateway.blocked")).unwrap();
+    assert!(saved.contains("agent:planner"), "{saved:?}");
+    // The operator clears it; the fresh connection may act, the refusing
+    // connection's own session stays blocked.
+    let (status, body) = h
+        .op_post(
+            "/v1/operator/end-session",
+            &operator,
+            json!({"session": "agent:planner"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    ok(&h.post(&fresh, "#engineering", "roadmap only").await);
+    let post = h.post(&planner, "#engineering", "roadmap").await;
+    assert_eq!(error_code(&post), "session_blocked", "{post}");
+}
+
+fn bare_server(state: &Path) -> Arc<Server<MemoryJournal>> {
+    let runtime = Runtime::open(MemoryJournal::new(), POLICY, 0).unwrap();
+    Server::new(runtime, settings(1, state, Limits::default())).unwrap()
+}
+
+#[tokio::test]
+async fn m1_a_corrupt_or_unreadable_blocked_file_stops_the_gateway() {
+    let dir = tempfile::tempdir().unwrap();
+    let drive = drive(dir.path()).await;
+    let text = config_text(&drive.url, &dir.path().join("s.log"), "agent");
+    let state = dir.path().join("state");
+    let blocked = state.join("gateway.blocked");
+    for bad in [
+        "",
+        "not json",
+        "[\"agent:planner\"",
+        "{\"agent:planner\": true}",
+        "[1]",
+    ] {
+        let server = bare_server(&state);
+        std::fs::write(&blocked, bad).unwrap();
+        let problems = gateway::attach(server, config::parse(&text).unwrap(), &env)
+            .err()
+            .unwrap_or_else(|| panic!("started with {bad:?}"));
+        assert!(
+            problems.iter().any(|p| p.contains("gateway.blocked")),
+            "{problems:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&blocked).unwrap(),
+            bad,
+            "kept as is"
+        );
+    }
+    // A directory or a link where the file should be is refused too.
+    std::fs::remove_file(&blocked).unwrap();
+    std::fs::create_dir(&blocked).unwrap();
+    assert!(gateway::attach(bare_server(&state), config::parse(&text).unwrap(), &env).is_err());
+    std::fs::remove_dir(&blocked).unwrap();
+    #[cfg(unix)]
+    {
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, "[]").unwrap();
+        std::os::unix::fs::symlink(&target, &blocked).unwrap();
+        assert!(gateway::attach(bare_server(&state), config::parse(&text).unwrap(), &env).is_err());
+        std::fs::remove_file(&blocked).unwrap();
+    }
+    // A missing file is an empty set; a good one is kept.
+    std::fs::write(&blocked, r#"["agent:planner","conn:x"]"#).unwrap();
+    let server = bare_server(&state);
+    assert!(gateway::attach(server, config::parse(&text).unwrap(), &env).is_ok());
+    assert_eq!(
+        std::fs::read_to_string(&blocked).unwrap(),
+        r#"["agent:planner"]"#
+    );
+}
+
+#[test]
+fn m1_the_blocked_file_is_written_atomically_and_never_through_a_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gateway.blocked");
+    let set: std::collections::BTreeSet<String> = ["agent:planner".to_string()].into();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let target = dir.path().join("target");
+        std::fs::write(&target, "untouched").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("gateway.blocked.tmp")).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        gateway::save_blocked(&path, &set).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert!(metadata.is_file(), "the link was replaced by a file");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    }
+    gateway::save_blocked(&path, &set).unwrap();
+    assert_eq!(gateway::load_blocked(&path).unwrap(), set);
+    assert!(!dir.path().join("gateway.blocked.tmp").exists());
+    assert!(
+        gateway::load_blocked(&dir.path().join("missing"))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn a_connection_ended_mid_call_leaves_no_session_behind() {
     let dir = tempfile::tempdir().unwrap();
     let h = memory(dir.path(), "connection").await;
@@ -2351,4 +2903,58 @@ async fn c2_concurrent_identical_retries_release_one_call() {
     let forwarded = results.iter().filter(|r| r["isError"] != true).count();
     assert_eq!(forwarded, 1, "{results:?}");
     assert_eq!(slack_calls(&h).len(), 1);
+}
+
+#[tokio::test]
+async fn m8_after_concurrent_retries_the_losers_call_stays_approvable() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Arc::new(memory(dir.path(), "agent").await);
+    let operator = h.login().await;
+    let planner = h.connect("planner").await;
+    ok(&h.read(&planner, "Product/roadmap.md").await);
+    let args = json!({"channel": "#leadership", "text": "Q3 plan"});
+    let mut connections = Vec::new();
+    for _ in 0..3 {
+        connections.push(Arc::new(h.connect("planner").await));
+    }
+    for round in 0..10 {
+        let held = h.call(&planner, "slack__post_message", args.clone()).await;
+        assert_eq!(error_code(&held), "needs_approval", "{held}");
+        let decision = decision_of(&held);
+        let (status, body) = h
+            .op_post(
+                "/v1/operator/approve",
+                &operator,
+                json!({"decision": decision}),
+            )
+            .await;
+        assert_eq!(status, 200, "round {round}: {body}");
+        let mut tasks = Vec::new();
+        for c in &connections {
+            let (h, c, args) = (h.clone(), c.clone(), args.clone());
+            tasks.push(tokio::spawn(async move {
+                h.call(&c, "slack__post_message", args).await
+            }));
+        }
+        let mut forwarded = 0;
+        for t in tasks {
+            if t.await.unwrap()["isError"] != true {
+                forwarded += 1;
+            }
+        }
+        assert_eq!(forwarded, 1, "round {round}");
+        assert_eq!(slack_calls(&h).len(), round + 1);
+        // Every loser was held again: the operator still sees exactly what
+        // it would forward, so the next approval can be given.
+        let state = h.op_state(&operator).await;
+        let pending = state["pending"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["decision"] == decision.as_str())
+            .unwrap_or_else(|| panic!("round {round}: not pending: {state}"))
+            .clone();
+        assert_eq!(pending["gateway"]["held"], true, "round {round}: {pending}");
+        assert_eq!(pending["can_approve"], true, "round {round}: {pending}");
+    }
 }

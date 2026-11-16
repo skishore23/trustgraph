@@ -9,11 +9,13 @@
 //!
 //! Every tool has an argument allow-list (`arguments`); a call carrying any
 //! other argument is refused, so what is checked is exactly what is
-//! forwarded. Matching is fail-closed by construction (see
-//! [`safe_for_matching`] and [`safe_path_for_matching`]): an argument that
-//! is not a plain string (or a list of them), or holds a `..` segment or a
-//! control character, never matches a `when` rule, so the call falls to
-//! `otherwise`.
+//! forwarded. A `when` argument is matched by type ([`MatchType`]): `acts`
+//! rules match exactly unless a rule asks for `glob`, `email` or `path`,
+//! because the rule decides who an action reaches. Matching is fail-closed
+//! by construction (see [`safe_for_matching`], [`safe_path_for_matching`]
+//! and [`parse_email`]): an argument that is not a plain string (or a list
+//! of them), or holds a `..` segment or an invisible or control character,
+//! never matches a `when` rule, so the call falls to `otherwise`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -47,7 +49,7 @@ const STDIO_KEYS: &[&str] = &["command", "env"];
 const READS_KEYS: &[&str] = &["reads", "otherwise", "arguments"];
 const ACTS_KEYS: &[&str] = &["acts", "otherwise", "allow_without_reads", "arguments"];
 const PASSTHROUGH_KEYS: &[&str] = &["passthrough", "untracked", "arguments"];
-const MATCHER_KEYS: &[&str] = &["glob", "type"];
+const MATCHER_KEYS: &[&str] = &["pattern", "glob", "type"];
 /// Longest argument name.
 pub const MAX_ARGUMENT_NAME: usize = 128;
 /// Shortest `${env:…}` value accepted: redacting a shorter one by
@@ -136,13 +138,39 @@ pub enum Upstream {
     },
 }
 
-/// One argument glob of a `when` rule.
+/// How one `when` argument is matched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchType {
+    /// The value equals the pattern byte for byte; no wildcards. The
+    /// default in `acts` rules.
+    Exact,
+    /// A glob (see [`glob`]). Must be asked for on an `acts` rule.
+    Glob,
+    /// A strict email address: `name@domain` or `*@domain` (see
+    /// [`email_matches`]).
+    Email,
+    /// A glob over a path; odd path forms never match. The default in
+    /// `reads` rules.
+    Path,
+}
+
+impl MatchType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MatchType::Exact => "exact",
+            MatchType::Glob => "glob",
+            MatchType::Email => "email",
+            MatchType::Path => "path",
+        }
+    }
+}
+
+/// One argument of a `when` rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Matcher {
     pub argument: String,
-    pub glob: String,
-    /// `type: path` (the default in `reads` rules): odd path forms never match.
-    pub path: bool,
+    pub pattern: String,
+    pub kind: MatchType,
 }
 
 #[derive(Debug, Clone)]
@@ -332,9 +360,11 @@ impl Cx {
         out
     }
 
-    /// A `when` mapping: `argument: glob`, or `argument: {glob, type}` with
-    /// `type` `path` or `text` (`default_path` when not given).
-    fn when(&mut self, v: Option<&&Value>, path: &str, default_path: bool) -> Vec<Matcher> {
+    /// A `when` mapping: `argument: pattern`, or `argument: {pattern, type}`
+    /// with `type` `exact`, `glob`, `email` or `path` (`glob:` is accepted
+    /// for `pattern:`). `acts` rules default to `exact` and refuse an
+    /// untyped wildcard; `reads` rules default to `path`.
+    fn when(&mut self, v: Option<&&Value>, path: &str, acts: bool) -> Vec<Matcher> {
         let Some(v) = v else {
             return Vec::new();
         };
@@ -349,37 +379,92 @@ impl Cx {
                 self.error(&here, "not a valid argument name");
                 continue;
             }
-            let (glob, is_path) = match value {
+            let (pattern, kind) = match value {
                 Value::Mapping(spec) => {
                     let keys = self.entries(spec, &here, Some(MATCHER_KEYS));
-                    let is_path = match keys.get("type") {
-                        None => default_path,
-                        Some(Value::String(t)) if t == "path" => true,
-                        Some(Value::String(t)) if t == "text" => false,
+                    let kind = match keys.get("type") {
+                        None => None,
+                        Some(Value::String(t)) if t == "exact" => Some(MatchType::Exact),
+                        Some(Value::String(t)) if t == "glob" => Some(MatchType::Glob),
+                        Some(Value::String(t)) if t == "email" => Some(MatchType::Email),
+                        Some(Value::String(t)) if t == "path" => Some(MatchType::Path),
+                        Some(Value::String(t)) if t == "text" => {
+                            self.error(
+                                &join(&here, "type"),
+                                "`text` is no longer a type: write `exact` (the value must equal the pattern), `email` (a strict address match, for recipients) or `glob`",
+                            );
+                            continue;
+                        }
                         Some(_) => {
-                            self.error(&join(&here, "type"), "must be `path` or `text`");
+                            self.error(
+                                &join(&here, "type"),
+                                "must be `exact`, `glob`, `email` or `path`",
+                            );
                             continue;
                         }
                     };
-                    let Some(glob) = keys.get("glob") else {
-                        self.error(&join(&here, "glob"), "required: the glob to match");
-                        continue;
+                    let pattern = match (keys.get("pattern"), keys.get("glob")) {
+                        (Some(p), None) | (None, Some(p)) => *p,
+                        (Some(_), Some(_)) => {
+                            self.error(&here, "give `pattern` or `glob`, not both");
+                            continue;
+                        }
+                        (None, None) => {
+                            self.error(&join(&here, "pattern"), "required: the pattern to match");
+                            continue;
+                        }
                     };
-                    (self.string(glob, &join(&here, "glob")), is_path)
+                    (self.string(pattern, &here), kind)
                 }
-                other => (self.string(other, &here), default_path),
+                other => (self.string(other, &here), None),
             };
-            match glob {
-                Some(glob) if glob.len() > MAX_GLOB_BYTES => {
-                    self.error(&here, format!("a glob is at most {MAX_GLOB_BYTES} bytes"))
-                }
-                Some(glob) => out.push(Matcher {
-                    argument,
-                    glob,
-                    path: is_path,
-                }),
-                None => {}
+            let Some(pattern) = pattern else {
+                continue;
+            };
+            if pattern.len() > MAX_GLOB_BYTES {
+                self.error(
+                    &here,
+                    format!("a pattern is at most {MAX_GLOB_BYTES} bytes"),
+                );
+                continue;
             }
+            if pattern.chars().any(never_matches) {
+                self.error(
+                    &here,
+                    "the pattern holds an invisible or formatting character; a value holding one never matches",
+                );
+                continue;
+            }
+            let explicit = matches!(
+                kind,
+                Some(MatchType::Glob | MatchType::Email | MatchType::Path)
+            );
+            if acts && pattern.contains(['*', '?']) && !explicit {
+                self.error(
+                    &here,
+                    format!(
+                        "`{pattern}` holds a wildcard, but an `acts` rule matches its value exactly unless told otherwise. This rule decides who the output reaches, so choose: for an email recipient write `{{pattern: \"{pattern}\", type: email}}` (a strict address match); for anything else list each exact value in its own rule, or write `type: glob` if you accept that a glob may match values you did not mean"
+                    ),
+                );
+                continue;
+            }
+            let kind = kind.unwrap_or(if acts {
+                MatchType::Exact
+            } else {
+                MatchType::Path
+            });
+            if kind == MatchType::Email && !valid_email_pattern(&pattern) {
+                self.error(
+                    &here,
+                    "an email pattern is `name@domain` or `*@domain`: a local part of ASCII letters, digits and `._+-` (no leading or trailing dot), and a domain of dot-separated labels of letters, digits and `-`",
+                );
+                continue;
+            }
+            out.push(Matcher {
+                argument,
+                pattern,
+                kind,
+            });
         }
         out
     }
@@ -777,7 +862,7 @@ fn tool_kind(
                 continue;
             };
             let rk = cx.entries(rm, &here, Some(READ_RULE_KEYS));
-            let when = cx.when(rk.get("when"), &here, true);
+            let when = cx.when(rk.get("when"), &here, false);
             let Some(source) = rk.get("source") else {
                 cx.error(&join(&here, "source"), "required: the source this read is");
                 continue;
@@ -832,7 +917,7 @@ fn tool_kind(
                 continue;
             };
             let rk = cx.entries(rm, &here, Some(ACT_RULE_KEYS));
-            let when = cx.when(rk.get("when"), &here, false);
+            let when = cx.when(rk.get("when"), &here, true);
             let content = rk
                 .get("content")
                 .and_then(|v| cx.string(v, &join(&here, "content")));
@@ -1052,6 +1137,49 @@ pub fn warnings(config: &Config) -> Vec<Problem> {
             Kind::Acts { rules, .. } => (rules.iter().map(|r| r.when.as_slice()).collect(), "acts"),
             Kind::Passthrough { .. } => continue,
         };
+        if let Kind::Acts { rules, .. } = &tool.kind {
+            for (i, rule) in rules.iter().enumerate() {
+                let here = format!("{path}.acts[{i}]");
+                if rule.when.is_empty() {
+                    out.push(Problem {
+                        path: here.clone(),
+                        message: format!(
+                            "no `when`: every call to this tool is treated as `{}` whatever its arguments, so the policy audience of `{}` is assumed to be who it reaches",
+                            rule.action, rule.action
+                        ),
+                    });
+                }
+                for m in rule.when.iter().filter(|m| m.kind == MatchType::Glob) {
+                    out.push(Problem {
+                        path: format!("{here}.when.{}", m.argument),
+                        message: format!(
+                            "`type: glob` on an action: `{}` may match values you did not mean, and the action's audience is only as true as this match; prefer exact values or `type: email`",
+                            m.pattern
+                        ),
+                    });
+                }
+            }
+            let constrained: BTreeSet<&str> = rules
+                .iter()
+                .flat_map(|r| &r.when)
+                .map(|m| m.argument.as_str())
+                .collect();
+            let free: Vec<&str> = tool
+                .arguments
+                .iter()
+                .map(String::as_str)
+                .filter(|a| !constrained.contains(a))
+                .collect();
+            if !free.is_empty() {
+                out.push(Problem {
+                    path: join(&path, "arguments"),
+                    message: format!(
+                        "not constrained by any `when`: {}; each is hashed into the checked output and shown to the approver, but can hold anything, so it must not be able to choose who the call reaches",
+                        free.join(", ")
+                    ),
+                });
+            }
+        }
         for (j, later) in whens.iter().enumerate() {
             // An earlier rule whose matchers are all in this one matches
             // every call this one would: this one is never reached.
@@ -1081,17 +1209,106 @@ pub fn env_names(config: &Config) -> BTreeSet<String> {
     names
 }
 
-/// True when `value` may be matched against a `when` glob: a string of at
-/// most `MAX_MATCH_BYTES` bytes with no control character (NUL included)
-/// and no `..` segment (split on `/` and `\`). Anything else never matches,
-/// so it falls to `otherwise`: the upstream may normalise a path the
-/// gateway sees as `Product/../HR/x` into one the rule did not mean.
+/// Characters a matched value never holds: control characters (Cc),
+/// format characters (Cf), line and paragraph separators (Zl, Zp), the
+/// Hangul fillers and the tag characters. They are invisible or reorder
+/// text, so a value that looks like the pattern may not be it.
+pub fn never_matches(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00AD}'
+                | '\u{0600}'..='\u{0605}'
+                | '\u{061C}'
+                | '\u{06DD}'
+                | '\u{070F}'
+                | '\u{0890}'..='\u{0891}'
+                | '\u{08E2}'
+                | '\u{115F}'..='\u{1160}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{3164}'
+                | '\u{FEFF}'
+                | '\u{FFA0}'
+                | '\u{FFF9}'..='\u{FFFB}'
+                | '\u{110BD}'
+                | '\u{110CD}'
+                | '\u{13430}'..='\u{1343F}'
+                | '\u{1BCA0}'..='\u{1BCA3}'
+                | '\u{1D173}'..='\u{1D17A}'
+                | '\u{E0000}'..='\u{E007F}'
+        )
+}
+
+/// True when `value` may be matched against a `when` pattern: a string of
+/// at most `MAX_MATCH_BYTES` bytes with no character [`never_matches`]
+/// (NUL included) and no `..` segment (split on `/` and `\`). Anything else
+/// never matches, so it falls to `otherwise`: the upstream may normalise a
+/// path the gateway sees as `Product/../HR/x` into one the rule did not mean.
 pub fn safe_for_matching(value: &serde_json::Value) -> Option<&str> {
     let text = value.as_str()?;
     let safe = text.len() <= MAX_MATCH_BYTES
-        && !text.chars().any(char::is_control)
+        && !text.chars().any(never_matches)
         && !text.split(['/', '\\']).any(|segment| segment == "..");
     safe.then_some(text)
+}
+
+/// A strict email address, split: ASCII only, exactly one `@`, a local
+/// part of `[A-Za-z0-9._+-]` with no leading, trailing or doubled dot, and
+/// a domain of dot-separated labels of `[A-Za-z0-9-]` (each 1 to 63
+/// characters, not starting or ending with `-`). No comments, quoting,
+/// encoded words, source routes or address literals: anything a mail
+/// parser could read as another address.
+pub fn parse_email(text: &str) -> Option<(&str, &str)> {
+    if !text.is_ascii() || text.len() > 254 {
+        return None;
+    }
+    let (local, domain) = text.split_once('@')?;
+    let local_ok = !local.is_empty()
+        && local.len() <= 64
+        && local
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._+-".contains(c))
+        && !local.starts_with('.')
+        && !local.ends_with('.')
+        && !local.contains("..");
+    (local_ok && valid_domain(domain)).then_some((local, domain))
+}
+
+fn valid_domain(domain: &str) -> bool {
+    !domain.is_empty()
+        && domain.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        })
+}
+
+/// `name@domain` (a valid address) or `*@domain`.
+fn valid_email_pattern(pattern: &str) -> bool {
+    match pattern.strip_prefix("*@") {
+        Some(domain) => pattern.is_ascii() && valid_domain(domain),
+        None => parse_email(pattern).is_some(),
+    }
+}
+
+/// `type: email`: `value` is a valid address ([`parse_email`]) and the
+/// pattern is that address (domain compared ignoring ASCII case) or
+/// `*@domain` for exactly its domain.
+pub fn email_matches(pattern: &str, value: &str) -> bool {
+    let Some((local, domain)) = parse_email(value) else {
+        return false;
+    };
+    match pattern.strip_prefix("*@") {
+        Some(want) => domain.eq_ignore_ascii_case(want),
+        None => parse_email(pattern).is_some_and(|(want_local, want_domain)| {
+            local == want_local && domain.eq_ignore_ascii_case(want_domain)
+        }),
+    }
 }
 
 /// [`safe_for_matching`], and for an argument declared `type: path`: ASCII
@@ -1168,13 +1385,13 @@ pub fn glob(pattern: &str, text: &str) -> bool {
 /// a non-empty list whose every element is one. Objects, numbers and
 /// anything else never match.
 pub fn value_matches(m: &Matcher, value: &serde_json::Value) -> bool {
-    let one = |v: &serde_json::Value| {
-        let safe = if m.path {
-            safe_path_for_matching(v)
-        } else {
-            safe_for_matching(v)
-        };
-        safe.is_some_and(|text| glob(&m.glob, text))
+    let one = |v: &serde_json::Value| match m.kind {
+        MatchType::Exact => safe_for_matching(v).is_some_and(|text| text == m.pattern),
+        MatchType::Glob => safe_for_matching(v).is_some_and(|text| glob(&m.pattern, text)),
+        MatchType::Email => {
+            safe_for_matching(v).is_some_and(|text| email_matches(&m.pattern, text))
+        }
+        MatchType::Path => safe_path_for_matching(v).is_some_and(|text| glob(&m.pattern, text)),
     };
     match value {
         serde_json::Value::String(_) => one(value),
