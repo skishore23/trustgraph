@@ -13,7 +13,140 @@ The gateway is [`trustgraph serve`](serve.md) plus one MCP endpoint,
 tokens, operator page, HTTP API and limits. Everything it records goes
 through the same runtime and journal.
 
-## Quickstart
+## Protected version 2
+
+Run `./examples/typed-gateway/run.sh` from the repository root. It builds the
+fake MCP server and runs the real HTTP/stdio gateway test, including independent
+upstream call-log assertions. It exits nonzero on failure and prints typed
+ancestry, denied forwarding, authorized tasks, and restart behavior.
+The runnable [configuration](../examples/typed-gateway/gateway.yaml) and
+[policy](../examples/typed-gateway/policy.yaml) are the test fixtures themselves.
+
+Version 2 requires durable `session: agent` context (also its default). Every
+upstream tool has a capability manifest:
+
+| Capability | Supported semantics |
+| --- | --- |
+| `source` | A fixed source with no outbound arguments. Requires `reads` and `otherwise`. |
+| `read_and_sink` | All outbound arguments require a policy `egress` action. The response is registered and carried before disclosure. Supports `reads`, or tracked `passthrough` classified as `unclassified`. |
+| `sink` | Requires `acts`, an argument allowlist, and `destination_arguments`. Each destination argument must have an exact matcher in every rule. The upstream response is withheld and replaced by a local acknowledgement. |
+| `local_pure` | Reserved for implemented local transformations. Rejected on upstream MCP tools; an upstream's annotation does not establish purity. |
+| `disabled` | Hidden and uncallable. This is the default when a version 2 tool omits its capability. |
+
+Protected decisions also bind to the tool manifest and a keyed fingerprint of
+the resolved upstream endpoint, command, environment and account credentials.
+Changing that deployment context invalidates old approvals without exposing
+credential hashes. Review adapter code upgrades and revoke outstanding approvals
+when their semantics change; the fingerprint does not attest executable bytes.
+
+An outbound call with no recorded context is denied. Bootstrap a task with a
+fixed zero-argument source. `allow_without_reads` is unavailable for protected
+sinks. A search query, URL, header, or path can contain secrets, so a read tool
+with arguments is `read_and_sink`, even if its name sounds harmless.
+An `egress` action describes the actual service receiving **all** its arguments,
+including URLs it dereferences and any secondary recipients. Tools with dynamic
+secondary destinations require a trusted service adapter or must be disabled.
+
+Without a resource-specific attestation, protected reads always use
+`otherwise`, even when a request path matches a more permissive rule. Choose a
+fallback at least as restrictive as every resource accessible through that tool.
+The gateway cannot authenticate a resource merely from its supplied path or from
+an untrusted MCP response claiming that it is public.
+
+### Typed execution
+
+A read tool can declare `schema: SourceCode@1` and a local transform:
+
+```yaml
+transform:
+  implementation: first_line_v1
+  input: SourceCode@1
+  output: Summary@1
+```
+
+`first_line_v1` requires one successful text content item and returns its first
+line. This deliberately small deterministic transform is not an LLM summarizer
+or a declassifier. The source and output are registered in the existing
+`trustgraph-framework::Graph`, through journaled runtime events. Input schemas
+must match exactly. Changing the output schema never widens its readers.
+
+Schemas are versioned nominal contracts, not JSON Schema payload validators.
+The trusted adapter establishes the source type. Opaque agent outputs infer the
+schemas of all carried inputs and retain every dependency. Their default output
+type is `any`; typing alone conveys no trust or clearance.
+
+Typed read results expose graph evidence in `_meta.trustgraph`; denied actions
+include it in `structuredContent.error.lineage`. The artifact explanation API
+also exposes typed lineage. Evidence contains identities, schemas, operation
+contracts, and edges; the engine stores content digests rather than payloads.
+The gateway executes the transform and supplies its receipt; the receipt is a
+host attestation, not a proof certificate.
+
+Old events omit optional schema/contract fields. They still serialize and hash
+as before, replay as `any`, and preserve existing source/output identities.
+Typed records replay the registered contracts, artifacts, and decisions.
+Connection-scoped contexts present during an upgrade are merged into their
+agent's durable context before retirement; an impossible merge fails startup.
+
+### Protected preview threat model
+
+The tested deployment is the local fake GitHub MCP adapter. It has fixed source
+tools, two immutable repository IDs, and no secondary destinations. The test
+client intentionally follows an injected instruction; there is no probabilistic
+prompt-injection detector and no claim about any model's behavior. The independent
+upstream log proves the tested denied calls did not run. This is a reproducible
+execution test, not a production GitHub integration or a comparative benchmark.
+
+Trusted components are the gateway/host, policy administrator, authenticated
+identity assignment, service adapters and their resource/audience semantics,
+OS isolation, and durable state. The agent, arguments, and tool-response prose
+are untrusted. Configuration cannot make a destination identity canonical by
+assertion: the adapter must resolve and use that exact immutable identity.
+The fake adapter does this; arbitrary Slack aliases, GitHub names, redirects,
+webhooks, search plugins and other production tool semantics are not certified.
+
+For a protected deployment, the operator must arrange:
+
+- Separate OS identities, containers, or an equivalent boundary for gateway and
+  agent. The agent must not read gateway environment, process memory, policy,
+  journal, signing keys, operator launch files, or other agents' token files.
+- Upstream credentials available only to the gateway. Give each agent only its
+  own gateway token. Filesystem permissions on a shared OS identity do not
+  isolate that agent from the gateway.
+- Deny direct agent network routes to protected APIs and other exfiltration
+  destinations. A gateway does not itself install a network sandbox.
+- Sandbox untrusted MCP subprocesses separately, restricting their filesystem
+  and network access. Environment scrubbing and a private HOME are not process
+  isolation; an MCP subprocess otherwise has the gateway's OS privileges.
+- Keep the journal/state directory durable and outside agent workspaces. Startup
+  fails on corrupt state, but deletion/truncation of an entire journal cannot be
+  detected without an external trusted head anchor.
+- Resume using the same authenticated agent identity. Hand-offs must pass through
+  the authenticated gateway token flow before information is disclosed. The host
+  must not give an agent another principal's token or restore confidential memory
+  into an unrelated fresh identity. Missing/invalid hand-off tokens block action;
+  out-of-band information exchange remains outside gateway observation.
+
+Within that scope, tested guarantees are authorization before protected tool
+forwarding, denial without an upstream call, reader non-widening through typed
+transforms, argument/destination-bound approvals, and durable inherited context.
+External policy changes are not an atomic transaction with a remote API call.
+An upstream timeout can have an unknown side-effect outcome; it is not a policy
+denial. Retirement by the trusted operator means the host must discard the
+corresponding model context and memory; it does not erase what a model remembers.
+
+Integrity labels, privileged argument influence tracking, field-level dependency
+verification, declassification, and persistent-memory/checkpoint SDK guarantees
+remain future work. Session-wide tracking is intentionally conservative and may
+deny an unrelated public write after a confidential read. Bounded kernel proofs
+do not prove gateway coverage or host isolation.
+
+## Legacy version 1 quickstart
+
+The remaining version 1 configuration examples describe legacy behavior.
+Version 1 can send read/passthrough arguments without an egress check and can
+use connection-scoped context. Use version 2 for the protected preview above.
+
 
 The example in [examples/gateway](../examples/gateway) runs with no external
 services. Its upstreams are a small fake MCP server. Run it from the

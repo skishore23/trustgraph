@@ -83,6 +83,23 @@ Decisions are deterministic. There is no model in the decision path.
 
 Requires Rust 1.90 or newer.
 
+Run the protected typed-graph demonstration from a clone:
+
+```sh
+./examples/typed-gateway/run.sh
+```
+
+It starts local fake MCP servers and a real gateway, follows an injected
+instruction in private code, and verifies that the public PR and secret-bearing
+search queries never reach the upstream. The same agent completes an authorized
+private PR. Restarting and reconnecting preserves the restrictions; a fresh
+public-only agent can complete a public task. The printed graph explains
+`SourceCode@1 → first_line_v1 → Summary@1 → denied public PR`.
+No API keys or model service are needed. This deterministic client deliberately
+attempts the injected action; it does not measure a model's attack success rate.
+See [the protected configuration and threat model](docs/gateway.md#protected-version-2).
+
+
 ```sh
 cargo install --locked --git https://github.com/skishore23/trustgraph trustgraph-cli
 
@@ -135,11 +152,11 @@ or [llms.txt](llms.txt). Protect the policy file with code review.
 
 ## Use it in your system
 
-> **Status.** The policy CLI, `trustgraph serve` and `trustgraph gateway` have
-> been through security review; the gateway's assumptions are listed in
-> [docs/gateway.md](docs/gateway.md). The Python integrations are not ready:
-> four review rounds each found ways to drop a restriction, and their session
-> handling is being rebuilt. Try them, but do not rely on them yet.
+> **Status.** Experimental preview. Gateway configuration version 2 provides
+> a scoped protected boundary with typed provenance and durable per-agent context.
+> Version 1 remains available for compatibility and permits unchecked outbound
+> read/passthrough arguments. See [supported guarantees](docs/gateway.md#protected-preview-threat-model).
+> The Python integrations remain experimental and require trusted host instrumentation.
 
 ### `trustgraph gateway`: agents cannot skip it while it alone holds the credentials
 
@@ -160,8 +177,9 @@ planner slack__post_message #engineering: error: TrustGraph gateway: `post_to_en
 ```
 
 Config, sessions, hand-offs and the threat model:
-[docs/gateway.md](docs/gateway.md). A runnable example:
-[examples/gateway](examples/gateway).
+[docs/gateway.md](docs/gateway.md). Protected runnable example:
+[examples/typed-gateway](examples/typed-gateway). The older
+[hand-off example](examples/gateway) uses legacy version 1 configuration.
 
 ### `trustgraph serve`
 
@@ -287,3 +305,5 @@ cargo test --workspace --locked
 ```
 
 See [development](docs/development.md) and [the public site](docs/vercel.md).
+
+Licensed under [MIT](LICENSE). Report vulnerabilities through the process in [SECURITY.md](SECURITY.md).

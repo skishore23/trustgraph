@@ -107,6 +107,20 @@ and property tests; the lineage graph's tests; the simulator's tests; the CLI
 tests; and the `trustgraph serve` tests over real HTTP, MCP and the operator
 session. They are evidence, not a substitute for the symbolic checks.
 
+The [Rust workspace CI](../.github/workflows/rust.yml) also checks formatting,
+Clippy with warnings denied, every workspace target, the gateway's HTTP/stdio
+end-to-end suite, and the executable protected demo. Existing Python CI tests
+HTTP/MCP integration and supported framework version ranges; the Kani workflow
+continues to verify the bounded kernels separately.
+
+The typed-runtime tests exercise schema mismatch rejection, reader non-widening,
+legacy event encodings/hash compatibility, typed ancestry, and replay equivalence.
+The protected demo tests denied PR/search forwarding using independent upstream
+logs, successful authorized work, conservative classification, and restart and
+reconnect behavior. Additional gateway tests cover context migration and approval
+invalidation when the resolved upstream account changes. These checks do not
+certify arbitrary production MCP adapters or establish model attack-success rates.
+
 ## The policy simulator
 
 `crates/trustgraph-sim` drives `Runtime<MemoryJournal>`, the same runtime
