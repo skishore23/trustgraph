@@ -62,4 +62,32 @@ const page = require('./serve.js');
   assert.match(page.signedOutMessage({ status: 401, data: {} }), /^Not signed in/);
 }
 
+// A confirmation for an item that is gone is dropped, so refreshing resumes.
+{
+  const state = {
+    pending: [
+      { decision: 'd1', can_approve: true },
+      { decision: 'd2', can_approve: false },
+    ],
+    proposals: [{ proposal: 'p1' }],
+  };
+  assert.deepEqual(page.confirmableKeys(state), ['approve:d1', 'activate:p1']);
+  assert.equal(page.staleConfirmation(state, null), false, 'nothing open');
+  assert.equal(page.staleConfirmation(state, 'approve:d1'), false, 'still there');
+  assert.equal(page.staleConfirmation(state, 'activate:p1'), false);
+  assert.equal(page.staleConfirmation(state, 'approve:d2'), true, 'no longer approvable');
+  assert.equal(page.staleConfirmation(state, 'approve:gone'), true, 'expired or evicted');
+  assert.equal(page.staleConfirmation({ pending: [], proposals: [] }, 'activate:p1'), true, 'voided by an activation');
+  assert.equal(page.GONE, 'That request is no longer pending.');
+}
+
+// A proposal from the policy file says who could have written it.
+{
+  assert.equal(
+    page.proposer({ origin: 'file' }),
+    'From the policy file (anyone who can edit the file could have written this)'
+  );
+  assert.equal(page.proposer({ origin: 'agent', from: 'mailer' }), 'Proposed by agent mailer');
+}
+
 console.log('serve.test.cjs: ok');

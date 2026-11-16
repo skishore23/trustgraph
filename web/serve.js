@@ -8,6 +8,7 @@
   var SESSION_KEY = 'trustgraph-operator-session';
   var REPLACED = 'Signed out: a newer operator session was started. If that was not you, stop the server.';
   var SIGNED_OUT = 'Not signed in. Open the newest operator launch file (operator.html in the state directory); each one works once.';
+  var GONE = 'That request is no longer pending.';
   var LINK_USED = 'This sign-in link is not valid or was already used. If you did not use it, stop the server: someone else holds the operator session.';
 
   function list(names) {
@@ -22,6 +23,33 @@
   function approvalSummary(p) {
     return 'Approve: ' + p.agent + ' may ' + p.action + ' to ' + list(p.recipients) +
       ', from ' + list(p.sources) + ' (decision ' + shortId(p.decision) + '…).';
+  }
+
+  // The confirmation keys the page would render for `state`: an Approve for
+  // each pending decision the operator can approve, an Activate for each
+  // proposal.
+  function confirmableKeys(state) {
+    var keys = [];
+    (state.pending || []).forEach(function (p) {
+      if (p.can_approve) keys.push('approve:' + p.decision);
+    });
+    (state.proposals || []).forEach(function (p) {
+      keys.push('activate:' + p.proposal);
+    });
+    return keys;
+  }
+
+  // True when a confirmation is open for an item `state` no longer has
+  // (expired, evicted, voided by an activation): it must be dropped, or the
+  // periodic refresh would stay paused for good.
+  function staleConfirmation(state, confirming) {
+    return confirming !== null && confirmableKeys(state).indexOf(confirming) === -1;
+  }
+
+  function proposer(p) {
+    if (p.origin === 'operator') return 'Proposed by you';
+    if (p.origin === 'file') return 'From the policy file (anyone who can edit the file could have written this)';
+    return 'Proposed by agent ' + p.from;
   }
 
   function signedOutMessage(result) {
@@ -58,7 +86,11 @@
   }
 
   var api = {
+    GONE: GONE,
     approvalSummary: approvalSummary,
+    confirmableKeys: confirmableKeys,
+    proposer: proposer,
+    staleConfirmation: staleConfirmation,
     createScheduler: createScheduler,
     list: list,
     shortId: shortId,
@@ -217,12 +249,6 @@
     });
   }
 
-  function proposer(p) {
-    if (p.origin === 'operator') return 'Proposed by you';
-    if (p.origin === 'file') return 'From the policy file (it changed on disk; not applied)';
-    return 'Proposed by agent ' + p.from;
-  }
-
   function renderProposals(items) {
     var box = $('proposals');
     box.replaceChildren();
@@ -261,6 +287,10 @@
     var active = document.activeElement;
     var key = focusKey || (active && active.getAttribute && active.getAttribute('data-key'));
     var policy = state.policy;
+    if (staleConfirmation(state, confirming)) {
+      confirming = null;
+      notice(GONE);
+    }
     $('who').textContent = 'Operator ' + state.operator + '. Policy revision ' + policy.revision +
       (policy.source === 'file' ? ', from the policy file.' : ', activated in service.');
     $('clock').hidden = !state.clock_behind;
@@ -339,6 +369,8 @@
     lists.addEventListener('mouseleave', function () { pointerInside = false; });
     $('refresh').addEventListener('click', function (event) {
       event.preventDefault();
+      // Always a way out: drop any open confirmation and held update.
+      confirming = null;
       notice('');
       load(true);
     });

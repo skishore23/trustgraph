@@ -10,9 +10,9 @@ page.
 It listens on 127.0.0.1 only. Each agent has its own token. The operator signs
 in through a single-use file. Over HTTP and MCP, a request is acted on as the
 agent whose token it carries; no agent route or tool can approve, revoke or
-activate; and a changed policy file waits for the operator. These hold as
-long as agents cannot read the state directory; see
-[Threat model](#threat-model).
+activate; and a changed policy file waits for the operator. These hold only
+while agents cannot read the state directory, which means running them as a
+different OS user or in a sandbox; see [Threat model](#threat-model).
 
 ## Five-minute quickstart
 
@@ -217,8 +217,14 @@ Agent routes take `Authorization: Bearer <the agent's token>`:
 | --- | --- | --- |
 | `POST /v1/sources` | `{"source", "sha256"}` or `{"source", "content"}` | `{"artifact"}`. The agent must be listed in the source's `agents`. |
 | `POST /v1/outputs` | `{"inputs": [ids], "step", "sha256" \| "content"}` | `{"artifact"}` |
-| `POST /v1/check` | `{"artifact", "action", "recipients": [names] \| null}` | `{"decision", "verdict", "code", "reason", "blocking", "expires_at"}`, always 200 |
+| `POST /v1/check` | `{"artifact", "action", "recipients": [names] \| null}` | `{"decision", "verdict", "code", "reason", "blocking", "expires_at"}`. Every verdict, deny included, is a 200; an artifact that does not exist or that the agent may not use is 404 `unknown_artifact`. |
 | `GET /v1/artifacts/{id}` | | `{"artifact", "sources", "readers"}`. Only if the agent may use every source. |
+| `POST /v1/policy/propose` | `{"policy": "<yaml>"}` | `{"proposal", "widens", "changes", "explanation"}`, or 422 with `diagnostics`. Never changes the active policy. |
+| `GET /v1/policy` | | `{"policy", "revision", "digest"}`. The YAML is the canonical form; comments are not kept. |
+| `POST /v1/policy/check`, `/test`, `/explain` | `{"policy"}` | The same JSON as `trustgraph policy check/test/explain --json` |
+| `POST /v1/policy/diff` | `{"old"?, "new"}` | As `policy diff --json`; `old` defaults to the active policy |
+| `POST /v1/policy/simulate` | `{"policy", "seed"?, "count"? ≤ 8, "steps"? ≤ 120}` | As `policy simulate --json` |
+| `GET /v1/policy/schema` | | The policy file's JSON Schema |
 
 An artifact the agent may not use (it derives from a source the agent is not
 listed for) gets exactly the same answer as an id that does not exist: 404
@@ -231,20 +237,19 @@ answer is journaled.
 `GET /v1/policy` shows every agent the whole active policy, groups and people
 included. This is deliberate: an agent needs the policy to propose a change
 to it. Do not put anything in the policy file that agents may not see.
-| `POST /v1/policy/propose` | `{"policy": "<yaml>"}` | `{"proposal", "widens", "changes", "explanation"}`, or 422 with `diagnostics`. Never changes the active policy. |
-| `GET /v1/policy` | | `{"policy", "revision", "digest"}`. The YAML is the canonical form; comments are not kept. |
-| `POST /v1/policy/check`, `/test`, `/explain` | `{"policy"}` | The same JSON as `trustgraph policy check/test/explain --json` |
-| `POST /v1/policy/diff` | `{"old"?, "new"}` | As `policy diff --json`; `old` defaults to the active policy |
-| `POST /v1/policy/simulate` | `{"policy", "seed"?, "count"? ≤ 8, "steps"? ≤ 120}` | As `policy simulate --json` |
-| `GET /v1/policy/schema` | | The policy file's JSON Schema |
 
-Operator routes take only the `X-TrustGraph-Operator: <session>` header, and
-refuse any request that also carries an `Authorization` header:
+Signing in is `POST /session` with `Authorization: Bearer <launch secret>`:
+it exchanges the single-use secret for `{"session", "expires_at"}`, ends any
+earlier session and writes a new launch file. `expires_at` is on the
+server's time (see [Time](#time)). It is the one operator route that takes
+an `Authorization` header.
+
+The other operator routes take only the `X-TrustGraph-Operator: <session>`
+header, and refuse any request that also carries an `Authorization` header:
 
 | Route | Body | Does |
 | --- | --- | --- |
 | `GET /` | | The operator page: a static shell with no data; it loads the rest with the session |
-| `POST /session` | `Authorization: Bearer <launch secret>` | Exchanges the single-use secret for `{"session", "expires_at"}`, ends any earlier session and writes a new launch file |
 | `GET /v1/operator/state` | | Operator, policy in force, pending decisions, live approvals, proposals |
 | `POST /v1/operator/approve` | `{"decision"}` | Approves as `--operator` |
 | `POST /v1/operator/revoke` | `{"decision"}` | Revokes a live approval |
@@ -310,7 +315,8 @@ journaled.
   secret. Opening it exchanges the secret for a session id that the page
   keeps in `sessionStorage` (this origin and port only) and sends as
   `X-TrustGraph-Operator`. There is no cookie: cookies ignore ports, so any
-  other server on 127.0.0.1 would receive one. A session lasts 8 hours.
+  other server on 127.0.0.1 would receive one. A session lasts 8 hours of
+  real time, sleep included (see [Time](#time)).
 - **One session at a time; sign in again without a restart.** Each sign-in
   writes a new single-use `operator.html` and logs that it did. Opening it
   starts a new session and ends the previous one; the old page says "Signed
@@ -331,21 +337,39 @@ Agents are untrusted callers.
   Over any of them, 429 with `Retry-After` (an `isError` result over MCP).
 - **Server caps:** at most 100,000 artifacts (`--max-artifacts`) and a 1 GiB
   journal (`--max-journal-bytes`).
-- **Per-agent budgets,** counted from when the server started: 64 MiB of
-  journal (`--agent-journal-bytes`) and 10,000 artifacts (`--agent-artifacts`).
-  One agent at its budget gets 507 `quota_exceeded`; other agents are not
-  affected.
+- **Per-agent budgets,** for the whole life of the state directory: 64 MiB
+  of journal (`--agent-journal-bytes`) and 10,000 artifacts
+  (`--agent-artifacts`). At start each agent's usage is rebuilt from the
+  journal records that name it (outputs, checks and its proposals), so a
+  restart does not reset it. Registering a source is charged to the agent
+  while the server runs, but its record names no agent, so after a restart
+  source registrations count only toward the server caps. One agent at its
+  budget gets 507 `quota_exceeded`; other agents' budgets are not affected.
 - Writes past any cap are refused with 507 before anything is written.
   Re-registering content that is already registered still works at a cap, and
   so does `check` at the artifact cap. Operator actions are never blocked.
 - **Not journaled:** requests refused before the engine (bad shape, unknown
   source, an artifact the agent may not use) and idempotent re-registrations.
-- **Engine state per agent:** at most 64 remembered pending decisions per
-  agent (1,024 in all) and 8 stored proposals per agent (32 for all agents;
-  the operator and the policy file have their own 32). When an agent is over,
-  its own oldest entry goes, so it cannot push out anyone else's.
-- **Recovering from a quota:** per-agent budgets reset when the server
-  restarts. If the server caps are reached, raise them
+- **Remembered pending decisions:** at most 64 per agent and 1,024 in all.
+  Each agent's own oldest entry is evicted first: at its own 64, its oldest
+  unapproved entry goes (or, if all are approved, its oldest). When all
+  1,024 are in use, the asking agent's own oldest unapproved entry goes; if
+  it has none, the oldest UNAPPROVED entry of any other agent goes. So with
+  many agents active (more than 16 with pending requests), one agent's
+  checks can push out other agents' oldest pending requests; those agents
+  ask again. An approved entry is evicted only when there is no unapproved
+  candidate (the agent's own at its own cap, anyone's at the global cap),
+  and takes its approval with it.
+- **Stored proposals:** at most 8 per agent and 32 for all agents together;
+  when an agent is over, its own oldest goes, and when all agents are over
+  32, the oldest of the agent holding the most goes. The operator has its
+  own 32. The policy file has one: a newer file version replaces the older
+  file proposal. Agents and the file never push out the operator's
+  proposals.
+- **Recovering from a quota:** per-agent budgets last as long as the state
+  directory. To let an agent write again, restart with a higher
+  `--agent-journal-bytes` or `--agent-artifacts`, or start over with a new
+  state directory. If the server caps are reached, raise them
   (`--max-artifacts`, `--max-journal-bytes`) or start over with a new state
   directory; there is no compaction yet.
 - **`policy_simulate`:** `count` up to 8 and `steps` up to 120 per call.
@@ -357,27 +381,39 @@ the runtime is rebuilt from the journal at start. A restart keeps artifacts,
 pending decisions, approvals, stored proposals and tokens.
 
 - **The policy file applies by itself only on the first start** (an empty
-  journal). After that, if the file differs from the active policy, it is
-  NOT applied: it is stored once as a proposal from the file, and the server
-  prints the difference, with every `WIDENS` line, and how to apply it:
+  journal), as written; an invalid file then is an error. After that, if the
+  file differs from the active policy, it is NOT applied: it is stored as
+  the proposal from the file (there is one; a newer file version replaces
+  it), and the server prints the difference, with every `WIDENS` line, and
+  how to apply it:
 
   ```text
-  The policy file differs from the active policy. It was NOT applied; it is stored as a proposal from the file. Changes it would make:
+  The policy file differs from the active policy. It was NOT applied; it is stored as the proposal from the file (replacing any older one). Changes it would make:
     WIDENS  source price_sheet: readers gained beta
     WIDENS  action email_customer: audience gained beta
   To apply it, activate it on the operator page, or restart once with --activate-policy-file.
   ```
 
-  The operator page lists it under "Proposed policies" as "From the policy
-  file", with its changes, like any other proposal. `--activate-policy-file`
-  applies a changed file at start and prints the same difference; use it only
-  as the person at the terminal. A file equal to the active policy changes
-  nothing.
+  A file version is proposed only once; on later starts the server says
+  whether that proposal is still stored and by whom. The operator page lists
+  it under "Proposed policies" as "From the policy file (anyone who can edit
+  the file could have written this)", with its changes, like any other
+  proposal. `--activate-policy-file` applies a changed file at start and
+  prints the same difference; use it only as the person at the terminal. A
+  file equal to the active policy changes nothing.
+- **An invalid policy file on a later start is ignored** (it does not parse,
+  fails lint or fails its own tests): the server prints a warning with the
+  diagnostics and runs on the active policy, and nothing is proposed. So
+  whoever can edit the file cannot keep the server from starting.
+  `--activate-policy-file` with an invalid file is an error.
 - **Every activation voids all approvals** and forgets pending decisions.
   Agents must ask again.
 - **The journal is hash-chained.** It detects edits, reordering and gaps. It
   does not detect deleted trailing records or a deleted file. Protect the
   state directory with filesystem permissions.
+- **A journal written while the clock was far in the future** refuses
+  approvals until real time catches up with it (see [Time](#time)). If that
+  is too far off, the only recovery is a new state directory.
 - **Outcome unknown.** If a journal write fails, the server cannot know
   whether the last event took effect. It stops serving: every request gets 503
   `restart_required` and the reason is logged. Restart it; the journal is
@@ -387,13 +423,22 @@ pending decisions, approvals, stored proposals and tokens.
 ## Time
 
 The server takes the larger of the wall clock and the last journaled time
-when it starts, and from then on adds monotonic time; later changes to the
-wall clock are ignored. So an approval lasts its `valid_for` of real elapsed
-time even if the clock is set back. If at start the wall clock is more than
-300 seconds behind the journal (for example after a record was written with
-a clock far in the future), the server logs a warning and refuses approvals
-with 409 `clock_behind` until the wall clock catches up; checks and
-everything else keep working, and the operator page says so.
+when it starts. From then on it adds the time elapsed since start, taken as
+whichever is larger: monotonic elapsed time or wall-clock elapsed time (and
+never less than it has already counted). Time asleep counts: monotonic time
+stops while a laptop sleeps, but the wall clock does not, so an approval
+granted for an hour before an 8-hour sleep has expired on waking, and so has
+the 8-hour operator session. A wall clock set forward can only make
+approvals and the session expire sooner; a wall clock set back is ignored,
+so an approval never lasts longer than its `valid_for` of real time. The
+operator session's expiry and `/session`'s `expires_at` use this same time.
+
+If at start the wall clock is more than 300 seconds behind the journal (for
+example after a record was written with a clock far in the future), the
+server logs a warning and refuses approvals with 409 `clock_behind` until
+the wall clock catches up; checks and everything else keep working, and the
+operator page says so. If it will not catch up soon, start over with a new
+state directory.
 
 ## Threat model
 
@@ -402,25 +447,30 @@ What the server enforces, and what it assumes.
 - **Agents hold only their own token.** The server takes an agent's identity
   from the bearer token alone; no request field can name an agent. A token
   file shared by two agents identifies neither.
-- **Agents must not be able to read the state directory.** It holds every
-  token, the unused operator launch file and the journal. An agent that runs
-  as the same OS user with shell access can read them all and act as any
-  agent or as the operator. Run agents as a different OS user or in a
-  sandbox, and keep the state directory outside anything agents can read. The
-  server refuses a state directory inside the Git repository that holds the
-  policy file or the current directory, unless you pass
+- **Agents must not run as your OS user.** The state directory holds every
+  agent token, the journal and the operator launch file. A new sign-in link
+  is written after every sign-in, so a usable operator sign-in secret is on
+  disk for the whole lifetime of the server. Any process running as the same
+  OS user can read all of it: it can act as any agent, sign in as the
+  operator (which signs the real operator out; their page says so), and
+  delete trailing journal records. Run agents as a different OS user or in a
+  sandbox, and keep the state directory outside anything agents can read.
+  The server refuses a state directory inside the Git repository that holds
+  the policy file or the current directory, unless you pass
   `--allow-state-in-repository`.
 - **The policy file is not a trust root.** Agents working in its repository
   can edit it (the server warns when it is in one). A changed file never
-  applies without the operator, or `--activate-policy-file` at the terminal.
-  The FIRST start applies the file as written, so check it before then.
+  applies without the operator, or `--activate-policy-file` at the terminal,
+  and an invalid one on a later start is ignored with a warning. The FIRST
+  start applies the file as written, so check it before then.
 - **Agents propose; the operator decides.** No agent route or MCP tool can
   approve, revoke or activate.
 - **The operator approves a content hash, not content they have read.** The
   page shows the agent, action, recipients, sources and decision id. What the
   output says is between your system and the agent.
 - **The operator session** is a header, one at a time, from a single-use
-  file. If someone else signs in, your page tells you; stop the server.
+  file, and lasts 8 hours of real time, sleep included. If someone else
+  signs in, your page tells you; stop the server.
 - **TrustGraph decides; your system acts.** The host must call `check` right
   before acting and act only on `allow`. TrustGraph only knows the sources and
   outputs it was told about.
