@@ -13,6 +13,7 @@
 //! failure makes the outcome unknown: the server then answers every request
 //! with 503 `restart_required` until the process is restarted.
 
+mod auth;
 pub mod mcp;
 mod tokens;
 
@@ -32,7 +33,6 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use trustgraph_engine::{Event, FileJournal, Journal, MemoryJournal, Reply, Runtime};
-use trustgraph_live::auth;
 use trustgraph_policy::{Policy, Severity, lint, parse, run_tests};
 
 use crate::policy_cmd::text as policy_text;
