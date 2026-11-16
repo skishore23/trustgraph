@@ -1,0 +1,468 @@
+use std::fs;
+use std::path::Path;
+
+use trustgraph_engine::{
+    Event, FileJournal, Journal, JournalError, MemoryJournal, OpenError, Record, Reply, Runtime,
+};
+use trustgraph_policy::Verdict;
+
+const SPEC: &str = include_str!("../../trustgraph-policy/tests/fixtures/spec-example.policy.yaml");
+
+fn sha(n: u32) -> String {
+    format!("{n:064x}")
+}
+
+/// The spec example with `roadmap` readable by hr only, and its tests updated.
+fn narrowed() -> String {
+    SPEC.replace("readers: [hr, engineering]", "readers: [hr]")
+        .replace(
+            "action: post_to_slack\n    expect: allow",
+            "action: post_to_slack\n    expect: deny",
+        )
+}
+
+fn file_journal(dir: &Path) -> FileJournal {
+    FileJournal::open(dir).expect("open journal")
+}
+
+fn text(dir: &Path) -> String {
+    fs::read_to_string(dir.join("journal.jsonl")).unwrap()
+}
+
+fn artifact(reply: Reply) -> String {
+    match reply {
+        Reply::Artifact { id } => id,
+        other => panic!("expected an artifact, got {other:?}"),
+    }
+}
+
+fn check_event(artifact: &str) -> Event {
+    Event::Check {
+        agent: "planner".into(),
+        artifact: artifact.into(),
+        action: "post_to_slack".into(),
+        recipients: None,
+    }
+}
+
+fn verdict(reply: &Reply) -> Verdict {
+    match reply {
+        Reply::Decision { verdict, .. } => *verdict,
+        other => panic!("expected a decision, got {other:?}"),
+    }
+}
+
+/// Ten events; returns the roadmap-derived output's artifact id.
+fn ten_events<J: Journal>(rt: &mut Runtime<J>) -> String {
+    let mut at = 1;
+    let mut send = |rt: &mut Runtime<J>, event: Event| {
+        at += 1;
+        rt.handle(at, event).unwrap()
+    };
+    let roadmap = artifact(send(
+        rt,
+        Event::RegisterSource {
+            source: "roadmap".into(),
+            sha256: sha(2),
+        },
+    ));
+    let salaries = artifact(send(
+        rt,
+        Event::RegisterSource {
+            source: "salaries".into(),
+            sha256: sha(1),
+        },
+    ));
+    let output = |inputs: Vec<String>, n| Event::RecordOutput {
+        agent: "planner".into(),
+        step: "summarize".into(),
+        inputs,
+        sha256: sha(n),
+    };
+    let only = artifact(send(rt, output(vec![roadmap.clone()], 10)));
+    let both = artifact(send(rt, output(vec![roadmap, salaries], 11)));
+    assert_eq!(verdict(&send(rt, check_event(&only))), Verdict::Allow);
+    assert_eq!(verdict(&send(rt, check_event(&both))), Verdict::Deny);
+    let unknown = send(rt, check_event("nope"));
+    assert!(matches!(unknown, Reply::Rejected { .. }));
+    send(
+        rt,
+        Event::Revoke {
+            decision: "nope".into(),
+            reviewer: "nina".into(),
+        },
+    );
+    send(rt, check_event(&only));
+    send(rt, check_event(&both));
+    only
+}
+
+#[test]
+fn reopen_reaches_the_same_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = Runtime::open(file_journal(dir.path()), SPEC, 0).unwrap();
+    ten_events(&mut rt);
+    let digest = rt.engine().state_digest();
+    drop(rt);
+
+    let rt = Runtime::open(file_journal(dir.path()), SPEC, 100).unwrap();
+    assert_eq!(rt.engine().state_digest(), digest);
+    let genesis = text(dir.path())
+        .lines()
+        .filter(|l| l.contains("\"type\":\"genesis\""))
+        .count();
+    assert_eq!(genesis, 1);
+}
+
+#[test]
+fn new_policy_file_appends_genesis() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = Runtime::open(file_journal(dir.path()), SPEC, 0).unwrap();
+    let only = ten_events(&mut rt);
+    assert_eq!(rt.engine().policy_revision(), 1);
+    drop(rt);
+
+    let mut rt = Runtime::open(file_journal(dir.path()), &narrowed(), 100).unwrap();
+    assert_eq!(rt.engine().policy_revision(), 2);
+    let reply = rt.handle(101, check_event(&only)).unwrap();
+    assert_eq!(verdict(&reply), Verdict::Deny);
+}
+
+fn register_roadmap() -> Event {
+    Event::RegisterSource {
+        source: "roadmap".into(),
+        sha256: sha(2),
+    }
+}
+
+#[test]
+fn failed_append_applies_nothing() {
+    let rt = Runtime::open(MemoryJournal::new(), SPEC, 0).unwrap();
+    let before = rt.engine().state_digest();
+    let mut journal = rt.into_journal();
+    // The policy matches, so `open` appends nothing and the failure stays
+    // armed for the first `handle`.
+    journal.fail_next_append();
+    let mut rt = Runtime::open(journal, SPEC, 0).unwrap();
+    assert!(matches!(
+        rt.handle(1, register_roadmap()),
+        Err(JournalError::Io(_))
+    ));
+    assert_eq!(rt.engine().state_digest(), before);
+    // The runtime stays usable, and the failed event left no trace.
+    assert!(matches!(
+        rt.handle(1, register_roadmap()),
+        Ok(Reply::Artifact { .. })
+    ));
+    let journal = rt.into_journal();
+    assert_eq!(journal.records().len(), 2);
+}
+
+#[test]
+fn second_open_is_locked() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = file_journal(dir.path());
+    assert_eq!(
+        FileJournal::open(dir.path()).unwrap_err(),
+        JournalError::Locked
+    );
+    drop(first);
+    FileJournal::open(dir.path()).unwrap();
+}
+
+#[test]
+fn torn_tail_is_dropped() {
+    for tail in [
+        "{\"seq\":99,\"at\":1,\"ev",
+        "{\"seq\":99,\"at\":1,\"ev\n",
+        "not json\n",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = Runtime::open(file_journal(dir.path()), SPEC, 0).unwrap();
+        ten_events(&mut rt);
+        let digest = rt.engine().state_digest();
+        drop(rt);
+        let good = text(dir.path());
+        fs::write(dir.path().join("journal.jsonl"), format!("{good}{tail}")).unwrap();
+
+        let mut rt = Runtime::open(file_journal(dir.path()), SPEC, 100).unwrap();
+        assert_eq!(rt.engine().state_digest(), digest, "tail {tail:?}");
+        assert_eq!(text(dir.path()), good, "the file is truncated: {tail:?}");
+        // and appending after the truncation continues the chain
+        rt.handle(101, register_roadmap()).unwrap();
+        drop(rt);
+        Runtime::open(file_journal(dir.path()), SPEC, 200).unwrap();
+    }
+}
+
+#[test]
+fn corrupt_middle_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = Runtime::open(file_journal(dir.path()), SPEC, 0).unwrap();
+    for n in 0..5 {
+        rt.handle(
+            n + 1,
+            Event::RegisterSource {
+                source: "roadmap".into(),
+                sha256: sha(n as u32 + 2),
+            },
+        )
+        .unwrap();
+    }
+    drop(rt);
+    let content = text(dir.path());
+    let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+    assert_eq!(lines.len(), 6);
+    let at = lines[2].find("\"at\":").unwrap() + 5;
+    let digit = lines[2].as_bytes()[at];
+    assert!(digit.is_ascii_digit());
+    let flipped = if digit == b'9' { "8" } else { "9" };
+    lines[2].replace_range(at..at + 1, flipped);
+    fs::write(dir.path().join("journal.jsonl"), lines.join("\n") + "\n").unwrap();
+
+    match Runtime::open(file_journal(dir.path()), SPEC, 100) {
+        Err(OpenError::Journal(JournalError::Corrupt { seq: 3, .. })) => {}
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn seq_gap_and_oversize_line_fail_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let genesis = Event::Genesis {
+        policy: SPEC.into(),
+    };
+    let first = Record::seal(1, 0, genesis, &"0".repeat(64));
+    let third = Record::seal(3, 0, register_roadmap(), &first.hash);
+    let lines = format!(
+        "{}\n{}\n",
+        serde_json::to_string(&first).unwrap(),
+        serde_json::to_string(&third).unwrap()
+    );
+    fs::write(dir.path().join("journal.jsonl"), lines).unwrap();
+    assert!(matches!(
+        FileJournal::open(dir.path()).unwrap().load(),
+        Err(JournalError::Corrupt { seq: 2, .. })
+    ));
+
+    let dir = tempfile::tempdir().unwrap();
+    let huge = "x".repeat((1 << 20) + 10);
+    fs::write(dir.path().join("journal.jsonl"), format!("{huge}\n")).unwrap();
+    assert!(matches!(
+        FileJournal::open(dir.path()).unwrap().load(),
+        Err(JournalError::Corrupt { seq: 1, .. })
+    ));
+}
+
+fn sealed_journal_dir(records: &[(u64, Event)]) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let mut prev = "0".repeat(64);
+    let mut out = String::new();
+    for (seq, (at, event)) in records.iter().enumerate() {
+        let record = Record::seal(seq as u64 + 1, *at, event.clone(), &prev);
+        prev = record.hash.clone();
+        out.push_str(&serde_json::to_string(&record).unwrap());
+        out.push('\n');
+    }
+    fs::write(dir.path().join("journal.jsonl"), out).unwrap();
+    dir
+}
+
+fn genesis_event() -> Event {
+    Event::Genesis {
+        policy: SPEC.into(),
+    }
+}
+
+#[test]
+fn reordered_time_fails_closed() {
+    let dir = sealed_journal_dir(&[(5, genesis_event()), (3, register_roadmap())]);
+    match Runtime::open(file_journal(dir.path()), SPEC, 10) {
+        Err(OpenError::Replay { seq: 2, .. }) => {}
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn invalid_policy_file_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    match Runtime::open(file_journal(dir.path()), "version: 1\nnot: [valid", 0) {
+        Err(OpenError::InvalidPolicy(d)) => assert!(!d.is_empty()),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(text(dir.path()), "", "nothing is journaled");
+
+    let failing = SPEC.replace("expect: deny", "expect: allow");
+    match Runtime::open(MemoryJournal::new(), &failing, 0) {
+        Err(OpenError::InvalidPolicy(d)) => {
+            assert!(d.iter().any(|d| d.code == "test_failed"), "{d:?}")
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn rejected_and_check_events_are_journaled_and_replayed() {
+    let mut rt = Runtime::open(MemoryJournal::new(), SPEC, 0).unwrap();
+    let sheet = artifact(
+        rt.handle(
+            1,
+            Event::RegisterSource {
+                source: "price_sheet".into(),
+                sha256: sha(3),
+            },
+        )
+        .unwrap(),
+    );
+    let out = artifact(
+        rt.handle(
+            2,
+            Event::RecordOutput {
+                agent: "mailer".into(),
+                step: "draft".into(),
+                inputs: vec![sheet],
+                sha256: sha(10),
+            },
+        )
+        .unwrap(),
+    );
+    let rejected = rt.handle(7, check_event("missing")).unwrap();
+    assert!(matches!(rejected, Reply::Rejected { .. }));
+    let pending = rt
+        .handle(
+            9,
+            Event::Check {
+                agent: "mailer".into(),
+                artifact: out,
+                action: "email_customer".into(),
+                recipients: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(verdict(&pending), Verdict::NeedsApproval);
+    let digest = rt.engine().state_digest();
+    let journal = rt.into_journal();
+    assert_eq!(journal.records().len(), 5, "genesis + 4 handled events");
+
+    let rt = Runtime::open(journal, SPEC, 0).unwrap();
+    assert_eq!(rt.engine().state_digest(), digest);
+}
+
+#[test]
+fn genesis_through_handle_is_refused() {
+    let mut rt = Runtime::open(MemoryJournal::new(), SPEC, 0).unwrap();
+    let digest = rt.engine().state_digest();
+    let reply = rt.handle(5, genesis_event()).unwrap();
+    assert!(matches!(&reply, Reply::Rejected { code, .. } if code == "not_allowed"));
+    assert_eq!(rt.engine().state_digest(), digest);
+    assert_eq!(rt.into_journal().records().len(), 1);
+}
+
+#[test]
+fn clock_regression_is_not_journaled() {
+    let mut rt = Runtime::open(MemoryJournal::new(), SPEC, 0).unwrap();
+    rt.handle(10, register_roadmap()).unwrap();
+    let digest = rt.engine().state_digest();
+    let reply = rt.handle(4, register_roadmap()).unwrap();
+    assert!(matches!(&reply, Reply::Rejected { code, .. } if code == "clock_regressed"));
+    assert_eq!(rt.engine().state_digest(), digest);
+    assert!(matches!(
+        rt.handle(10, register_roadmap()),
+        Ok(Reply::Artifact { .. })
+    ));
+    let journal = rt.into_journal();
+    assert_eq!(journal.records().len(), 3, "genesis + two accepted events");
+    let digest = {
+        let rt = Runtime::open(journal.clone(), SPEC, 0).unwrap();
+        rt.engine().state_digest()
+    };
+    assert_eq!(digest.len(), 64);
+}
+
+#[test]
+fn append_rejects_a_forked_chain() {
+    let genesis = Record::seal(1, 0, genesis_event(), &"0".repeat(64));
+    let forks = [
+        Record::seal(1, 1, register_roadmap(), &genesis.hash), // repeated seq
+        Record::seal(2, 1, register_roadmap(), &"f".repeat(64)), // wrong prev
+        Record::seal(3, 1, register_roadmap(), &genesis.hash), // gap
+        Record {
+            hash: "0".repeat(64),
+            ..Record::seal(2, 1, register_roadmap(), &genesis.hash)
+        }, // bad hash
+    ];
+
+    let mut memory = MemoryJournal::new();
+    memory.append(&genesis).unwrap();
+    for fork in &forks {
+        assert!(matches!(
+            memory.append(fork),
+            Err(JournalError::Corrupt { .. })
+        ));
+    }
+    assert_eq!(memory.records().len(), 1);
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut file = file_journal(dir.path());
+    file.load().unwrap();
+    file.append(&genesis).unwrap();
+    for fork in &forks {
+        assert!(matches!(
+            file.append(fork),
+            Err(JournalError::Corrupt { .. })
+        ));
+    }
+    drop(file);
+    assert_eq!(text(dir.path()).lines().count(), 1);
+}
+
+#[test]
+fn append_before_load_on_a_non_empty_file_is_an_error() {
+    let dir = sealed_journal_dir(&[(0, genesis_event())]);
+    let mut file = file_journal(dir.path());
+    let next = Record::seal(2, 1, register_roadmap(), "x");
+    assert_eq!(
+        file.append(&next),
+        Err(JournalError::Io("journal not loaded".into()))
+    );
+}
+
+#[test]
+fn memory_journal_tear_tail_then_reopen() {
+    let mut rt = Runtime::open(MemoryJournal::new(), SPEC, 0).unwrap();
+    ten_events(&mut rt);
+    let before = rt.engine().state_digest();
+    rt.handle(500, register_roadmap()).unwrap();
+    assert_ne!(rt.engine().state_digest(), before);
+    let mut journal = rt.into_journal();
+    journal.tear_tail();
+
+    let rt = Runtime::open(journal, SPEC, 0).unwrap();
+    assert_eq!(rt.engine().state_digest(), before);
+}
+
+#[test]
+fn first_record_must_be_genesis() {
+    let mut journal = MemoryJournal::new();
+    journal
+        .append(&Record::seal(1, 0, register_roadmap(), &"0".repeat(64)))
+        .unwrap();
+    match Runtime::open(journal, SPEC, 0) {
+        Err(OpenError::Replay { seq: 1, .. }) => {}
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn file_permissions_are_private() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("state");
+        let _journal = file_journal(&sub);
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&sub), 0o700);
+        assert_eq!(mode(&sub.join("journal.jsonl")), 0o600);
+    }
+}

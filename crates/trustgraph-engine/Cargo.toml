@@ -11,7 +11,11 @@ workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+fs2.workspace = true
 thiserror.workspace = true
 trustgraph-core = { path = "../trustgraph-core" }
 trustgraph-framework = { path = "../trustgraph-framework" }
 trustgraph-policy = { path = "../trustgraph-policy" }
+
+[dev-dependencies]
+tempfile.workspace = true

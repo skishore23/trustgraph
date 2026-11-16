@@ -7,6 +7,10 @@
 
 mod engine;
 mod event;
+mod journal;
+mod runtime;
 
 pub use engine::Engine;
 pub use event::{Event, Fault, Reply};
+pub use journal::{FileJournal, Journal, JournalError, MemoryJournal, Record};
+pub use runtime::{OpenError, Runtime};

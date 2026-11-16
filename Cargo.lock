@@ -2059,8 +2059,10 @@ dependencies = [
 name = "trustgraph-engine"
 version = "0.1.0"
 dependencies = [
+ "fs2",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "trustgraph-core",
  "trustgraph-framework",
