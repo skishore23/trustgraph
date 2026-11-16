@@ -152,6 +152,7 @@ fn policy_text(text: &str) -> Result<(), Reply> {
 /// The engine's answer to one event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Reply {
     Artifact {
         id: String,

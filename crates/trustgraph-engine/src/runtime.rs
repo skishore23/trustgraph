@@ -11,6 +11,7 @@ use crate::event::{Event, Reply};
 use crate::journal::{GENESIS_PREV, Journal, JournalError, Record};
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum OpenError {
     #[error("journal error: {0}")]
     Journal(#[from] JournalError),

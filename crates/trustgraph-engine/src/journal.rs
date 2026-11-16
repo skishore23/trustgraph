@@ -97,6 +97,7 @@ impl Record {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum JournalError {
     #[error("journal I/O error: {0}")]
     Io(String),
