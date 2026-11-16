@@ -135,10 +135,11 @@ or [llms.txt](llms.txt). Protect the policy file with code review.
 
 ## Use it in your system
 
-> **Status.** The policy CLI and `trustgraph serve` have been through security
-> review. `trustgraph gateway` and the Python integrations are new: two review
-> rounds found and fixed real holes, and a third is in progress. Try them, but
-> do not put them in front of real data yet.
+> **Status.** The policy CLI, `trustgraph serve` and `trustgraph gateway` have
+> been through security review; the gateway's assumptions are listed in
+> [docs/gateway.md](docs/gateway.md). The Python integrations are not ready:
+> four review rounds each found ways to drop a restriction, and their session
+> handling is being rebuilt. Try them, but do not rely on them yet.
 
 ### `trustgraph gateway`: agents cannot skip it while it alone holds the credentials
 
