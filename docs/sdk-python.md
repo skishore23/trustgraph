@@ -18,6 +18,14 @@ One client is one agent. The server takes the agent's identity from the token
 alone; nothing in the SDK can name a different agent. Pass `token=` or
 `token_file=`, not both.
 
+The token is a bearer credential, so the client guards where it goes. `url`
+must be https, or plain http to a loopback address (`127.0.0.0/8`, `::1`,
+`localhost`); plain http to any other host raises `ValueError` unless you pass
+`allow_insecure=True`. A URL carrying credentials is refused. Redirects are
+never followed: a 3xx answer raises `TrustGraphError("redirect_refused")`
+and nothing is sent to the address it names. Proxies are not used, and the
+token never appears in an exception or a `repr`.
+
 | Method | Route |
 | --- | --- |
 | `register_source(source, content=None, sha256=None) -> Artifact` | `POST /v1/sources` |
@@ -30,10 +38,12 @@ alone; nothing in the SDK can name a different agent. Pass `token=` or
 `blocking`, `expires_at`, `id`, `allowed`); `decision.raise_unless_allowed()`
 turns deny and needs-approval into exceptions.
 
-**Content is hashed in the process.** `content` (text, bytes, or anything
-else as compact JSON with sorted keys) is hashed with SHA-256 and only the
-hash is sent. `Client(send_content=True)` sends text instead; the server
-hashes it the same way and does not store it.
+**Content is hashed in the process.** `content` (text, bytes, or a JSON value
+as compact JSON with sorted keys) is hashed with SHA-256 and only the hash is
+sent. `None`, and anything that is not text, bytes or JSON (a generator, an
+arbitrary object), raises `InvalidContent` before anything is sent; nothing
+is hashed through `repr()`. `Client(send_content=True)` sends text instead;
+the server hashes it the same way and does not store it.
 
 `trustgraph.set_default_client(client)` sets the client that
 `trustgraph.session()` uses.
@@ -68,6 +78,24 @@ or `output` in a session that has read nothing raises `nothing_read`
 inputs; a session that has seen more folds them into intermediate outputs
 (step `trustgraph.merge`), which carry the same restrictions.
 
+**A TrustGraph session must live as long as the conversation it protects;
+resuming a conversation with a new session drops its restrictions.** The
+earlier turns are back in front of the model, but the new session has not
+seen them. Where the framework keeps a conversation, the integrations keep
+the session's token with it, and refuse when they can tell a conversation
+was resumed without it:
+
+| Integration | Keeps the token in | Refuses when |
+| --- | --- | --- |
+| LangGraph `agent_node` | graph state, `state["trustgraph"]` (saved with the thread by a checkpointer) | the key is missing, or empty on any node but the `first=True` one, or empty on a thread that already holds model or tool messages (the node raises before its agent runs) |
+| LangChain / LangGraph `Guard` | graph state, `state["trustgraph"]`, for its per-thread sessions | the conversation holds a mapped source's result that the session did not record and the session carries no token (mapped tools are refused) |
+| OpenAI Agents `Guard.run` | a dict run context, `context["trustgraph"]` (a `RunState` serialises it) | the run continues a conversation (`RunState`, a non-empty `session=`, `previous_response_id`, `conversation_id`, or earlier model or tool items in the input) and the context holds no token |
+| Claude Agent SDK `Guard` | a file per SDK session id under `Guard(store=DIR)` (off by default) | the SDK session's transcript already holds tool results the guard never saw and nothing is stored for it |
+
+Each detection sees only what the framework shows it. History that was
+trimmed or summarised away is not detected, and neither is an OpenAI Agents
+run under your own `with client.session():` instead of `Guard.run`.
+
 ## Hand-offs
 
 ```python
@@ -80,8 +108,10 @@ The receiving session starts carrying everything the sender had seen, so a
 restriction follows the work to the next agent. The receiving agent must be
 listed in `agents` for every source the token carries; if it is not, the
 server answers 404 `unknown_artifact`, `receive` raises, and the session
-refuses every later read, output and check (`session_broken`). The token is
-not signed: code that drops or edits it drops the restrictions it carries.
+refuses every later read, output, check and hand-off (`session_broken`).
+`s.mark_broken(reason)` does the same on purpose, and `s.broken` says why.
+The token is not signed: code that drops or edits it drops the restrictions
+it carries.
 
 ## Decorators
 
@@ -93,10 +123,12 @@ def read_salaries(): ...
 def post_to_slack(text): ...
 ```
 
-`@source` registers the return value as the source in the current session.
-`@action` records and checks before the body runs, and runs it only on allow.
-`recipients` is a list or a function of `(args, kwargs)`; `None` means the
-action's whole audience. Both work on `async def` functions. With no current
+`@source` registers the return value as the source in the current session;
+a value that cannot be hashed raises `InvalidContent` instead of being
+returned, and a generator function needs `content=`. `@action` records and
+checks before the body runs, and runs it only on allow. `recipients` is a
+list or a function of `(args, kwargs)`; a `str` is one name, and `None` means
+the action's whole audience. Both work on `async def` functions. With no current
 session, both raise `TrustGraphError("no_session")` before the function
 runs; `@source(..., require_session=False)` runs untracked instead. `@action`
 never runs unchecked.
@@ -107,14 +139,25 @@ never runs unchecked.
 | --- | --- |
 | `Denied` | The policy denied it. `e.decision` has the reason and the `blocking` sources. |
 | `NeedsApproval` | A reviewer must approve first. `e.decision_id` is what the operator approves. |
+| `InvalidContent` | The content cannot be hashed (`None`, or not text, bytes or JSON). Nothing was sent. |
 | `TrustGraphError` | The check could not be completed. `status` (HTTP, or `None`) and `code`. |
 
-`Denied` and `NeedsApproval` are subclasses of `TrustGraphError`, so
-`except TrustGraphError` catches every case in which the action must not run.
-A server that cannot be reached (`unreachable`), any non-2xx answer
-(including 503 `restart_required` and 429 `rate_limited`) and an answer that
-is not a valid check (`invalid_response`) all raise; a wrapped action never
-runs when its check did not complete.
+`Denied`, `NeedsApproval` and `InvalidContent` are subclasses of
+`TrustGraphError`, so `except TrustGraphError` catches every case in which
+the action must not run. A server that cannot be reached (`unreachable`), a
+redirect (`redirect_refused`), any other non-2xx answer (including 503
+`restart_required` and 429 `rate_limited`), an answer that is not a valid
+check (`invalid_response`) and a broken session (`session_broken`) all
+raise; a wrapped action never runs when its check did not complete.
+
+The [integrations](integrations.md) turn each of these into a tool result
+the agent can read, and the tool does not run: "TrustGraph blocked
+`<action>`: denied: …" for a deny, "TrustGraph held `<action>`: needs
+approval: … (decision <id>)" for needs approval, and "TrustGraph could not
+complete the check for `<action>` (<code>: …)" for everything else. A source
+result that cannot be registered is withheld from the agent: "TrustGraph
+could not register the result as source `<source>` (…). The result was
+withheld."
 
 ## Waiting for approval
 

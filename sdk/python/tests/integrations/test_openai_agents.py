@@ -271,3 +271,37 @@ def test_run_streamed_is_scoped(server: Server) -> None:
 
     out = outputs(asyncio.run(run()))
     assert "`salaries`" in out["post_message"] and posted == []
+
+
+def test_runstate_resume_restores_or_refuses(server: Server) -> None:
+    """A run interrupted for the SDK's own tool approval, serialised and resumed."""
+    from agents import RunState
+
+    @function_tool(needs_approval=True)
+    def publish(text: str) -> str:
+        """Publish, after a person approves."""
+        posted.append(text)
+        return "published"
+
+    def agent() -> tuple[Guard, Agent]:
+        guard = Guard(clients={"planner": server.client("planner")},
+                      sources={"read_salaries": "salaries"}, actions={"publish": "post_to_slack"})
+        a = Agent(name="planner", tools=[read_salaries, publish],
+                  model=script(call("read_salaries"), call("publish", {"text": "x"})))
+        guard.protect(a)
+        return guard, a
+
+    for context in ({}, None):
+        guard, a = agent()
+        result = guard.run_sync(a, "go", context=context)
+        assert result.interruptions and posted == []
+        saved = result.to_state().to_json()
+        guard, a = agent()  # a new process
+        state = asyncio.run(RunState.from_json(a, saved))
+        state.approve(state.get_interruptions()[0])
+        out = outputs(guard.run_sync(a, state))
+        assert posted == []
+        if context is not None:  # the dict context travelled in the RunState with the token
+            assert "denied" in out["publish"] and "`salaries`" in out["publish"]
+        else:
+            assert "continues an earlier conversation" in out["publish"]

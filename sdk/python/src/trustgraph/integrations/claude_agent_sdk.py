@@ -347,7 +347,8 @@ class Guard:
         return {}
 
     async def subagent_stop(self, data: Any, tool_use_id: str | None, context: Any) -> dict[str, Any]:
-        # Never raises: a failure to hand back marks the SDK session broken instead.
+        # Never raises. If the subagent's reads cannot be handed back to the main session, the
+        # SDK session is marked broken; a running subagent that cannot receive them is broken itself.
         try:
             await asyncio.to_thread(self._stop, data)
         except Exception as e:
