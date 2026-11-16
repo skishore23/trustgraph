@@ -24,20 +24,24 @@
 <h1>Decide where your agent's output can go, based on what it read.</h1>
 <div class="intro">
 <div>
-<p class="lead">TrustGraph is policy-as-code for what AI agents produce. One small YAML file says who may read each source and who receives each action. Every output gets <span class="mono">allow</span>, <span class="mono">needs approval</span> or <span class="mono">deny</span>, with the reason.</p>
+<p class="lead">TrustGraph is policy-as-code for what AI agents produce. Restrictions follow the data through every hand-off, and every output gets <span class="mono">allow</span>, <span class="mono">needs approval</span> or <span class="mono">deny</span>, with the reason.</p>
 </div>
 
 <figure class="hero">
-  <svg class="flow" viewBox="0 0 520 200" role="img" aria-label="The salary file (readers: hr) and the roadmap (readers: hr, engineering) flow into a headcount plan that only hr may read. Sending it to #hr is allowed; sending it to #engineering is denied.">
-    <g class="box"><rect x="1" y="12" width="138" height="56"/><text x="12" y="36" class="t-name">salaries</text><text x="12" y="56" class="t-sub">readers: hr</text></g>
-    <g class="box"><rect x="1" y="132" width="138" height="56"/><text x="12" y="156" class="t-name">roadmap</text><text x="12" y="176" class="t-sub">hr, engineering</text></g>
-    <path class="wire" d="M139 40H164V160H139M164 100H190"/>
-    <g class="box out"><rect x="190" y="72" width="140" height="56"/><text x="201" y="96" class="t-name">headcount plan</text><text x="201" y="116" class="t-sub">readers: hr</text></g>
-    <path class="wire ok" d="M330 100H355V40H378M371 35l8 5-8 5"/>
-    <path class="wire bad dash" d="M330 100H355V160H364"/>
-    <path class="wire bad" d="M366 155l10 10M376 155l-10 10"/>
-    <g class="box"><rect x="381" y="12" width="138" height="56"/><text x="392" y="36" class="t-name">#hr</text><text x="392" y="56" class="t-allow">ALLOWED</text></g>
-    <g class="box"><rect x="381" y="132" width="138" height="56"/><text x="392" y="156" class="t-name">#engineering</text><text x="392" y="176" class="t-deny">DENIED</text></g>
+  <svg class="flow" viewBox="0 0 654 176" role="img" aria-label="A researcher reads salaries (readers: hr) and writes planning notes, which stay hr only. A planner combines the notes with the roadmap (readers: hr, engineering) into a summary, still hr only. Sending the summary to #hr is allowed; sending it to #engineering is denied.">
+    <g><rect x="1" y="20" width="120" height="50"/><text x="12" y="41" class="t-name">salaries</text><text x="12" y="60" class="t-sub">readers: hr</text></g>
+    <path class="wire" d="M121 45H181M174 40l7 5-7 5"/>
+    <rect class="agent" x="144" y="38" width="14" height="14"/><text x="151" y="12" class="t-agent">researcher</text>
+    <g><rect x="184" y="20" width="120" height="50"/><text x="195" y="41" class="t-name">planning notes</text><text x="195" y="60" class="t-sub">hr only</text></g>
+    <path class="wire" d="M304 45H364M357 40l7 5-7 5M334 122V54M329 61l5-7 5 7"/>
+    <rect class="agent" x="327" y="38" width="14" height="14"/><text x="334" y="12" class="t-agent">planner</text>
+    <g><rect x="266" y="122" width="136" height="50"/><text x="277" y="143" class="t-name">roadmap</text><text x="277" y="162" class="t-sub">hr, engineering</text></g>
+    <g class="out"><rect x="367" y="20" width="120" height="50"/><text x="378" y="41" class="t-name">summary</text><text x="378" y="60" class="t-sub">hr only</text></g>
+    <path class="wire ok" d="M487 45H510V22H534M527 17l7 5-7 5"/>
+    <path class="wire bad dash" d="M510 45V78H520"/>
+    <path class="wire bad" d="M522 73l9 9M531 73l-9 9"/>
+    <g><rect x="534" y="1" width="118" height="44"/><text x="545" y="19" class="t-name">#hr</text><text x="545" y="37" class="t-allow">ALLOWED</text></g>
+    <g><rect x="534" y="56" width="118" height="44"/><text x="545" y="74" class="t-name">#engineering</text><text x="545" y="92" class="t-deny">DENIED</text></g>
   </svg>
 </figure>
 </div>
@@ -61,47 +65,67 @@
         <button id="reset" class="plain" type="button">Reset</button>
       </div>
       <label class="sr-only" for="policy">Policy YAML</label>
-      <textarea id="policy" name="policy" class="editor" rows="18" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off" wrap="off" aria-describedby="editor-help check-status">version: 1
+      <textarea id="policy" name="policy" class="editor" rows="18" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off" wrap="off" aria-describedby="editor-help check-status"># Scenario: a research agent reads the salary file and writes planning notes; a planning agent combines the notes with the roadmap.
+# What the notes carry follows them, so a summary built on them stays HR-only however many steps later.
+version: 1
 
 groups:
   hr: [nina]
   engineering: [sam, ravi]
-  sales: [leo]
-  customers: [acme]
+  leadership: [maya]
 
-agents: [planner, mailer]
+agents: [researcher, planner]
 
 sources:
-  salaries:
+  salaries:           # compensation: HR only
     readers: [hr]
+    agents: [researcher, planner]
+  roadmap:            # product plans: HR, engineering and leadership
+    readers: [hr, engineering, leadership]
     agents: [planner]
-  roadmap:
-    readers: [hr, engineering]
-    agents: [planner]
-  price_sheet:
-    readers: [sales, customers]
-    agents: [mailer]
+  benchmarks:         # public industry data
+    readers: [hr, engineering, leadership]
+    agents: [researcher, planner]
 
 actions:
-  post_to_slack:
+  post_to_engineering:
     agents: [planner]
     audience: [engineering]
-  email_customer:
-    agents: [mailer]
-    audience: [customers]
-    approval: { reviewers: [sales], valid_for: 30m }
+  brief_hr:
+    agents: [planner]
+    audience: [hr]
+  brief_leadership:   # leadership sees plans only after HR signs off
+    agents: [planner]
+    audience: [leadership]
+    approval: { reviewers: [hr], valid_for: 1h }
 
+# Tests list every source an output carries, including through notes.
 tests:
-  - name: salary data never reaches engineering
+  - name: a summary built on salary notes never reaches engineering
     output_from: [salaries, roadmap]
     agent: planner
-    action: post_to_slack
+    action: post_to_engineering
     expect: deny
-  - name: roadmap summary can be posted
+  - name: a roadmap summary can go to engineering
     output_from: [roadmap]
     agent: planner
-    action: post_to_slack
+    action: post_to_engineering
     expect: allow
+  - name: the same summary can brief HR
+    output_from: [salaries, roadmap]
+    agent: planner
+    action: brief_hr
+    expect: allow
+  - name: leadership gets the roadmap after HR approves
+    output_from: [roadmap, benchmarks]
+    agent: planner
+    action: brief_leadership
+    expect: needs_approval
+  - name: salary notes never reach leadership, even with approval
+    output_from: [salaries, benchmarks]
+    agent: planner
+    action: brief_leadership
+    expect: deny
 </textarea>
       <div class="cell-foot">
         <p id="check-status" class="status" role="status" aria-live="polite">Connecting to the policy engine…</p>
@@ -111,13 +135,8 @@ tests:
     </div>
 
     <div class="cell">
-      <div class="cell-head"><h3>The run</h3></div>
-      <p class="sentence">
-        <label class="sr-only" for="agent">Agent</label><select id="agent" name="agent" disabled><option>planner</option></select>
-        read <span id="sources" class="chips" role="group" aria-label="Sources it read"></span>
-        and wants to <label class="sr-only" for="action">Action</label><select id="action" name="action" disabled><option>post_to_slack</option></select>
-        <span aria-hidden="true">→</span><span class="sr-only">sending to</span> <span id="recipients" class="chips" role="group" aria-label="Recipients"></span>.
-      </p>
+      <h3 class="sr-only">The run</h3>
+      <div id="steps" class="steps"><p class="muted">Loading the run…</p></div>
       <div id="decision" class="answer" aria-live="polite"><p class="muted">Waiting for the policy engine.</p></div>
     </div>
   </div>
@@ -141,25 +160,25 @@ tests:
 
 <section aria-labelledby="problem-title">
 <h2 id="problem-title">The problem</h2>
-<p>Permission systems decide what an agent may read. They lose track the moment it writes something new.</p>
+<p>Permission systems decide what an agent may read. They lose track once it writes something new, and again each time another agent builds on that.</p>
 <ol class="grid three">
   <li class="cell">
-    <svg class="spot" viewBox="0 0 120 64" role="img" aria-label="Two documents read by an agent"><path class="ink" d="M10 4h24v26H10zM15 12h14M15 18h14M15 24h9M10 34h24v26H10zM15 42h14M15 48h14M15 54h9M34 17c22 0 26 15 46 15M34 47c22 0 26-15 46-15"/><rect class="accent" x="80" y="25" width="14" height="14"/></svg>
-    <b>It reads two allowed files.</b>
-    <p>The salary file and the roadmap. Each read passes its permission check.</p>
+    <svg class="spot" viewBox="0 0 120 64" role="img" aria-label="An agent reads a restricted document"><path class="ink" d="M14 14h28v36H14zM20 24h16M20 31h16M20 38h10M42 32h34M70 27l6 5-6 5"/><rect class="accent" x="80" y="25" width="14" height="14"/></svg>
+    <b>An agent reads something restricted.</b>
+    <p>A research agent opens the salary file. It is allowed to.</p>
   </li>
   <li class="cell">
-    <svg class="spot" viewBox="0 0 120 64" role="img" aria-label="The agent writes a new document with no permissions"><rect class="accent" x="12" y="25" width="14" height="14"/><path class="ink" d="M26 32h34M54 27l6 5-6 5M72 10h28v44H72z" /><path class="ink dash" d="M78 20h16M78 27h16M78 34h16M78 41h10"/></svg>
-    <b>It writes something new.</b>
-    <p>A Q3 headcount plan built from both. A new document has no permissions of its own.</p>
+    <svg class="spot" viewBox="0 0 120 64" role="img" aria-label="The first agent writes notes; a second agent builds on them"><rect class="accent" x="2" y="25" width="14" height="14"/><path class="ink" d="M16 32h14M26 28l4 4-4 4M32 14h24v36H32zM56 32h20M72 28l4 4-4 4"/><path class="ink dash" d="M37 23h14M37 30h14M37 37h10"/><rect class="accent" x="80" y="25" width="14" height="14"/></svg>
+    <b>It writes notes. Another agent builds on them.</b>
+    <p>A planner, which never opened the salary file, combines the notes with the roadmap.</p>
   </li>
   <li class="cell">
-    <svg class="spot" viewBox="0 0 120 64" role="img" aria-label="The new document is posted to an engineering channel"><path class="ink" d="M10 14h26v36H10zM16 24h14M16 31h14M16 38h9M80 14h30v36H80zM89 26h12M89 38h12M92 22l-2 20M100 22l-2 20"/><path class="deny" d="M36 32h38M68 27l6 5-6 5"/></svg>
-    <b>It posts where it shouldn't.</b>
-    <p>The plan goes to #engineering, and the salaries go with it.</p>
+    <svg class="spot" viewBox="0 0 120 64" role="img" aria-label="Two steps later the summary is posted to a channel"><path class="ink" d="M10 14h26v36H10zM16 24h14M16 31h14M16 38h9M80 14h30v36H80zM89 26h12M89 38h12M92 22l-2 20M100 22l-2 20"/><path class="deny" d="M36 32h38M68 27l6 5-6 5"/></svg>
+    <b>Two steps later, the secret is in a channel.</b>
+    <p>The summary goes to #engineering. It never mentions salaries, and nothing along the way looked wrong.</p>
   </li>
 </ol>
-<p>TrustGraph makes the restriction follow the data.</p>
+<p>TrustGraph follows the salary file through both steps and says no.</p>
 </section>
 
 <section id="simulator" aria-labelledby="sim-title">

@@ -11,7 +11,9 @@ const CHECK_DELAY_MS = 400;
 const SIM_COUNT = 8;
 const SIM_STEPS = 120;
 const SEED_MAX = 65535;
-const DEFAULT_EXAMPLE = 'starter';
+const DEFAULT_EXAMPLE = 'handoff';
+const STARTER = 'starter';
+const MAX_UI_STEPS = 3;
 
 const VERDICTS = {
   allow: { label: 'ALLOWED', word: 'allow', cls: 'allow' },
@@ -85,6 +87,15 @@ function buildRequest(op, args = {}) {
       return { op, old: String(args.old ?? ''), new: String(args.new ?? '') };
     case 'simulate':
       return { op, policy: String(args.policy ?? ''), seed: args.seed, count: args.count ?? SIM_COUNT, steps: args.steps ?? SIM_STEPS };
+    case 'run':
+      return {
+        op,
+        policy: String(args.policy ?? ''),
+        steps: (Array.isArray(args.steps) ? args.steps : []).map(s => ({ agent: String(s.agent ?? ''), reads: list(s.reads), writes: String(s.writes ?? '') })),
+        check: args.check
+          ? { step: Number(args.check.step), action: String(args.check.action ?? ''), recipients: Array.isArray(args.check.recipients) ? args.check.recipients.map(String) : null }
+          : null,
+      };
     default:
       throw new Error(`Unknown policy operation: ${op}`);
   }
@@ -148,13 +159,22 @@ function defaultRun(summary) {
   return { agent, action: name || '', sources: usable.slice(0, 1), recipients: null };
 }
 
+// A run is a list of steps, each an agent that read some sources and some
+// earlier steps' outputs; the last step's output is checked against an action.
+// { steps: [{ agent, sources: [names], prior: [step indexes] }], action, recipients }
+function toRun(simple) {
+  return { steps: [{ agent: simple.agent, sources: list(simple.sources), prior: [] }], action: simple.action, recipients: simple.recipients ?? null };
+}
+
+const cloneRun = run => JSON.parse(JSON.stringify(run));
+
 // Keep what the visitor chose when the policy changes, dropping names that vanished.
 function reconcileRun(run, summary) {
-  if (!run) return defaultRun(summary);
+  const fallback = toRun(defaultRun(summary));
+  if (!run || !Array.isArray(run.steps) || !run.steps.length) return fallback;
   const agents = list(summary.agents);
   const sources = Object.keys(summary.sources || {});
   const actions = summary.actions || {};
-  const fallback = defaultRun(summary);
   const action = hasOwn(actions, run.action) ? run.action : fallback.action;
   const people = list(actions[action] && actions[action].people);
   let recipients = null;
@@ -162,12 +182,37 @@ function reconcileRun(run, summary) {
     recipients = run.recipients.filter(p => people.includes(p));
     if (recipients.length === people.length) recipients = null;
   }
-  return {
-    agent: agents.includes(run.agent) ? run.agent : fallback.agent,
-    action,
-    sources: run.sources.filter(s => sources.includes(s)),
-    recipients,
-  };
+  const steps = run.steps.map((step, i) => ({
+    agent: agents.includes(step.agent) ? step.agent : fallback.steps[0].agent,
+    sources: list(step.sources).filter(x => sources.includes(x)),
+    prior: (Array.isArray(step.prior) ? step.prior : []).filter(n => Number.isInteger(n) && n >= 0 && n < i),
+  }));
+  return { steps, action, recipients };
+}
+
+// What each step writes, by position: "output" alone; "planning notes" then "summary".
+function stepNames(n) {
+  if (n <= 1) return ['output'];
+  if (n === 2) return ['planning notes', 'summary'];
+  return [...Array.from({ length: n - 1 }, (_, i) => `notes ${i + 1}`), 'summary'];
+}
+
+// The `run` request for a run: earlier steps first, then sources; check the last step.
+function runRequest(policy, run) {
+  const names = stepNames(run.steps.length);
+  return buildRequest('run', {
+    policy,
+    steps: run.steps.map((s, i) => ({ agent: s.agent, reads: [...s.prior.map(n => `step:${n}`), ...s.sources.map(x => `source:${x}`)], writes: names[i] })),
+    check: { step: run.steps.length - 1, action: run.action, recipients: Array.isArray(run.recipients) ? run.recipients : null },
+  });
+}
+
+// One quiet line per step: what the engine recorded, or why it refused.
+function recordedLine(step) {
+  if (!step) return { cls: 'recorded muted', text: 'not run' };
+  if (step.rejected) return { cls: 'recorded refused', text: `refused — ${String(step.rejected.message).replace(/`/g, '')}` };
+  const a = step.artifact || {};
+  return { cls: 'recorded', text: `${step.writes} — carries: ${names(a.sources)} — readable by: ${names(a.readers)}` };
 }
 
 function expandRecipients(run, summary) {
@@ -384,27 +429,53 @@ function renderSimulation(result) {
   return out;
 }
 
-/* ---------- experiments (defined against the starter policy) ---------- */
+/* ---------- experiments (per example) ---------- */
 
-const LEAK_RUN = { agent: 'planner', sources: ['salaries', 'roadmap'], action: 'post_to_slack' };
-const EXPERIMENTS = [
-  { id: 'leak', label: 'Leak the salary file', run: LEAK_RUN,
-    note: 'planner read salaries and roadmap and posts the result to engineering.' },
-  { id: 'roadmap', label: 'Post only the roadmap', run: { agent: 'planner', sources: ['roadmap'], action: 'post_to_slack' },
-    note: 'planner read only the roadmap and posts it to engineering.' },
-  { id: 'email', label: 'Email a customer', run: { agent: 'mailer', sources: ['price_sheet'], action: 'email_customer' },
-    note: 'mailer read the price sheet and emails the customer.' },
-  { id: 'widen', label: 'Give engineering the salary file', run: LEAK_RUN,
-    edit: [/(\n {2}salaries:\n {4}readers: \[)([^\]\n]*)\]/, '$1$2, engineering]'],
-    note: 'Added `engineering` to salaries.readers. A test now fails and the diff flags it.' },
-  { id: 'typo', label: 'Misspell a group', run: LEAK_RUN,
-    edit: [/(\n {2}roadmap:\n {4}readers: \[hr, )engineering\]/, '$1enginering]'],
-    note: 'Changed `engineering` to `enginering` in roadmap.readers.' },
-];
+const HANDOFF_RUN = {
+  steps: [
+    { agent: 'researcher', sources: ['salaries'], prior: [] },
+    { agent: 'planner', sources: ['roadmap'], prior: [0] },
+  ],
+  action: 'post_to_engineering',
+  recipients: null,
+};
+const STARTER_LEAK = toRun({ agent: 'planner', sources: ['salaries', 'roadmap'], action: 'post_to_slack' });
+
+const EXPERIMENTS = {
+  handoff: [
+    { id: 'launder', label: 'Launder the salary file through notes', run: HANDOFF_RUN,
+      note: 'Two agents, two steps: salaries → planning notes → a summary for engineering.' },
+    { id: 'uncleared', label: "Hand the notes to an agent that isn't cleared", run: HANDOFF_RUN,
+      edit: [/(\n {2}salaries:[^\n]*\n {4}readers: \[hr\]\n {4}agents: \[researcher), planner\]/, '$1]'],
+      note: 'Removed `planner` from salaries.agents: it may not take in anything built on salaries.' },
+    { id: 'roadmap', label: 'Drop the notes, keep the roadmap',
+      run: { ...HANDOFF_RUN, steps: [HANDOFF_RUN.steps[0], { agent: 'planner', sources: ['roadmap'], prior: [] }] },
+      note: 'planner wrote the summary from the roadmap alone.' },
+    { id: 'hr', label: 'Send the same summary to HR instead', run: { ...HANDOFF_RUN, action: 'brief_hr' },
+      note: 'Same summary, sent to hr with `brief_hr`.' },
+    { id: 'widen', label: 'Quietly widen the salary file', run: HANDOFF_RUN,
+      edit: [/(\n {2}salaries:[^\n]*\n {4}readers: \[)hr\]/, '$1hr, engineering]'],
+      note: 'Added `engineering` to salaries.readers. A test fails and the diff flags it.' },
+  ],
+  starter: [
+    { id: 'leak', label: 'Leak the salary file', run: STARTER_LEAK,
+      note: 'planner read salaries and roadmap and posts the result to engineering.' },
+    { id: 'roadmap', label: 'Post only the roadmap', run: toRun({ agent: 'planner', sources: ['roadmap'], action: 'post_to_slack' }),
+      note: 'planner read only the roadmap and posts it to engineering.' },
+    { id: 'email', label: 'Email a customer', run: toRun({ agent: 'mailer', sources: ['price_sheet'], action: 'email_customer' }),
+      note: 'mailer read the price sheet and emails the customer.' },
+    { id: 'widen', label: 'Give engineering the salary file', run: STARTER_LEAK,
+      edit: [/(\n {2}salaries:\n {4}readers: \[)([^\]\n]*)\]/, '$1$2, engineering]'],
+      note: 'Added `engineering` to salaries.readers. A test now fails and the diff flags it.' },
+    { id: 'typo', label: 'Misspell a group', run: STARTER_LEAK,
+      edit: [/(\n {2}roadmap:\n {4}readers: \[hr, )engineering\]/, '$1enginering]'],
+      note: 'Changed `engineering` to `enginering` in roadmap.readers.' },
+  ],
+};
 
 // The policy text and run an experiment produces from the original, or null if it does not apply.
-function applyExperiment(id, original) {
-  const experiment = EXPERIMENTS.find(e => e.id === id);
+function applyExperiment(exampleId, id, original) {
+  const experiment = (EXPERIMENTS[exampleId] || []).find(e => e.id === id);
   if (!experiment) return null;
   let policy = String(original ?? '');
   if (experiment.edit) {
@@ -412,7 +483,7 @@ function applyExperiment(id, original) {
     if (!pattern.test(policy)) return null;
     policy = policy.replace(pattern, replacement);
   }
-  return { policy, run: { ...experiment.run, sources: experiment.run.sources.slice(), recipients: null }, note: experiment.note };
+  return { policy, run: cloneRun(experiment.run), note: experiment.note };
 }
 
 // The starter without its comment lines: the same policy, shorter to read.
@@ -420,20 +491,24 @@ function stripComments(text) {
   return String(text).split('\n').filter(line => !/^\s*#/.test(line)).join('\n').replace(/\n{3,}/g, '\n\n').replace(/^\n+/, '');
 }
 
-// Starter first and comment-free; its annotated original kept as a second entry.
+// The hand-off first, then the comment-free starter and its annotated original, then the rest.
 function arrangeExamples(examples) {
-  const starter = examples.find(e => e.id === DEFAULT_EXAMPLE);
-  if (!starter) return examples.slice();
+  const starter = examples.find(e => e.id === STARTER);
+  const handoff = examples.find(e => e.id === DEFAULT_EXAMPLE);
+  const rest = examples.filter(e => e !== starter && e !== handoff);
   return [
-    { ...starter, policy: stripComments(starter.policy) },
-    { ...starter, id: `${DEFAULT_EXAMPLE}-annotated`, title: `${starter.title || 'Starter'} (annotated)` },
-    ...examples.filter(e => e !== starter),
+    ...(handoff ? [handoff] : []),
+    ...(starter ? [
+      { ...starter, policy: stripComments(starter.policy) },
+      { ...starter, id: `${STARTER}-annotated`, title: `${starter.title || 'Starter'} (annotated)` },
+    ] : []),
+    ...rest,
   ];
 }
 
 /* ---------- the live page ---------- */
 
-const ui = {};
+const ui = { recorded: [] };
 const state = {
   examples: [],
   exampleId: null,
@@ -454,27 +529,23 @@ function setStatus(cls, text) {
   ui.status.textContent = text;
 }
 
-function showDecisionMessage(title, detail) {
-  ui.decision.replaceChildren(h('p', { class: 'verdict', text: title }), detail ? h('p', { class: 'muted', text: detail }) : null);
+function showDecisionMessage(title, detail, cls) {
+  ui.decision.replaceChildren(h('p', { class: cls ? `verdict ${cls}` : 'verdict', text: title }), detail ? h('p', { class: 'muted', text: detail }) : null);
 }
 
-function fillSelect(select, values, selected) {
-  select.replaceChildren(...values.map(v => h('option', { value: v, text: v })));
-  select.value = selected;
-  select.disabled = values.length === 0;
-}
-
-function experimentsApply() {
-  return state.exampleId === DEFAULT_EXAMPLE || (state.exampleId === null && state.original != null);
+// Experiments for the selected example; the hand-off's when examples failed to load.
+function experimentSet() {
+  return EXPERIMENTS[state.exampleId ?? (state.original != null ? DEFAULT_EXAMPLE : '')] || null;
 }
 
 function renderExperiments() {
   if (!ui.experiments) return;
-  ui.experiments.hidden = !experimentsApply();
-  ui.experimentButtons.replaceChildren(...EXPERIMENTS.map(e => h('button', {
+  const set = experimentSet();
+  ui.experiments.hidden = !set;
+  ui.experimentButtons.replaceChildren(...(set || []).map(e => h('button', {
     type: 'button', class: 'exp', 'aria-pressed': String(state.experiment === e.id), on: { click: () => runExperiment(e.id) },
   }, e.label)));
-  const current = EXPERIMENTS.find(e => e.id === state.experiment);
+  const current = (set || []).find(e => e.id === state.experiment);
   ui.experimentNote.replaceChildren(...(current ? richText(current.note) : []));
 }
 
@@ -485,7 +556,7 @@ function clearExperiment() {
 }
 
 async function runExperiment(id) {
-  const result = applyExperiment(id, state.original);
+  const result = applyExperiment(state.exampleId ?? DEFAULT_EXAMPLE, id, state.original);
   if (!result) return;
   state.experiment = id;
   ui.policy.value = result.policy;
@@ -502,6 +573,7 @@ async function loadExamples() {
   if (res.error || !examples.length) {
     state.original = ui.policy.value;
     setStatus('offline', `Examples unavailable: ${res.error ? res.error.message : 'none returned'}`);
+    renderExperiments();
     await runCheck();
     return;
   }
@@ -523,8 +595,9 @@ async function loadExample(id) {
   lanes.simulate.cancel();
   ui.simResult.replaceChildren(h('p', { class: 'muted', text: 'Uses the policy in the playground above.' }));
   ui.simRun.disabled = false;
-  if (id === DEFAULT_EXAMPLE) {
-    await runExperiment('leak');
+  const set = EXPERIMENTS[id];
+  if (set) {
+    await runExperiment(set[0].id);
     return;
   }
   renderExperiments();
@@ -559,8 +632,8 @@ async function runCheck() {
   if (state.valid) {
     state.summary = result.summary;
     state.run = reconcileRun(state.run, state.summary);
-    renderRunControls();
-    runDecide();
+    renderSteps();
+    runSteps();
   } else {
     lanes.decide.cancel();
     showDecisionMessage('Policy has errors', 'Fix the errors in the policy to see an answer.');
@@ -568,22 +641,54 @@ async function runCheck() {
   runDiff(policy, Boolean(result.ok));
 }
 
-async function runDecide() {
+function showRecorded(results) {
+  ui.recorded.forEach((line, i) => {
+    const r = results ? recordedLine(results[i]) : { cls: 'recorded muted', text: '' };
+    line.setAttribute('class', `${r.cls} mono`);
+    line.textContent = r.text;
+  });
+}
+
+// Drive the steps through a fresh engine on the server, then show what each
+// step recorded and the answer for the last one.
+async function runSteps() {
   if (!state.valid || !state.run) return;
   const run = state.run;
+  if (run.steps.some(s => !s.sources.length && !s.prior.length)) {
+    lanes.decide.cancel();
+    showRecorded(null);
+    showDecisionMessage('Nothing read', 'Tick at least one input for every step.');
+    return;
+  }
   if (Array.isArray(run.recipients) && !run.recipients.length) {
     lanes.decide.cancel();
     showDecisionMessage('No recipients', 'Tick at least one recipient.');
     return;
   }
   ui.decision.setAttribute('aria-busy', 'true');
-  const res = await lanes.decide.run(buildRequest('decide', { policy: ui.policy.value, output_from: run.sources, agent: run.agent, action: run.action, recipients: run.recipients }));
+  const res = await lanes.decide.run(runRequest(ui.policy.value, run));
   if (!res.fresh) return;
   ui.decision.setAttribute('aria-busy', 'false');
   if (res.error) { showDecisionMessage('Engine unavailable', res.error.message); return; }
-  if (!res.value.outcome) { showDecisionMessage('Policy has errors', 'Fix the errors in the policy to see an answer.'); return; }
+  const value = res.value;
+  if (!value.ok) {
+    showRecorded(null);
+    const first = (value.diagnostics || [])[0];
+    showDecisionMessage('Policy has errors', first ? first.message : 'Fix the errors in the policy to see an answer.');
+    return;
+  }
+  const steps = Array.isArray(value.steps) ? value.steps : [];
+  showRecorded(steps);
+  const refused = steps.findIndex(s => s && s.rejected);
+  if (refused >= 0) {
+    showDecisionMessage('No answer', `The engine refused step ${refused + 1}, so the run stopped there.`, 'v-deny');
+    return;
+  }
+  const decision = value.decision;
+  if (!decision) { showDecisionMessage('No answer', 'The engine returned no decision.'); return; }
+  if (decision.rejected) { showDecisionMessage('No answer', decision.rejected.message, 'v-deny'); return; }
   const action = state.summary.actions[run.action] || {};
-  ui.decision.replaceChildren(...renderDecision(res.value.outcome, { approval: action.approval || null }));
+  ui.decision.replaceChildren(...renderDecision(decision, { approval: action.approval || null }));
 }
 
 async function runDiff(policy, ok) {
@@ -603,38 +708,95 @@ async function runDiff(policy, ok) {
   ui.diff.replaceChildren(...renderDiff(res.value));
 }
 
-// The run as a sentence: "[agent] read [sources] and wants to [action] → [recipients]."
-function renderRunControls() {
+function chip(value, label, checked, onChange, title) {
+  return h('label', { class: 'chip', title },
+    h('input', { type: 'checkbox', value, checked, on: { change: event => onChange(event.target.checked) } }), label);
+}
+
+function select(id, values, selected, onChange) {
+  const el = h('select', { id, name: id, on: { change: event => onChange(event.target.value) } }, values.map(v => h('option', { value: v, text: v })));
+  el.value = selected;
+  return el;
+}
+
+// Each step as an editable sentence, with the line the engine recorded under it.
+function renderSteps(focusId) {
   const summary = state.summary;
   const run = state.run;
-  fillSelect(ui.agent, list(summary.agents), run.agent);
-  fillSelect(ui.action, Object.keys(summary.actions || {}), run.action);
-  const chip = (value, checked, onChange, title) => h('label', { class: 'chip', title },
-    h('input', { type: 'checkbox', value, checked, on: { change: event => onChange(value, event.target.checked) } }), value);
-  ui.sources.replaceChildren(...Object.entries(summary.sources || {}).map(([name, s]) =>
-    chip(name, run.sources.includes(name), toggleSource, list(s.agents).includes(run.agent) ? null : `${run.agent} may not use ${name}`)));
-  const action = summary.actions[run.action] || {};
-  const chosen = expandRecipients(run, summary);
-  ui.recipients.replaceChildren(...list(action.people).map(person => chip(person, chosen.includes(person), toggleRecipient)));
+  const labels = stepNames(run.steps.length);
+  const many = run.steps.length > 1;
+  ui.recorded = [];
+  const blocks = run.steps.map((step, i) => {
+    const last = i === run.steps.length - 1;
+    const toggle = (array, item) => on => {
+      const at = array.indexOf(item);
+      if (on && at < 0) array.push(item);
+      if (!on && at >= 0) array.splice(at, 1);
+      clearExperiment();
+      runSteps();
+    };
+    const inputs = [
+      ...Array.from({ length: i }, (_, n) => chip(`step:${n}`, labels[n], step.prior.includes(n), toggle(step.prior, n))),
+      ...Object.entries(summary.sources || {}).map(([name, s]) =>
+        chip(name, name, step.sources.includes(name), toggle(step.sources, name), list(s.agents).includes(step.agent) ? null : `${step.agent} may not use ${name}`)),
+    ];
+    const agentId = `agent-${i}`;
+    const tail = last
+      ? [' and wants to ', h('label', { class: 'sr-only', for: 'action', text: 'Action' }),
+        select('action', Object.keys(summary.actions || {}), run.action, value => { run.action = value; run.recipients = null; clearExperiment(); renderSteps('action'); runSteps(); }),
+        h('span', { 'aria-hidden': 'true', text: '→' }), h('span', { class: 'sr-only', text: ' sending to ' }),
+        h('span', { class: 'chips', role: 'group', 'aria-label': 'Recipients' }, recipientChips()), '.']
+      : [' and wrote ', h('b', { text: labels[i] }), '.'];
+    const recorded = h('p', { class: 'recorded mono' });
+    ui.recorded.push(recorded);
+    return h('div', { class: 'step' },
+      h('p', { class: 'sentence' },
+        many ? h('span', { class: 'step-n mono', text: `${i + 1}.` }) : null,
+        h('label', { class: 'sr-only', for: agentId, text: `Agent for step ${i + 1}` }),
+        select(agentId, list(summary.agents), step.agent, value => { step.agent = value; clearExperiment(); renderSteps(agentId); runSteps(); }),
+        ' read ', h('span', { class: 'chips', role: 'group', 'aria-label': `What step ${i + 1} read` }, inputs), tail),
+      recorded);
+  });
+  const controls = h('p', { class: 'step-controls' },
+    run.steps.length < MAX_UI_STEPS ? h('button', { class: 'plain', type: 'button', on: { click: addStep } }, '+ add a step') : null,
+    many ? h('button', { class: 'plain', type: 'button', on: { click: removeStep } }, '− remove the last step') : null);
+  ui.steps.replaceChildren(...blocks, controls);
+  if (focusId) { const el = $(focusId); if (el && typeof el.focus === 'function') el.focus(); }
 }
 
-function toggleSource(name, on) {
-  const set = new Set(state.run.sources);
-  if (on) set.add(name); else set.delete(name);
-  const order = Object.keys(state.summary.sources || {});
-  state.run.sources = order.filter(s => set.has(s));
-  clearExperiment();
-  runDecide();
+function recipientChips() {
+  const run = state.run;
+  const action = state.summary.actions[run.action] || {};
+  const people = list(action.people);
+  const chosen = expandRecipients(run, state.summary);
+  return people.map(person => chip(person, person, chosen.includes(person), on => {
+    const set = new Set(expandRecipients(run, state.summary));
+    if (on) set.add(person); else set.delete(person);
+    const picked = people.filter(p => set.has(p));
+    run.recipients = picked.length === people.length ? null : picked;
+    clearExperiment();
+    runSteps();
+  }));
 }
 
-function toggleRecipient(person, on) {
-  const people = list(state.summary.actions[state.run.action].people);
-  const set = new Set(expandRecipients(state.run, state.summary));
-  if (on) set.add(person); else set.delete(person);
-  const chosen = people.filter(p => set.has(p));
-  state.run.recipients = chosen.length === people.length ? null : chosen;
+// A new last step reads the previous one; its agent starts as the previous agent.
+function addStep() {
+  const run = state.run;
+  if (run.steps.length >= MAX_UI_STEPS) return;
+  const previous = run.steps[run.steps.length - 1];
+  run.steps.push({ agent: previous.agent, sources: [], prior: [run.steps.length - 1] });
   clearExperiment();
-  runDecide();
+  renderSteps(`agent-${run.steps.length - 1}`);
+  runSteps();
+}
+
+function removeStep() {
+  const run = state.run;
+  if (run.steps.length <= 1) return;
+  run.steps.pop();
+  clearExperiment();
+  renderSteps(`agent-${run.steps.length - 1}`);
+  runSteps();
 }
 
 function focusDiagnostic(diagnostic) {
@@ -687,8 +849,7 @@ async function runSimulation(event) {
 function boot() {
   Object.assign(ui, {
     example: $('example'), policy: $('policy'), status: $('check-status'), reset: $('reset'),
-    diagnostics: $('diagnostics'), tests: $('tests'), agent: $('agent'), sources: $('sources'),
-    action: $('action'), recipients: $('recipients'), decision: $('decision'), explain: $('explain'), diff: $('diff'),
+    diagnostics: $('diagnostics'), tests: $('tests'), steps: $('steps'), decision: $('decision'), explain: $('explain'), diff: $('diff'),
     experiments: $('experiments'), experimentButtons: $('experiment-buttons'), experimentNote: $('experiment-note'),
     simForm: $('sim-form'), seed: $('sim-seed'), simRun: $('sim-run'), simResult: $('sim-result'),
   });
@@ -698,14 +859,13 @@ function boot() {
   ui.example.addEventListener('change', () => loadExample(ui.example.value));
   ui.reset.addEventListener('click', () => {
     if (state.original == null) return;
-    if (state.exampleId === DEFAULT_EXAMPLE) { runExperiment('leak'); return; }
+    const set = experimentSet();
+    if (set) { runExperiment(set[0].id); return; }
     ui.policy.value = state.original;
     state.run = null;
     clearExperiment();
     runCheck();
   });
-  ui.agent.addEventListener('change', () => { state.run.agent = ui.agent.value; clearExperiment(); renderRunControls(); runDecide(); });
-  ui.action.addEventListener('change', () => { state.run.action = ui.action.value; state.run.recipients = null; clearExperiment(); renderRunControls(); runDecide(); });
   ui.simForm.addEventListener('submit', runSimulation);
   renderExperiments();
   return loadExamples();

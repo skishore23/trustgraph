@@ -10,6 +10,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use trustgraph_engine::{Engine, Event, Reply};
 use trustgraph_policy::{
     Diagnostic, Policy, Query, STARTER, Severity, decide, diff, explain, lint, parse, run_tests,
 };
@@ -23,7 +24,12 @@ const MAX_SOURCES: usize = 64;
 const MAX_RECIPIENTS: usize = 256;
 const MAX_NAME_BYTES: usize = 256;
 
-const EXAMPLES: [(&str, &str, &str); 6] = [
+const EXAMPLES: [(&str, &str, &str); 7] = [
+    (
+        "handoff",
+        "Hand-off between agents",
+        include_str!("../examples/policies/handoff.policy.yaml"),
+    ),
     (
         "slack-digest",
         "Slack digest",
@@ -359,6 +365,317 @@ fn op_simulate(req: SimReq) -> Result<Value, Rejection> {
     )
 }
 
+// ---- `run`: several agent steps through a fresh engine, then one check ----
+
+const MAX_RUN_STEPS: usize = 6;
+const MAX_STEP_READS: usize = 8;
+const MAX_RUN_NAME_BYTES: usize = 64;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunStep {
+    agent: String,
+    reads: Vec<String>,
+    writes: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunCheck {
+    step: usize,
+    action: String,
+    #[serde(default)]
+    recipients: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunReq {
+    #[allow(dead_code)]
+    op: String,
+    policy: String,
+    steps: Vec<RunStep>,
+    #[serde(default)]
+    check: Option<RunCheck>,
+}
+
+/// What one step reads: a policy source, or the output of an earlier step.
+enum Read {
+    Source(String),
+    Step(usize),
+}
+
+fn run_name(value: &str, what: &str) -> Result<(), Rejection> {
+    if value.trim().is_empty() || value.len() > MAX_RUN_NAME_BYTES {
+        return reject(
+            "limit",
+            format!("`{what}` must be 1 to {MAX_RUN_NAME_BYTES} bytes and not blank."),
+        );
+    }
+    Ok(())
+}
+
+/// Check the request's shape before any engine work: bounds, names, and that
+/// every step reads only sources or earlier steps.
+fn plan(req: &RunReq) -> Result<Vec<Vec<Read>>, Rejection> {
+    if req.steps.is_empty() || req.steps.len() > MAX_RUN_STEPS {
+        return reject(
+            "limit",
+            format!("`steps` must have 1 to {MAX_RUN_STEPS} entries."),
+        );
+    }
+    let mut plan = Vec::with_capacity(req.steps.len());
+    for (index, step) in req.steps.iter().enumerate() {
+        run_name(&step.agent, "agent")?;
+        run_name(&step.writes, "writes")?;
+        if step.reads.is_empty() || step.reads.len() > MAX_STEP_READS {
+            return reject(
+                "limit",
+                format!("Each step reads 1 to {MAX_STEP_READS} inputs."),
+            );
+        }
+        let mut reads = Vec::with_capacity(step.reads.len());
+        for read in &step.reads {
+            run_name(read, "reads")?;
+            if let Some(source) = read.strip_prefix("source:") {
+                reads.push(Read::Source(source.to_string()));
+            } else if let Some(n) = read.strip_prefix("step:") {
+                match n.parse::<usize>() {
+                    Ok(n) if n < index => reads.push(Read::Step(n)),
+                    _ => {
+                        return reject(
+                            "bad_request",
+                            format!(
+                                "Step {index} reads `{read}`; a step may only read earlier steps."
+                            ),
+                        );
+                    }
+                }
+            } else {
+                return reject(
+                    "bad_request",
+                    "Each read is `source:<name>` or `step:<earlier index>`.",
+                );
+            }
+        }
+        plan.push(reads);
+    }
+    if let Some(check) = &req.check {
+        run_name(&check.action, "action")?;
+        if check.step >= req.steps.len() {
+            return reject("bad_request", "`check.step` must name one of the steps.");
+        }
+        if let Some(r) = &check.recipients {
+            bounded(r, MAX_RECIPIENTS, "recipients")?;
+            for name in r {
+                run_name(name, "recipients")?;
+            }
+        }
+    }
+    Ok(plan)
+}
+
+fn synthetic_sha256(parts: &[&str]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The policy text without its `tests:` block, if cutting it leaves exactly
+/// the same policy minus its tests. The engine refuses to activate a policy
+/// whose tests fail; the playground still lets you try such a draft.
+fn without_tests(text: &str, policy: &Policy) -> Option<String> {
+    let mut out = Vec::new();
+    let mut skipping = false;
+    for line in text.lines() {
+        let top_level = line
+            .chars()
+            .next()
+            .is_some_and(|c| !c.is_whitespace() && c != '-' && c != '#');
+        if top_level {
+            skipping = line.starts_with("tests:");
+            if skipping {
+                continue;
+            }
+        }
+        if !skipping {
+            out.push(line);
+        }
+    }
+    let stripped = out.join("\n") + "\n";
+    let expected = Policy {
+        tests: Vec::new(),
+        ..policy.clone()
+    };
+    (parse(&stripped).policy.as_ref() == Some(&expected)).then_some(stripped)
+}
+
+fn readers_of(policy: &Policy, lineage: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut sets = lineage.iter().filter_map(|name| {
+        policy
+            .sources
+            .get(name)
+            .map(|source| policy.people(&source.readers))
+    });
+    let first = sets.next().unwrap_or_default();
+    sets.fold(first, |acc, s| acc.intersection(&s).cloned().collect())
+}
+
+fn rejected(code: &str, message: &str) -> Value {
+    json!({"code": code, "message": message})
+}
+
+fn op_run(req: RunReq) -> Result<Value, Rejection> {
+    let plan = plan(&req)?;
+    let (policy, diagnostics) = load(&req.policy);
+    let Some(policy) = policy else {
+        return Ok(json!({"ok": false, "diagnostics": diagnostics, "steps": [], "decision": null}));
+    };
+    let text = without_tests(&req.policy, &policy).unwrap_or_else(|| req.policy.clone());
+    let mut engine = Engine::new();
+    if let Reply::Rejected { code, message } = engine.apply(0, &Event::Genesis { policy: text }) {
+        return Ok(json!({
+            "ok": false,
+            "diagnostics": [{"severity": "error", "path": "", "code": code, "message": message, "suggestion": null}],
+            "steps": [],
+            "decision": null,
+        }));
+    }
+
+    let mut done: Vec<(String, BTreeSet<String>)> = Vec::new();
+    let mut steps = Vec::new();
+    for (index, (step, reads)) in req.steps.iter().zip(&plan).enumerate() {
+        let mut inputs = Vec::new();
+        let mut lineage = BTreeSet::new();
+        let mut refusal = None;
+        for read in reads {
+            match read {
+                Read::Step(n) => {
+                    inputs.push(done[*n].0.clone());
+                    lineage.extend(done[*n].1.iter().cloned());
+                }
+                Read::Source(name) => {
+                    let sha = synthetic_sha256(&["source", name]);
+                    match engine.apply(
+                        0,
+                        &Event::RegisterSource {
+                            source: name.clone(),
+                            sha256: sha,
+                        },
+                    ) {
+                        Reply::Artifact { id } => {
+                            inputs.push(id);
+                            lineage.insert(name.clone());
+                        }
+                        Reply::Rejected { code, message } => {
+                            refusal = Some(rejected(&code, &message));
+                            break;
+                        }
+                        _ => {
+                            refusal = Some(rejected("engine_mismatch", "unexpected reply"));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if refusal.is_none() {
+            let sha = synthetic_sha256(&["step", &index.to_string(), &step.writes]);
+            let event = Event::RecordOutput {
+                agent: step.agent.clone(),
+                step: step.writes.clone(),
+                inputs,
+                sha256: sha,
+            };
+            match engine.apply(0, &event) {
+                Reply::Artifact { id } => {
+                    steps.push(json!({
+                        "agent": step.agent,
+                        "writes": step.writes,
+                        "artifact": {
+                            "id": id,
+                            "sources": lineage,
+                            "readers": readers_of(&policy, &lineage),
+                        },
+                        "rejected": null,
+                    }));
+                    done.push((id, lineage));
+                    continue;
+                }
+                Reply::Rejected { code, message } => refusal = Some(rejected(&code, &message)),
+                _ => refusal = Some(rejected("engine_mismatch", "unexpected reply")),
+            }
+        }
+        steps.push(json!({
+            "agent": step.agent,
+            "writes": step.writes,
+            "artifact": null,
+            "rejected": refusal,
+        }));
+        return Ok(
+            json!({"ok": true, "diagnostics": diagnostics, "steps": steps, "decision": null}),
+        );
+    }
+
+    let decision = match &req.check {
+        None => Value::Null,
+        Some(check) => {
+            let (artifact, lineage) = &done[check.step];
+            let agent = req.steps[check.step].agent.clone();
+            let recipients: Option<BTreeSet<String>> = check
+                .recipients
+                .as_ref()
+                .map(|r| r.iter().cloned().collect());
+            let event = Event::Check {
+                agent: agent.clone(),
+                artifact: artifact.clone(),
+                action: check.action.clone(),
+                recipients: recipients.clone(),
+            };
+            match engine.apply(0, &event) {
+                Reply::Decision {
+                    verdict,
+                    code,
+                    reason,
+                    blocking,
+                    ..
+                } => {
+                    // The engine's answer; readers come from the same `decide`
+                    // the engine runs, on the same lineage.
+                    let readers = decide(
+                        &policy,
+                        &Query {
+                            output_from: lineage.clone(),
+                            agent,
+                            action: check.action.clone(),
+                            recipients,
+                        },
+                    )
+                    .readers;
+                    json!({
+                        "verdict": verdict,
+                        "code": code,
+                        "reason": reason,
+                        "blocking": blocking,
+                        "readers": readers,
+                    })
+                }
+                Reply::Rejected { code, message } => json!({"rejected": rejected(&code, &message)}),
+                _ => json!({"rejected": rejected("engine_mismatch", "unexpected reply")}),
+            }
+        }
+    };
+    Ok(json!({"ok": true, "diagnostics": diagnostics, "steps": steps, "decision": decision}))
+}
+
 fn dispatch(body: Value) -> Result<Value, Rejection> {
     let op = match body.get("op") {
         Some(Value::String(op)) => op.clone(),
@@ -390,10 +707,15 @@ fn dispatch(body: Value) -> Result<Value, Rejection> {
             too_large(&req.policy, "policy")?;
             op_simulate(req)
         }
+        "run" => {
+            let req: RunReq = parse_req(body)?;
+            too_large(&req.policy, "policy")?;
+            op_run(req)
+        }
         other => reject(
             "unknown_op",
             format!(
-                "Unknown op `{}`. Use examples, check, decide, diff or simulate.",
+                "Unknown op `{}`. Use examples, check, decide, diff, simulate or run.",
                 other.chars().take(40).collect::<String>()
             ),
         ),
@@ -450,7 +772,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn examples_lists_six_in_order_and_each_is_clean() {
+    async fn examples_lists_seven_in_order_and_each_is_clean() {
         let (status, v) = post(json!({"op":"examples"})).await;
         assert_eq!(status, StatusCode::OK);
         let list = v["examples"].as_array().unwrap();
@@ -458,6 +780,7 @@ mod tests {
         assert_eq!(
             ids,
             [
+                "handoff",
                 "slack-digest",
                 "customer-email",
                 "pull-request-bot",
@@ -476,7 +799,13 @@ mod tests {
             let tests = c["tests"].as_array().unwrap();
             assert!(tests.iter().all(|t| t["pass"] == true), "{}", e["id"]);
         }
-        assert!(list[0]["summary"].as_str().unwrap().contains("digest_bot"));
+        assert!(
+            list[0]["summary"]
+                .as_str()
+                .unwrap()
+                .contains("planning notes")
+        );
+        assert!(list[1]["summary"].as_str().unwrap().contains("digest_bot"));
     }
 
     #[tokio::test]
@@ -680,5 +1009,126 @@ mod tests {
         let (s, v) = raw("application/json", pad).await;
         assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
         assert!(v["error"].is_string());
+    }
+
+    const HANDOFF: &str = include_str!("../examples/policies/handoff.policy.yaml");
+
+    fn laundering(policy: &str, action: &str) -> Value {
+        json!({"op":"run","policy":policy,"steps":[
+            {"agent":"researcher","reads":["source:salaries"],"writes":"planning notes"},
+            {"agent":"planner","reads":["step:0","source:roadmap"],"writes":"summary"}
+        ],"check":{"step":1,"action":action,"recipients":null}})
+    }
+
+    #[tokio::test]
+    async fn run_follows_salaries_through_notes_written_by_another_agent() {
+        let (status, v) = post(laundering(HANDOFF, "post_to_engineering")).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["ok"], true);
+        let steps = v["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0]["artifact"]["sources"], json!(["salaries"]));
+        assert_eq!(steps[0]["artifact"]["readers"], json!(["nina"]));
+        assert_eq!(
+            steps[1]["artifact"]["sources"],
+            json!(["roadmap", "salaries"])
+        );
+        assert_eq!(steps[1]["artifact"]["readers"], json!(["nina"]));
+        assert!(steps.iter().all(|s| s["rejected"].is_null()));
+        let d = &v["decision"];
+        assert_eq!(d["verdict"], "deny", "{d}");
+        assert_eq!(d["code"], "audience_outside_readers");
+        assert_eq!(d["blocking"][0]["source"], "salaries");
+        assert_eq!(d["blocking"][0]["excluded"], json!(["ravi", "sam"]));
+        assert_eq!(d["readers"], json!(["nina"]));
+
+        // Same summary, right audience.
+        let (_, hr) = post(laundering(HANDOFF, "brief_hr")).await;
+        assert_eq!(hr["decision"]["verdict"], "allow", "{hr}");
+    }
+
+    #[tokio::test]
+    async fn run_refuses_a_step_whose_agent_is_not_cleared_for_what_it_reads() {
+        let uncleared = HANDOFF.replace(
+            "    readers: [hr]\n    agents: [researcher, planner]",
+            "    readers: [hr]\n    agents: [researcher]",
+        );
+        assert_ne!(uncleared, HANDOFF);
+        let (status, v) = post(laundering(&uncleared, "post_to_engineering")).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let steps = v["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 2, "the run stops at the refused step");
+        assert!(steps[0]["rejected"].is_null());
+        assert!(steps[1]["artifact"].is_null());
+        assert_eq!(steps[1]["rejected"]["code"], "agent_cannot_use_source");
+        assert!(
+            steps[1]["rejected"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("salaries")
+        );
+        assert!(v["decision"].is_null());
+    }
+
+    #[tokio::test]
+    async fn run_allows_the_roadmap_alone_and_tries_drafts_with_failing_tests() {
+        let body = json!({"op":"run","policy":HANDOFF,"steps":[
+            {"agent":"planner","reads":["source:roadmap"],"writes":"summary"}
+        ],"check":{"step":0,"action":"post_to_engineering","recipients":["sam"]}});
+        let (status, v) = post(body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["decision"]["verdict"], "allow", "{v}");
+
+        // Widening salaries breaks a test; the run still answers for the draft.
+        let wider = HANDOFF.replace("    readers: [hr]\n", "    readers: [hr, engineering]\n");
+        let (_, w) = post(laundering(&wider, "post_to_engineering")).await;
+        assert_eq!(w["ok"], true, "{w}");
+        assert_eq!(w["decision"]["verdict"], "allow", "{w}");
+
+        let (_, approval) = post(json!({"op":"run","policy":HANDOFF,"steps":[
+            {"agent":"planner","reads":["source:roadmap","source:benchmarks"],"writes":"brief"}
+        ],"check":{"step":0,"action":"brief_leadership"}}))
+        .await;
+        assert_eq!(
+            approval["decision"]["verdict"], "needs_approval",
+            "{approval}"
+        );
+
+        let (_, bad) = post(laundering("version: 2", "post_to_engineering")).await;
+        assert_eq!(bad["ok"], false);
+        assert!(bad["decision"].is_null());
+    }
+
+    #[tokio::test]
+    async fn run_limits_are_rejected() {
+        let step = json!({"agent":"planner","reads":["source:roadmap"],"writes":"x"});
+        let seven = vec![step.clone(); 7];
+        rejected(json!({"op":"run","policy":HANDOFF,"steps":seven}), "limit").await;
+        rejected(json!({"op":"run","policy":HANDOFF,"steps":[]}), "limit").await;
+        let nine: Vec<_> = (0..9).map(|_| "source:roadmap").collect();
+        rejected(
+            json!({"op":"run","policy":HANDOFF,"steps":[{"agent":"planner","reads":nine,"writes":"x"}]}),
+            "limit",
+        )
+        .await;
+        let long = "a".repeat(65);
+        rejected(
+            json!({"op":"run","policy":HANDOFF,"steps":[{"agent":long,"reads":["source:roadmap"],"writes":"x"}]}),
+            "limit",
+        )
+        .await;
+        // A step may only read earlier steps.
+        for read in ["step:0", "step:1", "step:x", "roadmap"] {
+            rejected(
+                json!({"op":"run","policy":HANDOFF,"steps":[{"agent":"planner","reads":[read],"writes":"x"}]}),
+                "bad_request",
+            )
+            .await;
+        }
+        rejected(
+            json!({"op":"run","policy":HANDOFF,"steps":[step],"check":{"step":1,"action":"brief_hr"}}),
+            "bad_request",
+        )
+        .await;
     }
 }

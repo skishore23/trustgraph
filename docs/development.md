@@ -56,4 +56,4 @@ Everything else about the service is in [serve](serve.md).
 | `web/serve.*` | The operator page, compiled into the binary |
 | `web/index.html`, `web/site.*` | The public site |
 | `api/policy.rs`, `hosted/` | The site's `POST /api/policy` function; see [the public site](vercel.md) |
-| `examples/policies` | Five worked policies, also checked by the policy crate's tests |
+| `examples/policies` | Six worked policies, also checked by the policy crate's tests |

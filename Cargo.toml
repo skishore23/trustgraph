@@ -24,6 +24,9 @@ tokio.workspace = true
 tower = { version = "0.5", features = ["util"] }
 trustgraph-sim = { path = "crates/trustgraph-sim" }
 trustgraph-policy = { path = "crates/trustgraph-policy" }
+# No `fault-injection`: the playground runs the production engine.
+trustgraph-engine = { path = "crates/trustgraph-engine", default-features = false }
+sha2.workspace = true
 vercel_runtime = { version = "2.4", features = ["axum"] }
 
 [workspace]

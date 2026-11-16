@@ -56,6 +56,26 @@ function page() {
 
 const POLICY = 'version: 1\nagents: [planner]';
 const STARTER = fs.readFileSync('crates/trustgraph-policy/starter.policy.yaml', 'utf8');
+const HANDOFF = fs.readFileSync('examples/policies/handoff.policy.yaml', 'utf8');
+const HSUMMARY = {
+  agents: ['planner', 'researcher'],
+  sources: {
+    benchmarks: { readers: ['engineering', 'hr', 'leadership'], people: ['maya', 'nina', 'ravi', 'sam'], agents: ['planner', 'researcher'] },
+    roadmap: { readers: ['engineering', 'hr', 'leadership'], people: ['maya', 'nina', 'ravi', 'sam'], agents: ['planner'] },
+    salaries: { readers: ['hr'], people: ['nina'], agents: ['planner', 'researcher'] },
+  },
+  actions: {
+    brief_hr: { agents: ['planner'], audience: ['hr'], people: ['nina'], approval: null },
+    brief_leadership: { agents: ['planner'], audience: ['leadership'], people: ['maya'], approval: { reviewers: ['hr'], people: ['nina'], valid_for_seconds: 3600 } },
+    post_to_engineering: { agents: ['planner'], audience: ['engineering'], people: ['ravi', 'sam'], approval: null },
+  },
+  groups: { engineering: ['ravi', 'sam'], hr: ['nina'], leadership: ['maya'] },
+};
+const HCHECK = { ok: true, diagnostics: [], tests: [{ name: 'a summary built on salary notes never reaches engineering', expect: 'deny', pass: true, outcome: null }], explain: 'salaries: output can reach hr (nina).', summary: HSUMMARY };
+const step = (writes, sources, readers) => ({ agent: 'x', writes, artifact: { id: writes, sources, readers }, rejected: null });
+const RUN_DENY = { ok: true, diagnostics: [], steps: [step('planning notes', ['salaries'], ['nina']), step('summary', ['roadmap', 'salaries'], ['nina'])],
+  decision: { verdict: 'deny', code: 'audience_outside_readers', reason: 'denied: `salaries` is readable by hr only; engineering (ravi, sam) is not included', blocking: [{ source: 'salaries', readers: ['hr'], excluded: ['ravi', 'sam'] }], readers: ['nina'] } };
+const RUN_REFUSED = { ok: true, diagnostics: [], steps: [step('planning notes', ['salaries'], ['nina']), { agent: 'planner', writes: 'summary', artifact: null, rejected: { code: 'agent_cannot_use_source', message: 'agent `planner` may not use source `salaries`' } }], decision: null };
 const SUMMARY = {
   agents: ['planner', 'mailer'],
   sources: {
@@ -93,31 +113,69 @@ async function main() {
   assert.equal(p.run('coverageLabel("brand_new_path")'), 'brand_new_path');
   assert.equal(p.run('coverageLabel("constructor")'), 'constructor');
 
-  // The five experiments: each makes the expected edit to the comment-free starter and picks the expected run.
+  // The run request: earlier steps first, then sources; the check names the last step.
+  assert.deepEqual(req('run', { policy: POLICY, steps: [{ agent: 'researcher', reads: ['source:salaries'], writes: 'planning notes' }], check: { step: 0, action: 'brief_hr', recipients: ['nina'] } }),
+    { op: 'run', policy: POLICY, steps: [{ agent: 'researcher', reads: ['source:salaries'], writes: 'planning notes' }], check: { step: 0, action: 'brief_hr', recipients: ['nina'] } });
+  p.context.__run = { steps: [{ agent: 'researcher', sources: ['salaries'], prior: [] }, { agent: 'planner', sources: ['roadmap'], prior: [0] }], action: 'post_to_engineering', recipients: null };
+  assert.deepEqual(JSON.parse(p.run('JSON.stringify(runRequest("P", __run))')), {
+    op: 'run', policy: 'P',
+    steps: [
+      { agent: 'researcher', reads: ['source:salaries'], writes: 'planning notes' },
+      { agent: 'planner', reads: ['step:0', 'source:roadmap'], writes: 'summary' },
+    ],
+    check: { step: 1, action: 'post_to_engineering', recipients: null },
+  });
+  assert.deepEqual(JSON.parse(p.run('JSON.stringify([stepNames(1), stepNames(2), stepNames(3)])')), [['output'], ['planning notes', 'summary'], ['notes 1', 'notes 2', 'summary']]);
+  assert.deepEqual(JSON.parse(p.run('JSON.stringify(recordedLine({ writes: "planning notes", artifact: { sources: ["salaries"], readers: ["nina"] }, rejected: null }))')),
+    { cls: 'recorded', text: 'planning notes — carries: salaries — readable by: nina' });
+  assert.match(p.run('recordedLine({ writes: "summary", artifact: null, rejected: { code: "agent_cannot_use_source", message: "agent `planner` may not use source `salaries`" } }).text'), /^refused — agent planner may not use source salaries$/);
+
+  // The five hand-off experiments, against the real example file.
+  p.context.__handoff = HANDOFF;
+  const hexp = id => JSON.parse(p.run(`JSON.stringify(applyExperiment("handoff", ${JSON.stringify(id)}, __handoff))`));
+  const handoffRun = { steps: [{ agent: 'researcher', sources: ['salaries'], prior: [] }, { agent: 'planner', sources: ['roadmap'], prior: [0] }], action: 'post_to_engineering', recipients: null };
+  assert.deepEqual(hexp('launder').run, handoffRun);
+  assert.equal(hexp('launder').policy, HANDOFF);
+  const uncleared = hexp('uncleared');
+  assert.deepEqual(uncleared.run, handoffRun);
+  assert.match(uncleared.policy, /  salaries:[^\n]*\n    readers: \[hr\]\n    agents: \[researcher\]\n/);
+  assert.equal(uncleared.policy.length, HANDOFF.length - ', planner'.length, 'only planner is removed from salaries.agents');
+  assert.deepEqual(hexp('roadmap').run.steps[1], { agent: 'planner', sources: ['roadmap'], prior: [] }, 'the planner drops the notes');
+  assert.equal(hexp('roadmap').policy, HANDOFF);
+  assert.deepEqual(hexp('hr').run, { ...handoffRun, action: 'brief_hr' });
+  const hwiden = hexp('widen');
+  assert.deepEqual(hwiden.run, handoffRun);
+  assert.match(hwiden.policy, /  salaries:[^\n]*\n    readers: \[hr, engineering\]\n/);
+  assert.equal(hwiden.policy.replace('readers: [hr, engineering]\n    agents: [researcher, planner]', 'readers: [hr]\n    agents: [researcher, planner]'), HANDOFF);
+  assert.equal(p.run('applyExperiment("slack-digest", "launder", "x")'), null, 'other examples have no experiments');
+  p.run('applyExperiment("handoff", "launder", __handoff).run.steps[0].sources.push("mutated")');
+  assert.deepEqual(hexp('launder').run, handoffRun, 'experiments hand out copies of their runs');
+
+  // The starter keeps its five experiments.
   p.context.__starter = STARTER;
   const stripped = p.run('stripComments(__starter)');
   assert.doesNotMatch(stripped, /^\s*#/m, 'comment lines are removed');
   assert.match(stripped, /^version: 1\n/);
   assert.doesNotMatch(stripped, /\n\n\n/);
   p.context.__stripped = stripped;
-  const exp = id => JSON.parse(p.run(`JSON.stringify(applyExperiment(${JSON.stringify(id)}, __stripped))`));
-  const leakRun = { agent: 'planner', sources: ['salaries', 'roadmap'], action: 'post_to_slack', recipients: null };
+  const exp = id => JSON.parse(p.run(`JSON.stringify(applyExperiment("starter", ${JSON.stringify(id)}, __stripped))`));
+  const single = (agent, sources, action) => ({ steps: [{ agent, sources, prior: [] }], action, recipients: null });
+  const leakRun = single('planner', ['salaries', 'roadmap'], 'post_to_slack');
   assert.deepEqual(exp('leak'), { policy: stripped, run: leakRun, note: 'planner read salaries and roadmap and posts the result to engineering.' });
-  assert.deepEqual(exp('roadmap').run, { agent: 'planner', sources: ['roadmap'], action: 'post_to_slack', recipients: null });
+  assert.deepEqual(exp('roadmap').run, single('planner', ['roadmap'], 'post_to_slack'));
   assert.equal(exp('roadmap').policy, stripped);
-  assert.deepEqual(exp('email').run, { agent: 'mailer', sources: ['price_sheet'], action: 'email_customer', recipients: null });
+  assert.deepEqual(exp('email').run, single('mailer', ['price_sheet'], 'email_customer'));
   const widen = exp('widen');
   assert.deepEqual(widen.run, leakRun);
   assert.equal(widen.policy, stripped.replace('  salaries:\n    readers: [hr]', '  salaries:\n    readers: [hr, engineering]'));
-  assert.notEqual(widen.policy, stripped);
   const typo = exp('typo');
   assert.equal(typo.policy, stripped.replace('readers: [hr, engineering]', 'readers: [hr, enginering]'));
   assert.notEqual(typo.policy, stripped);
-  assert.equal(p.run('applyExperiment("widen", "version: 1")'), null, 'an edit that does not apply is refused');
-  assert.equal(p.run('applyExperiment("nope", "")'), null);
-  p.context.__examples = [{ id: 'a', title: 'A', policy: 'x' }, { id: 'starter', title: 'Starter', policy: '# c\nversion: 1' }];
+  assert.equal(p.run('applyExperiment("starter", "widen", "version: 1")'), null, 'an edit that does not apply is refused');
+  assert.equal(p.run('applyExperiment("starter", "nope", "")'), null);
+  p.context.__examples = [{ id: 'a', title: 'A', policy: 'x' }, { id: 'starter', title: 'Starter', policy: '# c\nversion: 1' }, { id: 'handoff', title: 'H', policy: 'h' }];
   assert.deepEqual(JSON.parse(p.run('JSON.stringify(arrangeExamples(__examples).map(e => [e.id, e.title, e.policy]))')),
-    [['starter', 'Starter', 'version: 1'], ['starter-annotated', 'Starter (annotated)', '# c\nversion: 1'], ['a', 'A', 'x']]);
+    [['handoff', 'H', 'h'], ['starter', 'Starter', 'version: 1'], ['starter-annotated', 'Starter (annotated)', '# c\nversion: 1'], ['a', 'A', 'x']]);
 
   // Status line and the interesting default run.
   assert.equal(p.run(`checkStatus(${JSON.stringify(CHECK_OK)}).text`), 'valid · 1 test pass');
@@ -158,52 +216,97 @@ async function main() {
   assert.match(text(pageA.$('decision')), /Policy has errors/);
   assert.match(text(pageA.$('tests')), /Fix the errors above/);
 
-  // Full flow: examples → check → decide + diff; then a stale check is ignored.
+  // Full flow: examples → hand-off → check → run, with the laundering experiment selected.
   const pageB = page();
-  pageB.queue.push(res({ examples: [{ id: 'slack-digest', title: 'Slack digest', summary: 's', policy: 'other' }, { id: 'starter', title: 'Starter', summary: 'Starter summary', policy: POLICY }] }));
-  pageB.queue.push(res(CHECK_OK));
-  pageB.queue.push(res({ ok: true, diagnostics: [], outcome: DENY }));
+  pageB.queue.push(res({ examples: [
+    { id: 'slack-digest', title: 'Slack digest', summary: 's', policy: 'other' },
+    { id: 'handoff', title: 'Hand-off between agents', summary: 'h', policy: HANDOFF },
+    { id: 'starter', title: 'Starter', summary: 'Starter summary', policy: POLICY },
+  ] }));
+  pageB.queue.push(res(HCHECK));
+  pageB.queue.push(res(RUN_DENY));
   await pageB.run('boot()');
   await new Promise(r => setImmediate(r));
-  assert.deepEqual(pageB.calls.map(c => c.body.op), ['examples', 'check', 'decide']);
+  assert.deepEqual(pageB.calls.map(c => c.body.op), ['examples', 'check', 'run']);
   assert.ok(pageB.calls.every(c => c.url === '/api/policy' && c.method === 'POST' && c.headers['Content-Type'] === 'application/json'));
-  assert.equal(pageB.$('example').value, 'starter', 'starts on the starter policy');
-  assert.equal(pageB.$('policy').value, POLICY);
-  assert.deepEqual(pageB.calls[2].body.query, { output_from: ['salaries', 'roadmap'], agent: 'planner', action: 'post_to_slack', recipients: null });
+  assert.equal(pageB.$('example').value, 'handoff', 'starts on the hand-off');
+  assert.deepEqual(all(pageB.$('example'), n => n.tagName === 'OPTION').map(n => n.value), ['handoff', 'starter', 'starter-annotated', 'slack-digest']);
+  assert.equal(pageB.$('policy').value, HANDOFF);
+  assert.deepEqual(pageB.calls[2].body.steps, [
+    { agent: 'researcher', reads: ['source:salaries'], writes: 'planning notes' },
+    { agent: 'planner', reads: ['step:0', 'source:roadmap'], writes: 'summary' },
+  ]);
+  assert.deepEqual(pageB.calls[2].body.check, { step: 1, action: 'post_to_engineering', recipients: null });
+  const steps = pageB.$('steps');
+  assert.equal(byClass(steps, 'step').length, 2, 'two steps, each a sentence');
+  assert.match(text(byClass(steps, 'step')[0]), /read.*salaries.*and wrote planning notes\./);
+  assert.match(text(byClass(steps, 'step')[1]), /read.*planning notes.*roadmap.*and wants to/);
+  assert.deepEqual(byClass(steps, 'recorded').map(text), ['planning notes — carries: salaries — readable by: nina', 'summary — carries: roadmap, salaries — readable by: nina']);
   assert.match(text(pageB.$('decision')), /DENIED/);
-  assert.equal(text(pageB.$('check-status')), 'valid · 1 test pass');
+  assert.match(text(pageB.$('decision')), /Held back by: salaries \(hr only\) — leaves out ravi, sam/);
+  assert.deepEqual(all(pageB.$('experiment-buttons'), n => n.tagName === 'BUTTON' && n.attributes['aria-pressed'] === 'true').map(text), ['Launder the salary file through notes']);
+  assert.equal(all(pageB.$('experiment-buttons'), n => n.tagName === 'BUTTON').length, 5);
+  assert.match(text(pageB.$('experiment-note')), /Two agents, two steps: salaries → planning notes → a summary for engineering/);
   assert.match(text(pageB.$('diff')), /No changes from the example as loaded/);
-  const pressed = all(pageB.$('experiment-buttons'), n => n.tagName === 'BUTTON' && n.attributes['aria-pressed'] === 'true').map(text);
-  assert.deepEqual(pressed, ['Leak the salary file'], 'the leak experiment is selected on load');
-  assert.match(text(pageB.$('experiment-note')), /planner read salaries and roadmap/);
-  assert.deepEqual(all(pageB.$('example'), n => n.tagName === 'OPTION').map(n => n.value), ['starter', 'starter-annotated', 'slack-digest'], 'starter first, annotated copy second');
-
-  // Clicking an experiment sets up the run and asks for a decision at once.
-  const emailButton = all(pageB.$('experiment-buttons'), n => n.tagName === 'BUTTON' && text(n) === 'Email a customer')[0];
-  pageB.queue.push(res(CHECK_OK));
-  pageB.queue.push(res({ ok: true, diagnostics: [], outcome: { verdict: 'needs_approval', code: 'needs_approval', reason: 'needs approval', blocking: [], readers: ['acme', 'leo'] } }));
-  await emailButton.fire('click');
-  await new Promise(r => setImmediate(r));
-  assert.deepEqual(pageB.calls.at(-1).body.query, { output_from: ['price_sheet'], agent: 'mailer', action: 'email_customer', recipients: null });
-  assert.match(text(pageB.$('decision')), /NEEDS APPROVAL/);
-  pageB.queue.push(res({ ok: true, diagnostics: [], outcome: DENY }));
-  await pageB.$('agent').fire('change');
-  assert.equal(all(pageB.$('experiment-buttons'), n => n.attributes && n.attributes['aria-pressed'] === 'true').length, 0, 'changing the run clears the selected experiment');
-  pageB.run('state.run = { agent: "planner", sources: ["salaries", "roadmap"], action: "post_to_slack", recipients: null }; renderRunControls();');
   assert.match(text(pageB.$('explain')), /salaries: output can reach hr/);
 
+  // A refused step: shown at that step in the deny colour, and no verdict.
+  const unclearedButton = all(pageB.$('experiment-buttons'), n => n.tagName === 'BUTTON' && text(n) === "Hand the notes to an agent that isn't cleared")[0];
+  pageB.queue.push(res(HCHECK));
+  pageB.queue.push(res(RUN_REFUSED));
+  pageB.queue.push(res({ ok: true, diagnostics: [], file: null, widens: false, changes: [{ kind: 'narrows', subject: 'source salaries', gained: [], lost: ['planner'], summary: 'agents lost planner' }] }));
+  await unclearedButton.fire('click');
+  await new Promise(r => setImmediate(r));
+  assert.match(pageB.calls.find(c => c.body.op === 'run' && c !== pageB.calls[2]).body.policy, /agents: \[researcher\]\n/);
+  const refusedLine = byClass(pageB.$('steps'), 'refused');
+  assert.equal(refusedLine.length, 1);
+  assert.match(text(refusedLine[0]), /refused — agent planner may not use source salaries|refused — agent `planner` may not use source `salaries`/);
+  assert.match(text(pageB.$('decision')), /No answer/);
+  assert.match(text(pageB.$('decision')), /refused step 2/);
+  assert.doesNotMatch(text(pageB.$('decision')), /DENIED|ALLOWED/);
+
+  // "+ add a step" adds a third step that reads the second; "− remove" takes it away.
+  const addButton = all(pageB.$('steps'), n => n.tagName === 'BUTTON' && text(n) === '+ add a step')[0];
+  pageB.queue.push(res(RUN_DENY));
+  await addButton.fire('click');
+  assert.equal(byClass(pageB.$('steps'), 'step').length, 3);
+  assert.deepEqual(pageB.calls.at(-1).body.steps.map(s => [s.reads, s.writes]), [[['source:salaries'], 'notes 1'], [['step:0', 'source:roadmap'], 'notes 2'], [['step:1'], 'summary']]);
+  assert.equal(all(pageB.$('steps'), n => n.tagName === 'BUTTON' && text(n) === '+ add a step').length, 0, 'at most three steps');
+  assert.equal(all(pageB.$('experiment-buttons'), n => n.attributes && n.attributes['aria-pressed'] === 'true').length, 0, 'editing the run clears the selected experiment');
+  pageB.queue.push(res(RUN_DENY));
+  await all(pageB.$('steps'), n => n.tagName === 'BUTTON' && text(n) === '− remove the last step')[0].fire('click');
+  assert.equal(byClass(pageB.$('steps'), 'step').length, 2);
+
   // Unticking a recipient sends an explicit recipient list.
-  const samBox = all(pageB.$('recipients'), n => n.tagName === 'INPUT' && n.value === 'sam')[0];
-  pageB.queue.push(res({ ok: true, diagnostics: [], outcome: DENY }));
+  const samBox = all(pageB.$('steps'), n => n.tagName === 'INPUT' && n.value === 'sam')[0];
+  pageB.queue.push(res(RUN_DENY));
   samBox.checked = false;
   await samBox.fire('change');
-  assert.deepEqual(pageB.calls.at(-1).body.query.recipients, ['ravi']);
+  assert.deepEqual(pageB.calls.at(-1).body.check.recipients, ['ravi']);
+
+  // The starter still has its own five experiments, as a single-step run.
+  pageB.queue.push(res(CHECK_OK));
+  pageB.queue.push(res(RUN_DENY));
+  pageB.$('example').value = 'starter';
+  await pageB.$('example').fire('change');
+  await new Promise(r => setImmediate(r));
+  assert.deepEqual(all(pageB.$('experiment-buttons'), n => n.tagName === 'BUTTON').map(text), ['Leak the salary file', 'Post only the roadmap', 'Email a customer', 'Give engineering the salary file', 'Misspell a group']);
+  assert.deepEqual(pageB.calls.at(-1).body.steps, [{ agent: 'planner', reads: ['source:salaries', 'source:roadmap'], writes: 'output' }]);
+  assert.equal(byClass(pageB.$('steps'), 'step').length, 1);
+  assert.equal(all(pageB.$('steps'), n => n.tagName === 'BUTTON' && text(n) === '+ add a step').length, 1);
+  pageB.queue.push(res(CHECK_OK));
+  pageB.queue.push(res(RUN_DENY));
+  pageB.$('example').value = 'slack-digest';
+  await pageB.$('example').fire('change');
+  await new Promise(r => setImmediate(r));
+  assert.equal(pageB.$('experiments').hidden, true, 'no experiments for other examples');
+  pageB.run('state.exampleId = "starter"; state.original = ' + JSON.stringify(POLICY) + ';');
 
   // Stale responses: an older, slower check must not overwrite a newer one.
   let releaseOld;
   pageB.queue.push(() => new Promise(r => { releaseOld = () => r(res({ ok: false, diagnostics: [{ severity: 'error', path: '', code: 'yaml_syntax', message: 'old', suggestion: null }] })); }));
   pageB.queue.push(res(CHECK_OK));
-  pageB.queue.push(res({ ok: true, diagnostics: [], outcome: DENY }));
+  pageB.queue.push(res(RUN_DENY));
   pageB.queue.push(res({ ok: true, diagnostics: [], file: null, widens: true, changes: [{ kind: 'widens', subject: 'source salaries', gained: ['ravi', 'sam'], lost: [], summary: 'readers gained ravi, sam' }] }));
   pageB.$('policy').value = 'edited once';
   const older = pageB.run('runCheck()');
@@ -214,7 +317,7 @@ async function main() {
   await older;
   assert.equal(text(pageB.$('check-status')), 'valid · 1 test pass', 'stale check answer ignored');
   assert.equal(text(pageB.$('diagnostics')), '');
-  const diffCall = pageB.calls.find(c => c.body.op === 'diff');
+  const diffCall = pageB.calls.filter(c => c.body.op === 'diff').at(-1);
   assert.deepEqual(diffCall.body, { op: 'diff', old: POLICY, new: 'edited twice' });
   assert.match(text(pageB.$('diff')), /WIDENS/);
   assert.match(text(pageB.$('diff')), /A person should approve each WIDENS line/);
@@ -269,13 +372,13 @@ async function main() {
   pageC.$('policy').value = POLICY;
   pageC.queue.push(res('gateway', 504));
   pageC.queue.push(res(CHECK_OK));
-  pageC.queue.push(res({ ok: true, diagnostics: [], outcome: DENY }));
+  pageC.queue.push(res(RUN_DENY));
   await pageC.run('boot()');
   await new Promise(r => setImmediate(r));
-  assert.deepEqual(pageC.calls.map(c => c.body.op), ['examples', 'check', 'decide']);
+  assert.deepEqual(pageC.calls.map(c => c.body.op), ['examples', 'check', 'run']);
   assert.match(text(pageC.$('decision')), /DENIED/);
 
-  console.log('Landing page logic passed: request shapes, seeds, coverage labels, status line, default run, five experiments, allow/approval/deny rendering, diagnostics with suggestions, recipients, stale responses, non-JSON and network errors, simulator results and violations.');
+  console.log('Landing page logic passed: request shapes, seeds, coverage labels, status line, default run, run requests and two-step rendering, a refused step, adding steps, five hand-off and five starter experiments, allow/approval/deny rendering, diagnostics with suggestions, recipients, stale responses, non-JSON and network errors, simulator results and violations.');
 }
 
 main().catch(error => { console.error(error); process.exitCode = 1; });

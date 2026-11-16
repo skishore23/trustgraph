@@ -17,12 +17,17 @@ nowhere else. The examples use fictional people.
 `POST /api/policy` takes one JSON operation per request, chosen by `op`:
 `examples`, `check` (diagnostics, inline test results, explanation and a
 summary of names), `decide` (one query: sources read, agent, action and
-optional recipients), `diff` (old and new policy text) and `simulate` (seeded
-simulator runs). A policy with problems is not an HTTP error: the answer is
+optional recipients), `diff` (old and new policy text), `simulate` (seeded
+simulator runs) and `run` (up to 6 agent steps, each reading sources or earlier
+steps' outputs, driven through a fresh in-memory `trustgraph-engine`; returns
+what each step recorded or the engine's refusal, then the decision for one
+action). `run` activates the draft without its inline tests, so a draft whose
+tests fail can still be tried; `trustgraph serve` refuses to activate one. A policy with problems is not an HTTP error: the answer is
 200 with `ok: false` and its diagnostics.
 
 Limits, rejected rather than clamped: a 128 KiB body, 64 KiB of policy text,
-64 sources and 256 recipients per query, names up to 256 bytes, and for
+64 sources and 256 recipients per query, names up to 256 bytes (64 for `run`,
+with at most 8 reads per step), and for
 `simulate` a seed from 0 to 65535, `count` 1 to 8 (default 4) and `steps` 1 to
 120 (default 80). The simulator runs only a policy that is valid and passes its
 own tests. Every error is a JSON body, `{"error": "..."}`: malformed JSON

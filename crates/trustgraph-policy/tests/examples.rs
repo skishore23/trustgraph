@@ -21,7 +21,7 @@ fn example_files() -> Vec<PathBuf> {
 #[test]
 fn every_example_is_clean() {
     let files = example_files();
-    assert_eq!(files.len(), 5, "expected exactly five examples: {files:?}");
+    assert_eq!(files.len(), 6, "expected exactly six examples: {files:?}");
 
     for file in files {
         let name = file.display().to_string();
