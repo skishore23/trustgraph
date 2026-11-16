@@ -1,9 +1,7 @@
 .git
 .vercel
-.trustgraph*
+.trustgraph
 .env*
-trustgraph.local.json
-trustgraph-actions*.local.json
 target
 node_modules
 public

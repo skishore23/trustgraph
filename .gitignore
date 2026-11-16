@@ -2,9 +2,8 @@
 /target/
 /.vercel/
 /public/
-.trustgraph*/
-/trustgraph.local.json
-trustgraph-actions*.local.json
+# `trustgraph serve` state (agent tokens) if pointed inside the repository
+/.trustgraph/
 
 # Credentials
 /.env

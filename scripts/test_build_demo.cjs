@@ -21,7 +21,9 @@ try {
   assert.doesNotMatch(html, /<script(?![^>]*\bsrc=)[^>]*>/, 'no inline scripts (CSP)');
   assert.doesNotMatch(html, /\sstyle=|<style/, 'no inline styles (CSP)');
   assert.doesNotMatch(html, /javascript:|\son[a-z]+=/i, 'no inline handlers (CSP)');
-  assert.doesNotMatch(html, /lab\.html|story\.html|legacy\.html/, 'no links to removed demos');
+  for (const [, page] of html.matchAll(/href="\/?([^"#?:]+\.html)"/g)) {
+    assert.ok(files.includes(page), `index.html links to unpublished page ${page}`);
+  }
   console.log('Site build passed: clean output, one page, complete assets, CSP-safe.');
 } finally {
   fs.rmSync(output, { recursive: true, force: true });
