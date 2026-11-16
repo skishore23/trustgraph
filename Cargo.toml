@@ -65,3 +65,8 @@ fs2 = "0.4"
 [workspace.lints.rust]
 unsafe_code = "forbid"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+# The journal and digests hash constantly; unoptimized SHA-256 dominates
+# debug test time (notably the policy simulator). Dev builds only.
+[profile.dev.package.sha2]
+opt-level = 3

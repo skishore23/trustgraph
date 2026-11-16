@@ -32,9 +32,7 @@ use trustgraph_engine::{
 use trustgraph_policy::{Diagnostic, Policy, Severity, Verdict, parse};
 
 use generate::{Names, Rng, UNKNOWN_ARTIFACT, sha};
-use invariants::{
-    AGENTS_CANNOT_CHANGE_POLICY, Ask, Finding, NARROWING_APPLIES, REPLAY_EQUIVALENT, Shadow,
-};
+use invariants::{AGENTS_CANNOT_CHANGE_POLICY, Ask, Finding, REPLAY_EQUIVALENT, Shadow};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Violation {
@@ -50,6 +48,8 @@ pub struct Run {
     pub steps: u32,
     /// Every event the runtime answered, with its time; `replies` is parallel.
     /// An event whose journal write failed has no reply and is not listed.
+    /// Events later dropped by a torn tail stay listed (they were answered),
+    /// so counts over `events` and `replies` include them.
     pub events: Vec<(u64, Event)>,
     pub replies: Vec<Reply>,
     pub violations: Vec<Violation>,
@@ -59,6 +59,9 @@ pub struct Run {
     pub crashes: u32,
     /// `ActivatePolicy` events that returned `Activated`.
     pub policy_changes: u32,
+    /// How often each path that makes a clean run meaningful was reached;
+    /// every key in `COVERAGE` is present.
+    pub coverage: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -72,7 +75,31 @@ pub struct Campaign {
     pub violations: Vec<(u64, Violation)>,
     /// Stable hash over every run's `(seed, state_digest, violations)`.
     pub digest: String,
+    /// `Run::coverage` summed over the runs.
+    pub coverage: BTreeMap<String, u64>,
 }
+
+/// The coverage keys every `Run` reports.
+pub const COVERAGE: [&str; 18] = [
+    "approved_allow",
+    "approval_expired_recheck",
+    "expiry_boundary_before",
+    "expiry_boundary_at",
+    "revoke_effective",
+    "identical_reactivation_with_live_approvals",
+    "recheck_after_identical_reactivation",
+    "narrowing_with_derived_outputs",
+    "source_removed_with_derived_outputs",
+    "explicit_recipients_check",
+    "agent_denied_source",
+    "crash_clean",
+    "crash_lost_write",
+    "crash_torn_tail",
+    "torn_approve",
+    "torn_revoke",
+    "torn_activate",
+    "crash_without_resend",
+];
 
 pub fn run(policy_yaml: &str, seed: u64, steps: u32) -> Result<Run, Vec<Diagnostic>> {
     simulate(policy_yaml, seed, steps, Fault::None, false)
@@ -107,6 +134,7 @@ pub fn campaign(
             .map(|v| (v.as_str().to_string(), 0))
             .collect();
     let mut events = 0;
+    let mut coverage: BTreeMap<String, u64> = COVERAGE.iter().map(|k| (k.to_string(), 0)).collect();
     let mut violations = Vec::new();
     let mut summary = Vec::new();
     for seed in first_seed..first_seed.saturating_add(count) {
@@ -116,6 +144,9 @@ pub fn campaign(
             if let Reply::Decision { verdict, .. } = reply {
                 *decisions.entry(verdict.as_str().into()).or_default() += 1;
             }
+        }
+        for (key, n) in &r.coverage {
+            *coverage.entry(key.clone()).or_default() += n;
         }
         violations.extend(r.violations.iter().map(|v| (seed, v.clone())));
         summary.push((seed, r.state_digest, r.violations));
@@ -133,6 +164,7 @@ pub fn campaign(
         decisions,
         violations,
         digest,
+        coverage,
     })
 }
 
@@ -151,8 +183,7 @@ enum Kind {
     Tear,
 }
 
-/// Weights per step kind. Each crash replays the whole journal, so crashes
-/// are kept to about three or four per 200-step run.
+/// Weights per step kind: about a dozen crashes per 200-step run.
 const ALL: [(Kind, u64); 11] = [
     (Kind::Record, 32),
     (Kind::Check, 56),
@@ -162,9 +193,9 @@ const ALL: [(Kind, u64); 11] = [
     (Kind::Advance, 12),
     (Kind::Propose, 12),
     (Kind::Register, 6),
-    (Kind::Crash, 1),
-    (Kind::LostWrite, 1),
-    (Kind::Tear, 1),
+    (Kind::Crash, 3),
+    (Kind::LostWrite, 3),
+    (Kind::Tear, 4),
 ];
 const AGENTS_ONLY: [(Kind, u64); 6] = [
     (Kind::Record, 20),
@@ -220,7 +251,19 @@ fn simulate(
                 }],
             }
         })?;
-    let policy = parse(policy_yaml).policy.ok_or_else(Vec::new)?;
+    // `open` validated the text, so this only fails if parse and open disagree.
+    let parsed = parse(policy_yaml);
+    let policy = parsed.policy.ok_or_else(|| {
+        let mut diagnostics = parsed.diagnostics;
+        diagnostics.push(Diagnostic {
+            severity: Severity::Error,
+            path: String::new(),
+            code: "open_failed",
+            message: "the runtime opened a policy that does not parse".into(),
+            suggestion: None,
+        });
+        diagnostics
+    })?;
     let longest_valid_for = policy
         .actions
         .values()
@@ -249,6 +292,7 @@ fn simulate(
             state_digest: String::new(),
             crashes: 0,
             policy_changes: 0,
+            coverage: COVERAGE.iter().map(|k| (k.to_string(), 0)).collect(),
         },
     };
     let table: &[(Kind, u64)] = if agents_only { &AGENTS_ONLY } else { &ALL };
@@ -300,7 +344,15 @@ impl Sim {
         self.runtime.as_ref().expect("the runtime is open").engine()
     }
 
+    fn note(&mut self, key: &'static str) {
+        *self.out.coverage.entry(key.into()).or_default() += 1;
+    }
+
+    /// Record findings, and the coverage notes the shadow made meanwhile.
     fn flag(&mut self, findings: Vec<Finding>) {
+        for key in std::mem::take(&mut self.shadow.notes) {
+            self.note(key);
+        }
         for (invariant, detail) in findings {
             self.out.violations.push(Violation {
                 invariant,
@@ -405,7 +457,7 @@ impl Sim {
             Kind::Recheck => self.recheck(),
             Kind::Approve => self.approve(),
             Kind::Revoke => self.revoke(),
-            Kind::Advance => self.now += self.rng.below(2 * self.longest_valid_for + 1),
+            Kind::Advance => self.advance(),
             Kind::Propose => self.propose(),
             Kind::Register => {
                 let source = self.rng.pick(&self.names.sources).cloned();
@@ -429,7 +481,9 @@ impl Sim {
             let engine = self.runtime.as_ref().expect("the runtime is open").engine();
             let findings = self
                 .shadow
-                .on_artifact(&reply, BTreeSet::from([source]), |id| engine.lineage(id));
+                .on_artifact(&reply, false, BTreeSet::from([source]), |id| {
+                    engine.lineage(id)
+                });
             self.flag(findings);
         }
     }
@@ -456,10 +510,13 @@ impl Sim {
             sha256: sha(self.rng.below(16)),
         };
         if let Some(reply) = self.send(Actor::Agent, event) {
+            if matches!(&reply, Reply::Rejected { code, .. } if code == "agent_cannot_use_source") {
+                self.note("agent_denied_source");
+            }
             let engine = self.runtime.as_ref().expect("the runtime is open").engine();
             let findings = self
                 .shadow
-                .on_artifact(&reply, expected, |id| engine.lineage(id));
+                .on_artifact(&reply, true, expected, |id| engine.lineage(id));
             self.flag(findings);
         }
     }
@@ -476,6 +533,53 @@ impl Sim {
             action: self.names.action(&mut self.rng),
             recipients: self.names.recipients(&mut self.rng),
         }
+    }
+
+    /// Move the clock: usually a random jump, sometimes to the last second of
+    /// a live approval and then to the second it expires, re-checking at each.
+    fn advance(&mut self) {
+        let live = self.shadow.live_grants(self.now);
+        let boundary = if self.rng.chance(40) {
+            self.rng.pick(&live).cloned()
+        } else {
+            None
+        };
+        let Some((ask, end)) = boundary else {
+            self.now += self.rng.below(2 * self.longest_valid_for + 1);
+            return;
+        };
+        let allowed = |reply: &Option<Reply>| {
+            matches!(
+                reply,
+                Some(Reply::Decision {
+                    verdict: Verdict::Allow,
+                    ..
+                })
+            )
+        };
+        self.now = end - 1;
+        if allowed(&self.check(ask.clone())) {
+            self.note("expiry_boundary_before");
+        }
+        self.now = end;
+        if !allowed(&self.check(ask)) {
+            self.note("expiry_boundary_at");
+        }
+    }
+
+    /// Sometimes tear the journal right after `event` when it succeeds, so
+    /// the dropped record is that event. True when it tore.
+    fn send_maybe_torn(&mut self, event: Event) -> (Option<Reply>, bool) {
+        let tear = self.rng.chance(10);
+        let keep = self.keep_snapshot;
+        self.keep_snapshot |= tear;
+        let reply = self.send(Actor::Operator, event);
+        self.keep_snapshot = keep;
+        let ok = matches!(
+            reply,
+            Some(Reply::Approved { .. } | Reply::Revoked { .. } | Reply::Activated { .. })
+        );
+        (reply, tear && ok)
     }
 
     /// Re-send an approved, pending or allowed check, as a host would.
@@ -519,13 +623,18 @@ impl Sim {
             decision: decision.clone(),
             reviewer: reviewer.clone(),
         };
-        let Some(reply) = self.send(Actor::Operator, event) else {
+        let (reply, tear) = self.send_maybe_torn(event);
+        let Some(reply) = reply else {
             return;
         };
         let findings = self
             .shadow
             .on_approve(self.now, &decision, &reviewer, &reply);
         self.flag(findings);
+        if tear {
+            self.torn_tail();
+            return;
+        }
         if let (Reply::Approved { .. }, Some(ask)) = (&reply, ask)
             && self.rng.chance(50)
         {
@@ -543,9 +652,27 @@ impl Sim {
         };
         let ask = self.shadow.ask_for(&decision);
         let reviewer = self.reviewer(ask.as_ref(), 70);
-        let event = Event::Revoke { decision, reviewer };
-        if let Some(reply) = self.send(Actor::Operator, event) {
-            self.shadow.on_revoke(&reply);
+        let event = Event::Revoke {
+            decision: decision.clone(),
+            reviewer: reviewer.clone(),
+        };
+        let (reply, tear) = self.send_maybe_torn(event);
+        let Some(reply) = reply else {
+            return;
+        };
+        let findings = self
+            .shadow
+            .on_revoke(self.now, &decision, &reviewer, &reply);
+        self.flag(findings);
+        if tear {
+            self.torn_tail();
+            return;
+        }
+        // A host re-checks after a revocation; it must no longer be allowed.
+        if let (Reply::Revoked { .. }, Some(ask)) = (&reply, ask)
+            && self.rng.chance(50)
+        {
+            self.check(ask);
         }
     }
 
@@ -588,11 +715,20 @@ impl Sim {
     }
 
     fn activate(&mut self, id: String) {
+        let old = self.shadow.policy.clone();
+        let old_digest = self.shadow.digest.clone();
+        let live: Vec<Ask> = self
+            .shadow
+            .live_grants(self.now)
+            .into_iter()
+            .map(|(ask, _)| ask)
+            .collect();
         let event = Event::ActivatePolicy {
             proposal: id.clone(),
             operator: "operator".into(),
         };
-        let Some(reply) = self.send(Actor::Operator, event) else {
+        let (reply, tear) = self.send_maybe_torn(event);
+        let Some(reply) = reply else {
             return;
         };
         if !matches!(reply, Reply::Activated { .. }) {
@@ -600,30 +736,52 @@ impl Sim {
         }
         let findings = self.shadow.on_activated(&reply, &id);
         self.flag(findings);
+        if tear {
+            self.torn_tail();
+            return;
+        }
+        let identical = self.shadow.digest == old_digest;
+        if identical && !live.is_empty() {
+            self.note("identical_reactivation_with_live_approvals");
+        }
+        for (name, source) in &old.sources {
+            if !self.shadow.has_derived_from(name) {
+                continue;
+            }
+            match self.shadow.policy.sources.get(name) {
+                None => self.note("source_removed_with_derived_outputs"),
+                Some(now)
+                    if !old
+                        .people(&source.readers)
+                        .is_subset(&self.shadow.policy.people(&now.readers)) =>
+                {
+                    self.note("narrowing_with_derived_outputs")
+                }
+                Some(_) => {}
+            }
+        }
         // Invariant 4: earlier allowed checks whose recipients are no longer
-        // all readers are re-sent, and so are approved ones (invariant 2).
-        // The rest stay remembered as they are.
-        let (resend, keep): (Vec<Ask>, Vec<Ask>) = std::mem::take(&mut self.shadow.allowed)
+        // all readers of the policy text are re-sent, and so are approved ones
+        // and those with an approval live until now (invariant 2). The rest
+        // stay remembered as they are.
+        let (mut resend, keep): (Vec<Ask>, Vec<Ask>) = std::mem::take(&mut self.shadow.allowed)
             .into_iter()
             .partition(|ask| !self.shadow.covered(ask) || self.shadow.approved(ask));
         self.shadow.allowed = keep;
+        for ask in &live {
+            if !resend.contains(ask) {
+                resend.push(ask.clone());
+            }
+        }
         for ask in resend {
-            let covered = self.shadow.covered(&ask);
             let Some(reply) = self.check(ask.clone()) else {
                 return;
             };
-            let denied = matches!(
-                reply,
-                Reply::Decision {
-                    verdict: Verdict::Deny,
-                    ..
-                }
-            );
-            if !covered && !denied {
-                self.flag(vec![(
-                    NARROWING_APPLIES,
-                    format!("{ask:?} was allowed, its recipients are no longer readers, yet the runtime says {reply:?}"),
-                )]);
+            if identical && live.contains(&ask) {
+                self.note("recheck_after_identical_reactivation");
+            }
+            if let Some(finding) = self.shadow.narrowing_finding(&ask, &reply) {
+                self.flag(vec![finding]);
             }
         }
     }
@@ -658,9 +816,18 @@ impl Sim {
             .into_journal()
     }
 
-    /// Crash after the last durable record; the next decisions must not change.
+    /// Crash after the last durable record; the next decisions must not
+    /// change. Sometimes nothing is re-sent first, so the last record before
+    /// the crash is whatever the previous step wrote.
     fn clean_crash(&mut self) {
-        let asks = self.shadow.recent_checks.clone();
+        self.note("crash_clean");
+        let asks = match self.rng.chance(40) {
+            true => {
+                self.note("crash_without_resend");
+                Vec::new()
+            }
+            false => self.shadow.recent_checks.clone(),
+        };
         let before: Vec<Option<Reply>> = asks.iter().map(|a| self.check(a.clone())).collect();
         let digest = self.engine().state_digest();
         let journal = self.take_journal();
@@ -680,6 +847,7 @@ impl Sim {
 
     /// Crash, then the first write after the restart fails: nothing changes.
     fn lost_write(&mut self) {
+        self.note("crash_lost_write");
         let digest = self.engine().state_digest();
         let mut journal = self.take_journal();
         journal.fail_next_append();
@@ -708,6 +876,15 @@ impl Sim {
         let Some((shadow, digest)) = self.before_last.take() else {
             return;
         };
+        self.note("crash_torn_tail");
+        match self.out.events.last().zip(self.out.replies.last()) {
+            Some(((_, Event::Approve { .. }), Reply::Approved { .. })) => self.note("torn_approve"),
+            Some(((_, Event::Revoke { .. }), Reply::Revoked { .. })) => self.note("torn_revoke"),
+            Some(((_, Event::ActivatePolicy { .. }), Reply::Activated { .. })) => {
+                self.note("torn_activate")
+            }
+            _ => {}
+        }
         let mut journal = self.take_journal();
         journal.tear_tail();
         if self.reopen(journal, &digest) {

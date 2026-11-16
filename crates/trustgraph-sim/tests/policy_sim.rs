@@ -1,7 +1,7 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use trustgraph_engine::{Event, Fault, MemoryJournal, Reply, Runtime};
-use trustgraph_policy::Verdict;
+use trustgraph_policy::{Policy, Query, Verdict, decide, parse};
 use trustgraph_sim::policy_sim::{Run, campaign, run, run_agents_only, run_with_fault};
 
 const EXAMPLES: [(&str, &str); 5] = [
@@ -28,6 +28,28 @@ const EXAMPLES: [(&str, &str); 5] = [
 ];
 const SLACK: &str = EXAMPLES[3].1;
 
+/// Paths that make a clean campaign meaningful; each must be reached.
+const COVERAGE: [&str; 18] = [
+    "approved_allow",
+    "approval_expired_recheck",
+    "expiry_boundary_before",
+    "expiry_boundary_at",
+    "revoke_effective",
+    "identical_reactivation_with_live_approvals",
+    "recheck_after_identical_reactivation",
+    "narrowing_with_derived_outputs",
+    "source_removed_with_derived_outputs",
+    "explicit_recipients_check",
+    "agent_denied_source",
+    "crash_clean",
+    "crash_lost_write",
+    "crash_torn_tail",
+    "torn_approve",
+    "torn_revoke",
+    "torn_activate",
+    "crash_without_resend",
+];
+
 #[test]
 fn examples_hold_under_simulation() {
     // One thread per example: each campaign takes several seconds in debug.
@@ -38,6 +60,19 @@ fn examples_hold_under_simulation() {
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
+    let mut combined: BTreeMap<String, u64> = BTreeMap::new();
+    for (name, result) in &results {
+        for (key, n) in &result.coverage {
+            *combined.entry(key.clone()).or_default() += n;
+        }
+        println!("{name}: {:?}", result.coverage);
+    }
+    for key in COVERAGE {
+        assert!(
+            combined.get(key).copied().unwrap_or(0) > 0,
+            "`{key}` never reached: {combined:?}"
+        );
+    }
     for (name, result) in results {
         assert!(
             result.violations.is_empty(),
@@ -115,18 +150,62 @@ fn caught(fault: Fault, invariants: &[&str]) -> Option<(&'static str, Run)> {
     None
 }
 
+/// This catch is the engine reporting on itself: its two deciders disagree
+/// (`engine_mismatch`) once the stale Graph readers stop matching `decide`.
 #[test]
 fn skip_reader_refresh_is_caught() {
-    let found = caught(Fault::SkipReaderRefresh, &["narrowing_applies", "no_leak"]);
-    assert!(found.is_some(), "SkipReaderRefresh went unnoticed");
+    let (_, r) = caught(Fault::SkipReaderRefresh, &["narrowing_applies", "no_leak"])
+        .expect("SkipReaderRefresh went unnoticed");
+    assert!(
+        r.violations
+            .iter()
+            .any(|v| v.detail.contains("engine_mismatch")),
+        "{:?}",
+        r.violations
+    );
+}
+
+/// Stale Graph readers without the `decide` gate leak a real `Allow`; the
+/// simulator's own oracle must catch it, not the engine.
+#[test]
+fn graph_only_stale_readers_is_caught() {
+    let (mut narrowing, mut independent) = (false, false);
+    for (_, yaml) in EXAMPLES {
+        for seed in 0..64 {
+            let r = run_with_fault(yaml, seed, 200, Fault::GraphOnlyStaleReaders).unwrap();
+            for v in &r.violations {
+                narrowing |= v.invariant == "narrowing_applies";
+                independent |= v.invariant == "no_leak" && !v.detail.contains("engine_mismatch");
+            }
+            if narrowing && independent {
+                return;
+            }
+        }
+    }
+    panic!(
+        "GraphOnlyStaleReaders: narrowing_applies {narrowing}, independent no_leak {independent}"
+    );
 }
 
 #[test]
 fn kept_approvals_are_caught() {
-    let found = caught(Fault::KeepApprovalsAcrossPolicyChange, &["approval_scoped"]);
+    // Not just bookkeeping: a real Allow that relies on an older revision's approval.
+    let leaked = EXAMPLES.iter().any(|(_, yaml)| {
+        (0..64).any(|seed| {
+            run_with_fault(yaml, seed, 200, Fault::KeepApprovalsAcrossPolicyChange)
+                .unwrap()
+                .violations
+                .iter()
+                .any(|v| {
+                    v.invariant == "approval_scoped"
+                        && v.detail.contains("runtime said allow")
+                        && v.detail.contains("relies on an approval from revision")
+                })
+        })
+    });
     assert!(
-        found.is_some(),
-        "KeepApprovalsAcrossPolicyChange went unnoticed"
+        leaked,
+        "KeepApprovalsAcrossPolicyChange never leaked an Allow that was caught"
     );
 }
 
@@ -137,29 +216,72 @@ fn invalid_policy_is_an_error() {
 
 #[test]
 fn mutations_change_decisions() {
-    // Some check's verdict differs before and after a policy activation.
+    // Some request's runtime verdict changes across an activation that really
+    // changed the policy, and `decide` under the old and new policy differs too.
     for seed in 0..64 {
         let r = run(SLACK, seed, 200).unwrap();
+        let genesis = parse(SLACK).policy.unwrap();
+        let mut policies: BTreeMap<String, Policy> =
+            BTreeMap::from([(genesis.digest(), genesis.clone())]);
+        let mut active = genesis;
         let mut epoch = 0u32;
-        let mut last: BTreeMap<String, (Verdict, u32)> = BTreeMap::new();
+        let mut lineage: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut last: BTreeMap<String, (Verdict, u32, Policy)> = BTreeMap::new();
         for ((_, event), reply) in r.events.iter().zip(&r.replies) {
             match (event, reply) {
-                (Event::ActivatePolicy { .. }, Reply::Activated { .. }) => epoch += 1,
-                (Event::Check { .. }, Reply::Decision { verdict, .. }) => {
+                (Event::ProposePolicy { policy, .. }, Reply::Proposed { id, .. }) => {
+                    policies.insert(id.clone(), parse(policy).policy.unwrap());
+                }
+                (Event::ActivatePolicy { .. }, Reply::Activated { digest, .. }) => {
+                    if *digest != active.digest() {
+                        epoch += 1;
+                    }
+                    active = policies[digest].clone();
+                }
+                (Event::RegisterSource { source, .. }, Reply::Artifact { id }) => {
+                    lineage.insert(id.clone(), BTreeSet::from([source.clone()]));
+                }
+                (Event::RecordOutput { inputs, .. }, Reply::Artifact { id }) => {
+                    let from = inputs
+                        .iter()
+                        .filter_map(|i| lineage.get(i))
+                        .flatten()
+                        .cloned()
+                        .collect();
+                    lineage.insert(id.clone(), from);
+                }
+                (
+                    Event::Check {
+                        agent,
+                        artifact,
+                        action,
+                        recipients,
+                    },
+                    Reply::Decision { verdict, .. },
+                ) => {
                     let key = format!("{event:?}");
-                    if let Some((before, at)) = last.get(&key)
+                    if let Some((before, at, old)) = last.get(&key)
                         && *at < epoch
                         && before != verdict
+                        && let Some(from) = lineage.get(artifact)
                     {
-                        return;
+                        let query = Query {
+                            output_from: from.clone(),
+                            agent: agent.clone(),
+                            action: action.clone(),
+                            recipients: recipients.clone(),
+                        };
+                        if decide(old, &query).verdict != decide(&active, &query).verdict {
+                            return;
+                        }
                     }
-                    last.insert(key, (*verdict, epoch));
+                    last.insert(key, (*verdict, epoch, active.clone()));
                 }
                 _ => {}
             }
         }
     }
-    panic!("no check changed its verdict across an activation");
+    panic!("no check changed its verdict across an activation that changed the policy");
 }
 
 #[test]

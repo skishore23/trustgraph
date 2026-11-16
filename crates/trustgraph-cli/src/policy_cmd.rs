@@ -628,6 +628,7 @@ mod tests {
                 })
                 .collect(),
             digest: "d".to_string(),
+            coverage: BTreeMap::new(),
         }
     }
 

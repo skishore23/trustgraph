@@ -405,7 +405,10 @@ impl Engine {
             .checked_add(1)
             .ok_or_else(|| reject("revision_exhausted", "the policy revision cannot grow"))?;
 
-        let refresh = self.fault != Fault::SkipReaderRefresh;
+        let refresh = !matches!(
+            self.fault,
+            Fault::SkipReaderRefresh | Fault::GraphOnlyStaleReaders
+        );
         let names: BTreeSet<String> = self
             .rule_names
             .iter()
@@ -650,12 +653,16 @@ impl Engine {
         );
         let query_id =
             || digest::structured("engine-query-v1", &(artifact, agent, action, recipients)).0;
-        if outcome.verdict == Verdict::Deny {
+        let graph_only = self.fault == Fault::GraphOnlyStaleReaders;
+        if outcome.verdict == Verdict::Deny && !graph_only {
             return Ok(decision_reply(query_id(), outcome));
         }
 
         // `decide` permits it; the Graph must say the same thing.
         let Some(rule) = policy.actions.get(action) else {
+            if graph_only {
+                return Ok(decision_reply(query_id(), outcome));
+            }
             return Ok(self.mismatch(query_id(), outcome.verdict, "no such action"));
         };
         let people = policy.people(recipients.unwrap_or(&rule.audience));
@@ -667,7 +674,21 @@ impl Engine {
             recipients: principals(people),
             parameters: serde_json::Value::Null,
         };
-        match (outcome.verdict, self.graph.check_action(&intent, None, at)) {
+        let graph = self.graph.check_action(&intent, None, at);
+        if graph_only {
+            return Ok(match graph {
+                Decision::Allow { context } => Reply::Decision {
+                    id: context.digest,
+                    verdict: Verdict::Allow,
+                    code: Gate::Allowed.code().into(),
+                    reason: "allowed".into(),
+                    blocking: Vec::new(),
+                    expires_at: None,
+                },
+                _ => decision_reply(query_id(), outcome),
+            });
+        }
+        match (outcome.verdict, graph) {
             (Verdict::Allow, Decision::Allow { context }) => {
                 Ok(decision_reply(context.digest, outcome))
             }

@@ -111,4 +111,9 @@ pub enum Fault {
     SkipReaderRefresh,
     /// Keep approvals and remembered decisions across policy activation.
     KeepApprovalsAcrossPolicyChange,
+    /// Skip the reader refresh on activation, like `SkipReaderRefresh`, and
+    /// answer `Check` from the Graph alone without the `decide` gate, so a
+    /// narrowing yields a real `Allow`. It exists only so the simulator can
+    /// prove it catches a real leak with its own oracle.
+    GraphOnlyStaleReaders,
 }

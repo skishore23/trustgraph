@@ -894,6 +894,36 @@ fn engine_matches_decide_on_every_example() {
     );
 }
 
+/// The simulator's leak fault: stale Graph readers and no `decide` gate turn a
+/// narrowing into a real `Allow`. Without the fault the same check is denied.
+#[test]
+fn graph_only_stale_readers_leaks_after_narrowing() {
+    for (fault, expected) in [
+        (Fault::None, Verdict::Deny),
+        (Fault::GraphOnlyStaleReaders, Verdict::Allow),
+    ] {
+        let mut engine = Engine::new().with_fault(fault);
+        engine.apply(
+            0,
+            &Event::Genesis {
+                policy: SPEC.into(),
+            },
+        );
+        let roadmap = register(&mut engine, 1, "roadmap", 2);
+        let out = record(&mut engine, 2, "planner", &[&roadmap], 10);
+        assert_eq!(
+            verdict(&check(&mut engine, 3, "planner", &out, "post_to_slack")),
+            Verdict::Allow
+        );
+        propose_and_activate(&mut engine, 4, &narrowed());
+        assert_eq!(
+            verdict(&check(&mut engine, 5, "planner", &out, "post_to_slack")),
+            expected,
+            "{fault:?}"
+        );
+    }
+}
+
 #[test]
 fn skipped_reader_refresh_shows_as_mismatch_never_allow() {
     let mut engine = Engine::new().with_fault(Fault::SkipReaderRefresh);

@@ -13,6 +13,9 @@ pub(super) const UNKNOWN_ACTION: &str = "unknown_action";
 /// An artifact id the runtime never issued.
 pub(super) const UNKNOWN_ARTIFACT: &str = "unknown_artifact_id";
 
+/// How many kinds of policy mutation `Names::mutate` draws from.
+pub(super) const MUTATIONS: u64 = 6;
+
 /// splitmix64: small, seedable and dependency-free.
 #[derive(Debug, Clone)]
 pub(super) struct Rng(u64);
@@ -128,60 +131,143 @@ impl Names {
     /// One random change to `policy`, with its inline tests cleared so that
     /// a stale test cannot make the proposal invalid.
     pub(super) fn mutate(&self, policy: &Policy, rng: &mut Rng) -> Policy {
+        let kind = rng.below(MUTATIONS);
+        self.mutate_with(policy, kind, rng)
+    }
+
+    /// Mutation `kind` (0..MUTATIONS): remove a reader, add a reader, remove
+    /// a source, remove an approval, shorten a `valid_for`, add a person to
+    /// a group. Each changes the policy whenever such a change exists.
+    pub(super) fn mutate_with(&self, policy: &Policy, kind: u64, rng: &mut Rng) -> Policy {
         let mut p = policy.clone();
         p.tests.clear();
-        let sources: Vec<String> = p.sources.keys().cloned().collect();
-        let gated: Vec<String> = p
-            .actions
-            .iter()
-            .filter(|(_, a)| a.approval.is_some())
-            .map(|(name, _)| name.clone())
-            .collect();
-        match rng.below(6) {
+        let gated = |p: &Policy, min: u64| -> Vec<String> {
+            p.actions
+                .iter()
+                .filter(|(_, a)| {
+                    a.approval
+                        .as_ref()
+                        .is_some_and(|r| r.valid_for_seconds >= min)
+                })
+                .map(|(name, _)| name.clone())
+                .collect()
+        };
+        match kind {
             0 => {
-                if let Some(name) = rng.pick(&sources) {
-                    let readers: Vec<String> = p.sources[name].readers.iter().cloned().collect();
-                    if let Some(reader) = rng.pick(&readers)
-                        && let Some(source) = p.sources.get_mut(name)
-                    {
-                        source.readers.remove(reader);
-                    }
+                let pairs: Vec<(String, String)> = p
+                    .sources
+                    .iter()
+                    .flat_map(|(name, s)| s.readers.iter().map(|r| (name.clone(), r.clone())))
+                    .collect();
+                if let Some((name, reader)) = rng.pick(&pairs)
+                    && let Some(source) = p.sources.get_mut(name)
+                {
+                    source.readers.remove(reader);
                 }
             }
             1 => {
-                if let Some(name) = rng.pick(&sources).cloned() {
-                    let reader = self.reader(rng);
-                    if let Some(source) = p.sources.get_mut(&name) {
-                        source.readers.insert(reader);
-                    }
+                // Only names the policy defines, or it would not parse.
+                let known: BTreeSet<String> = p
+                    .groups
+                    .iter()
+                    .flat_map(|(group, members)| std::iter::once(group).chain(members))
+                    .cloned()
+                    .collect();
+                let pairs: Vec<(String, String)> = p
+                    .sources
+                    .iter()
+                    .flat_map(|(name, s)| {
+                        known
+                            .iter()
+                            .filter(|r| !s.readers.contains(*r))
+                            .map(|r| (name.clone(), r.clone()))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                if let Some((name, reader)) = rng.pick(&pairs)
+                    && let Some(source) = p.sources.get_mut(name)
+                {
+                    source.readers.insert(reader.clone());
                 }
             }
             2 => {
+                let sources: Vec<String> = p.sources.keys().cloned().collect();
                 if let Some(name) = rng.pick(&sources) {
                     p.sources.remove(name);
                 }
             }
             3 => {
-                if let Some(action) = rng.pick(&gated).and_then(|n| p.actions.get_mut(n)) {
+                if let Some(action) = rng.pick(&gated(&p, 0)).and_then(|n| p.actions.get_mut(n)) {
                     action.approval = None;
                 }
             }
             4 => {
-                if let Some(name) = rng.pick(&gated)
-                    && let Some(rule) = p.actions.get_mut(name).and_then(|a| a.approval.as_mut())
+                if let Some(rule) = rng
+                    .pick(&gated(&p, 2))
+                    .and_then(|n| p.actions.get_mut(n))
+                    .and_then(|a| a.approval.as_mut())
                 {
-                    rule.valid_for_seconds = (rule.valid_for_seconds / 2).max(1);
+                    rule.valid_for_seconds /= 2;
                 }
             }
             _ => {
-                if let Some(group) = rng.pick(&self.groups).cloned() {
-                    let person = rng.pick(&self.people).map_or(OUTSIDER.into(), Clone::clone);
-                    if let Some(members) = p.groups.get_mut(&group) {
-                        members.insert(person);
-                    }
+                let pairs: Vec<(String, String)> = p
+                    .groups
+                    .iter()
+                    .flat_map(|(group, members)| {
+                        self.people
+                            .iter()
+                            .filter(|person| !members.contains(*person))
+                            .map(|person| (group.clone(), person.clone()))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                if let Some((group, person)) = rng.pick(&pairs)
+                    && let Some(members) = p.groups.get_mut(group)
+                {
+                    members.insert(person.clone());
                 }
             }
         }
         p
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use trustgraph_policy::{Severity, parse};
+
+    #[test]
+    fn every_mutation_kind_changes_the_policy_and_stays_parseable() {
+        for yaml in [
+            include_str!("../../../../examples/policies/slack-digest.policy.yaml"),
+            include_str!("../../../trustgraph-policy/tests/fixtures/spec-example.policy.yaml"),
+        ] {
+            let policy = parse(yaml).policy.unwrap();
+            let names = Names::new(&policy);
+            let mut cleared = policy.clone();
+            cleared.tests.clear();
+            for kind in 0..MUTATIONS {
+                for seed in 0..16 {
+                    let mutated = names.mutate_with(&policy, kind, &mut Rng::new(seed));
+                    assert_ne!(
+                        mutated.digest(),
+                        cleared.digest(),
+                        "kind {kind} seed {seed}"
+                    );
+                    let parsed = parse(&mutated.to_yaml());
+                    assert!(
+                        parsed
+                            .diagnostics
+                            .iter()
+                            .all(|d| d.severity != Severity::Error),
+                        "kind {kind} seed {seed}: {:?}",
+                        parsed.diagnostics
+                    );
+                    assert_eq!(parsed.policy.map(|p| p.digest()), Some(mutated.digest()));
+                }
+            }
+        }
     }
 }
