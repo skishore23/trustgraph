@@ -56,9 +56,12 @@ input; tests and the simulator cover those, without proof.
 
 [GitHub Actions run 43787456648](https://github.com/skishore23/trustgraph/actions/runs/43787456648)
 verified commit `c48d64cd8078d66de32ed9945a689e4e41cbae37` on 2026-11-15:
-**all ten harnesses verified, zero failures**. This result was recorded before
-the repository was cut down to the policy product; the kernels and harnesses
-in `trustgraph-core` are unchanged since that commit.
+**all ten harnesses verified, zero failures**. The table below is from that
+run. The kernels and harnesses in `trustgraph-core` are unchanged since.
+
+[Run 43800337348](https://github.com/skishore23/trustgraph/actions/runs/43800337348)
+repeated the result on commit `a62adc6`, after the repository was cut down to
+the policy product: all ten harnesses verified, zero failures.
 
 | Harness | Result | Verification seconds |
 | --- | --- | ---: |
