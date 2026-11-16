@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 #[cfg(feature = "fault-injection")]
 use trustgraph_engine::Fault;
-use trustgraph_engine::{Engine, Event, Reply};
+use trustgraph_engine::{Engine, Event, ProposalOrigin, Reply};
 use trustgraph_policy::{Query, Verdict, decide, parse};
 
 const SPEC: &str = include_str!("../../trustgraph-policy/tests/fixtures/spec-example.policy.yaml");
@@ -582,11 +582,12 @@ fn agent_callable_classification() {
             proposal: s(),
             operator: s(),
         },
+        Event::ProposeFromFile { policy: s() },
     ];
     let callable: Vec<bool> = all.iter().map(Event::agent_callable).collect();
     assert_eq!(
         callable,
-        [false, true, true, true, false, false, true, false]
+        [false, true, true, true, false, false, true, false, false]
     );
 }
 
@@ -995,12 +996,12 @@ fn rejection_messages_echo_at_most_64_characters_in_total() {
 }
 
 #[test]
-fn remembered_decisions_are_capped() {
+fn remembered_decisions_are_capped_per_agent() {
     let mut engine = genesis(SPEC);
     let sheet = register(&mut engine, 1, "price_sheet", 3);
     let mut outputs = Vec::new();
     let mut ids = Vec::new();
-    for i in 0..1100u32 {
+    for i in 0..100u32 {
         let out = record(&mut engine, 3, "mailer", &[&sheet], 100 + i);
         let reply = check(&mut engine, 3, "mailer", &out, "email_customer");
         assert_eq!(verdict(&reply), Verdict::NeedsApproval);
@@ -1033,10 +1034,10 @@ fn remembered_decisions_are_capped() {
             other => panic!("{other:?}"),
         }
     }
-    // 1,024 remembered: the approved oldest plus the 1,023 newest.
-    assert_eq!(approved, 1023);
-    assert_eq!(unknown, 76);
-    for id in &ids[1..77] {
+    // 64 remembered for the mailer: the approved oldest plus the 63 newest.
+    assert_eq!(approved, 63);
+    assert_eq!(unknown, 36);
+    for id in &ids[1..37] {
         assert_eq!(
             rejected_code(&approve(&mut engine, 6, id, "leo")),
             "unknown_decision"
@@ -1046,6 +1047,57 @@ fn remembered_decisions_are_capped() {
     let again = check(&mut engine, 7, "mailer", &outputs[1], "email_customer");
     assert_eq!(decision_id(&again), ids[1]);
     assert_eq!(verdict(&again), Verdict::NeedsApproval);
+}
+
+#[test]
+fn one_agent_flooding_checks_cannot_evict_another_agents_decision() {
+    let mut engine = genesis(&scope_policy());
+    let sheet = register(&mut engine, 1, "price_sheet", 3);
+    let theirs = record(&mut engine, 2, "mailer2", &[&sheet], 7);
+    let decision = decision_id(&check(&mut engine, 2, "mailer2", &theirs, "email_customer"));
+    for i in 0..300u32 {
+        let out = record(&mut engine, 3, "mailer", &[&sheet], 100 + i);
+        check(&mut engine, 3, "mailer", &out, "email_customer");
+    }
+    let pending = engine.pending_decisions(4);
+    assert_eq!(pending.iter().filter(|p| p.agent == "mailer").count(), 64);
+    assert!(pending.iter().any(|p| p.decision == decision));
+    assert!(matches!(
+        approve(&mut engine, 4, &decision, "leo"),
+        Reply::Approved { .. }
+    ));
+}
+
+#[test]
+fn remembered_decisions_are_capped_in_all() {
+    let names: Vec<String> = (0..20).map(|i| format!("m{i}")).collect();
+    let list = names.join(", ");
+    let policy = SPEC
+        .replace(
+            "agents: [planner, mailer]",
+            &format!("agents: [planner, {list}]"),
+        )
+        .replace("agents: [mailer]", &format!("agents: [{list}]"));
+    let mut engine = genesis(&policy);
+    let sheet = register(&mut engine, 1, "price_sheet", 3);
+    let mut n = 100;
+    for agent in &names {
+        for _ in 0..60 {
+            n += 1;
+            let out = record(&mut engine, 2, agent, &[&sheet], n);
+            assert_eq!(
+                verdict(&check(&mut engine, 2, agent, &out, "email_customer")),
+                Verdict::NeedsApproval
+            );
+        }
+    }
+    let pending = engine.pending_decisions(3);
+    assert_eq!(pending.len(), 1024);
+    // Agents that asked after the cap was reached kept their own newest.
+    for agent in &names {
+        let own = pending.iter().filter(|p| &p.agent == agent).count();
+        assert!(own > 0 && own <= 60, "{agent}: {own}");
+    }
 }
 
 #[test]
@@ -1082,18 +1134,77 @@ fn agent_proposals_cannot_evict_operator_proposals() {
             },
         )
     };
+    // The planner keeps its own 8 newest.
     assert_eq!(
-        rejected_code(&activate(&mut engine, &agent_ids[67])),
+        rejected_code(&activate(&mut engine, &agent_ids[91])),
         "unknown_proposal"
     );
     assert!(matches!(
-        activate(&mut engine, &agent_ids[68]),
+        activate(&mut engine, &agent_ids[92]),
         Reply::Activated { .. }
     ));
     assert!(matches!(
         activate(&mut engine, &operator_id),
         Reply::Activated { .. }
     ));
+}
+
+fn agent_propose(engine: &mut Engine, at: u64, agent: &str, policy: &str) -> String {
+    match engine.apply(
+        at,
+        &Event::ProposePolicy {
+            agent: Some(agent.into()),
+            policy: policy.into(),
+        },
+    ) {
+        Reply::Proposed { id, .. } => id,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_proposal_flood_cannot_evict_other_agents_the_operator_or_the_file() {
+    let mut engine = genesis(&scope_policy());
+    let variant =
+        |n: u32| scope_policy().replace("valid_for: 30m", &format!("valid_for: {}s", 100 + n));
+    let theirs = agent_propose(&mut engine, 1, "mailer2", &variant(1));
+    let operator = match propose(&mut engine, 1, &variant(2)) {
+        Reply::Proposed { id, .. } => id,
+        other => panic!("{other:?}"),
+    };
+    let file = match engine.apply(1, &Event::ProposeFromFile { policy: variant(3) }) {
+        Reply::Proposed { id, .. } => id,
+        other => panic!("{other:?}"),
+    };
+    let before = engine.stored_proposals();
+    // Re-proposing someone else's digest changes neither origin nor order.
+    for id_text in [variant(1), variant(2), variant(3)] {
+        agent_propose(&mut engine, 2, "mailer", &id_text);
+    }
+    assert_eq!(engine.stored_proposals(), before);
+    for i in 0..200 {
+        agent_propose(&mut engine, 3, "mailer", &variant(10 + i));
+    }
+    for id in [&theirs, &operator, &file] {
+        assert!(engine.has_proposal(id), "{id}");
+    }
+    let stored = engine.stored_proposals();
+    let origin = |id: &str| {
+        stored
+            .iter()
+            .find(|p| p.proposal == id)
+            .unwrap()
+            .origin
+            .clone()
+    };
+    assert_eq!(origin(&theirs), ProposalOrigin::Agent("mailer2".into()));
+    assert_eq!(origin(&operator), ProposalOrigin::Operator);
+    assert_eq!(origin(&file), ProposalOrigin::File);
+    let mailer = stored
+        .iter()
+        .filter(|p| p.origin == ProposalOrigin::Agent("mailer".into()))
+        .count();
+    assert_eq!(mailer, 8);
 }
 
 #[test]
@@ -1351,9 +1462,9 @@ fn operator_views_list_pending_approved_and_proposals() {
     ));
     let stored = engine.stored_proposals();
     assert_eq!(stored.len(), 2);
-    assert_eq!(stored[0].agent.as_deref(), Some("planner"));
+    assert_eq!(stored[0].origin, ProposalOrigin::Agent("planner".into()));
     assert!(!stored[0].widens);
-    assert_eq!(stored[1].agent, None);
+    assert_eq!(stored[1].origin, ProposalOrigin::Operator);
     assert!(stored[1].widens);
     assert!(!stored[1].explanation.is_empty());
 

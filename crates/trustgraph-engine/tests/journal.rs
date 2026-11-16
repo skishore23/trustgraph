@@ -2,7 +2,8 @@ use std::fs;
 use std::path::Path;
 
 use trustgraph_engine::{
-    Event, FileJournal, Journal, JournalError, MemoryJournal, OpenError, Record, Reply, Runtime,
+    Event, FileJournal, FileOutcome, Journal, JournalError, MemoryJournal, OpenError, PolicyFile,
+    ProposalOrigin, Record, Reply, Runtime,
 };
 use trustgraph_policy::Verdict;
 
@@ -115,16 +116,59 @@ fn reopen_reaches_the_same_state() {
 }
 
 #[test]
-fn new_policy_file_appends_genesis() {
+fn a_changed_policy_file_is_only_proposed() {
     let dir = tempfile::tempdir().unwrap();
     let mut rt = Runtime::open(file_journal(dir.path()), SPEC, 0).unwrap();
+    assert_eq!(rt.file_outcome(), &FileOutcome::Genesis);
     let only = ten_events(&mut rt);
     assert_eq!(rt.engine().policy_revision(), 1);
     drop(rt);
 
-    let mut rt = Runtime::open(file_journal(dir.path()), &narrowed(), 100).unwrap();
+    // A widened file: stored as a file proposal; the active policy stays.
+    let widened = SPEC.replace(
+        "readers: [sales, customers]",
+        "readers: [sales, customers, engineering]",
+    );
+    let mut rt = Runtime::open(file_journal(dir.path()), &widened, 100).unwrap();
+    assert_eq!(rt.engine().policy_revision(), 1);
+    let FileOutcome::Proposed { id } = rt.file_outcome().clone() else {
+        panic!("{:?}", rt.file_outcome());
+    };
+    let stored = rt.engine().stored_proposals();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].proposal, id);
+    assert_eq!(stored[0].origin, ProposalOrigin::File);
+    assert!(stored[0].widens);
+    assert_eq!(
+        verdict(&rt.handle(101, check_event(&only)).unwrap()),
+        Verdict::Allow
+    );
+    drop(rt);
+
+    // The same file again: already proposed, nothing written.
+    let before = text(dir.path());
+    let rt = Runtime::open(file_journal(dir.path()), &widened, 200).unwrap();
+    assert_eq!(
+        rt.file_outcome(),
+        &FileOutcome::AlreadyRecorded {
+            digest: id.clone(),
+            proposal: true
+        }
+    );
+    assert_eq!(text(dir.path()), before);
+    drop(rt);
+
+    // `PolicyFile::Activate` applies a changed file at start.
+    let mut rt = Runtime::open_with(
+        file_journal(dir.path()),
+        &narrowed(),
+        300,
+        PolicyFile::Activate,
+    )
+    .unwrap();
     assert_eq!(rt.engine().policy_revision(), 2);
-    let reply = rt.handle(101, check_event(&only)).unwrap();
+    assert!(matches!(rt.file_outcome(), FileOutcome::Activated { .. }));
+    let reply = rt.handle(301, check_event(&only)).unwrap();
     assert_eq!(verdict(&reply), Verdict::Deny);
 }
 
@@ -606,11 +650,47 @@ fn restart_keeps_an_in_band_activation() {
     let journal = rt.into_journal();
     assert_eq!(journal.records().len(), len);
 
-    // A different file wins: one new Genesis, revision + 1.
+    // A different file is proposed, not applied: one new record, and the
+    // in-band activation stays in force.
     let third = SPEC.replace("valid_for: 30m", "valid_for: 20m");
     assert_ne!(third, SPEC);
     let rt = Runtime::open(journal, &third, 100).unwrap();
-    assert_eq!(rt.engine().policy_revision(), 3);
+    assert_eq!(rt.engine().policy_revision(), 2);
+    assert_eq!(rt.engine().policy().unwrap().digest(), active);
+    assert!(matches!(rt.file_outcome(), FileOutcome::Proposed { .. }));
+    let journal = rt.into_journal();
+    assert_eq!(journal.records().len(), len + 1);
+    let digest = Runtime::open(journal.clone(), &third, 100)
+        .unwrap()
+        .engine()
+        .state_digest();
+
+    // Activating it from the operator class applies it.
+    let mut rt = Runtime::open(journal, &third, 100).unwrap();
+    let FileOutcome::AlreadyRecorded { digest: id, .. } = rt.file_outcome().clone() else {
+        panic!("{:?}", rt.file_outcome());
+    };
+    assert_eq!(rt.engine().state_digest(), digest, "replay is exact");
+    let reply = rt
+        .handle(
+            101,
+            Event::ActivatePolicy {
+                proposal: id,
+                operator: "leo".into(),
+            },
+        )
+        .unwrap();
+    assert!(
+        matches!(reply, Reply::Activated { revision: 3, .. }),
+        "{reply:?}"
+    );
+
+    // Explicit activation at start: one new Genesis, revision + 1.
+    let fourth = SPEC.replace("valid_for: 30m", "valid_for: 10m");
+    let journal = rt.into_journal();
+    let len = journal.records().len();
+    let rt = Runtime::open_with(journal, &fourth, 200, PolicyFile::Activate).unwrap();
+    assert_eq!(rt.engine().policy_revision(), 4);
     assert_eq!(rt.into_journal().records().len(), len + 1);
 }
 
@@ -756,11 +836,30 @@ fn policy_source_survives_reopen_until_the_file_changes() {
     assert_eq!(rt.engine().policy_revision(), 2);
     drop(rt);
 
+    // The file is the activated policy now, so there is nothing to do.
     let rt = Runtime::open(file_journal(dir.path()), &narrowed(), 20).unwrap();
+    assert_eq!(rt.file_outcome(), &FileOutcome::Unchanged);
+    drop(rt);
+
+    let widened = SPEC.replace(
+        "readers: [sales, customers]",
+        "readers: [sales, customers, engineering]",
+    );
+    let rt = Runtime::open(file_journal(dir.path()), &widened, 20).unwrap();
+    assert_eq!(
+        rt.policy_source(),
+        PolicySource::Activated,
+        "a changed file is proposed"
+    );
+    assert_eq!(rt.engine().policy_revision(), 2);
+    drop(rt);
+
+    let rt =
+        Runtime::open_with(file_journal(dir.path()), &widened, 30, PolicyFile::Activate).unwrap();
     assert_eq!(
         rt.policy_source(),
         PolicySource::File,
-        "a changed file wins"
+        "--activate-policy-file"
     );
     assert_eq!(rt.engine().policy_revision(), 3);
 }

@@ -16,8 +16,8 @@
 //!
 //! Growth: the journal grows without bound by design; there is no compaction
 //! yet. Artifacts, Graph operations and lineage also grow with every agent
-//! call (remembered pending decisions are capped at 1,024 and stored
-//! proposals at 32 per origin). A server that exposes this runtime to agents
+//! call (remembered pending decisions are capped at 64 per agent and 1,024 in
+//! all; stored proposals at 32 per class, operator or agent, and 8 per agent). A server that exposes this runtime to agents
 //! must add per-agent quotas, as `trustgraph serve` does.
 //!
 //! Errors: when [`Runtime::handle`] or [`Journal::append`] returns `Err`, the
@@ -37,9 +37,9 @@ mod runtime;
 /// engine bugs are compiled in. Production builds must have it false.
 pub const FAULT_INJECTION: bool = cfg!(feature = "fault-injection");
 
-pub use engine::{Engine, LiveApproval, PendingDecision, StoredProposal};
+pub use engine::{Engine, LiveApproval, PendingDecision, ProposalOrigin, StoredProposal};
 #[cfg(feature = "fault-injection")]
 pub use event::Fault;
 pub use event::{Event, Reply};
 pub use journal::{FileJournal, Journal, JournalError, MemoryJournal, Record};
-pub use runtime::{OpenError, PolicySource, Runtime};
+pub use runtime::{FileOutcome, OpenError, PolicyFile, PolicySource, Runtime};

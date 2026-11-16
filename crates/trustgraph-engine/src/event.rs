@@ -48,6 +48,12 @@ pub enum Event {
         proposal: String,
         operator: String,
     },
+    /// System only, written by `Runtime::open`: the policy file differs from
+    /// the active policy, so it is stored as an operator-class proposal
+    /// marked as coming from the file. It never changes the active policy.
+    ProposeFromFile {
+        policy: String,
+    },
 }
 
 impl Event {
@@ -73,7 +79,7 @@ impl Event {
     /// changes nothing, not even the engine's clock.
     pub fn validate_shape(&self) -> Result<(), Reply> {
         match self {
-            Event::Genesis { policy } => policy_text(policy),
+            Event::Genesis { policy } | Event::ProposeFromFile { policy } => policy_text(policy),
             Event::RegisterSource {
                 source,
                 sha256: sha,
