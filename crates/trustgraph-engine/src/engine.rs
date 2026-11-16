@@ -581,22 +581,28 @@ impl Engine {
     /// False only under an injected fault that leaves Graph readers stale.
     fn refreshes_readers(&self) -> bool {
         #[cfg(feature = "fault-injection")]
-        if matches!(
-            self.fault,
-            Fault::SkipReaderRefresh | Fault::GraphOnlyStaleReaders
-        ) {
-            return false;
+        {
+            !matches!(
+                self.fault,
+                Fault::SkipReaderRefresh | Fault::GraphOnlyStaleReaders
+            )
         }
-        true
+        #[cfg(not(feature = "fault-injection"))]
+        {
+            true
+        }
     }
 
     /// True only under an injected fault that keeps approvals across activation.
     fn keeps_approvals(&self) -> bool {
         #[cfg(feature = "fault-injection")]
-        if self.fault == Fault::KeepApprovalsAcrossPolicyChange {
-            return true;
+        {
+            self.fault == Fault::KeepApprovalsAcrossPolicyChange
         }
-        false
+        #[cfg(not(feature = "fault-injection"))]
+        {
+            false
+        }
     }
 
     fn active(&self) -> Result<&Policy, Reply> {

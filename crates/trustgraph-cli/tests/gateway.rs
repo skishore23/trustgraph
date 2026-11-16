@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use rmcp::model::{CallToolRequestParams, JsonObject};
@@ -45,24 +45,45 @@ actions:
 
 /// The fake upstream binary, built by `cargo test` with the examples.
 fn fake_upstream() -> PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let debug = exe.parent().unwrap().parent().unwrap();
-    let path = debug.join("examples").join("fake_upstream");
-    if !path.exists() {
-        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-        let status = std::process::Command::new(cargo)
-            .args([
-                "build",
-                "-p",
-                "trustgraph-cli",
-                "--example",
-                "fake_upstream",
-            ])
-            .status()
-            .unwrap();
-        assert!(status.success(), "cannot build the fake upstream");
-    }
-    path
+    static EXECUTABLE: OnceLock<PathBuf> = OnceLock::new();
+    EXECUTABLE
+        .get_or_init(|| {
+            // Cargo's test artifact layout varies by toolchain. Ask Cargo for
+            // the example executable rather than walking from current_exe.
+            let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+            let output = std::process::Command::new(cargo)
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .args([
+                    "build",
+                    "--locked",
+                    "-p",
+                    "trustgraph-cli",
+                    "--example",
+                    "fake_upstream",
+                    "--message-format=json",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "cannot build fake MCP server: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find_map(|value| {
+                    if value["reason"] == "compiler-artifact"
+                        && value["target"]["name"] == "fake_upstream"
+                    {
+                        value["executable"].as_str().map(PathBuf::from)
+                    } else {
+                        None
+                    }
+                })
+                .expect("Cargo did not report the fake MCP server executable")
+        })
+        .clone()
 }
 
 /// The `drive` upstream: the fake over streamable HTTP, needing DRIVE_SECRET.
