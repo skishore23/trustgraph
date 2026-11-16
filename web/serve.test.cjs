@@ -90,4 +90,19 @@ const page = require('./serve.js');
   assert.equal(page.proposer({ origin: 'agent', from: 'mailer' }), 'Proposed by agent mailer');
 }
 
+// Gateway sessions can be ended, with a confirmation that says what is forgotten.
+{
+  const state = {
+    pending: [],
+    proposals: [],
+    gateway: { mode: 'agent', problems: [], sessions: [{ session: 'agent:planner', agent: 'planner', sources: ['salaries'] }] },
+  };
+  assert.deepEqual(page.confirmableKeys(state), ['end:agent:planner']);
+  assert.equal(page.staleConfirmation({ pending: [], proposals: [] }, 'end:agent:planner'), true, 'ended elsewhere');
+  assert.equal(
+    page.endSummary(state.gateway.sessions[0]),
+    "End this session? planner's later actions will no longer count what it read: salaries."
+  );
+}
+
 console.log('serve.test.cjs: ok');
