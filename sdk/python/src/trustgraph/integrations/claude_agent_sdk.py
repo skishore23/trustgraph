@@ -26,10 +26,11 @@ import asyncio
 import hashlib
 import json
 import os
+import stat
 import tempfile
 import threading
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 from claude_agent_sdk import HookMatcher
@@ -71,9 +72,14 @@ def _require(data: Mapping[str, Any], *fields: str) -> None:
         )
 
 
+class _Absent(list):  # type: ignore[type-arg]
+    """No transcript file (yet): no results, but nothing verified either."""
+
+
 def _tool_results(path: Any) -> list[tuple[str, str | None]] | None:
-    """The ``(tool_use_id, tool name)`` of every tool result in the transcript, or ``None``
-    when it cannot be read. A result whose ``tool_use`` is not found has no name."""
+    """The ``(tool_use_id, tool name)`` of every tool result in the transcript; an empty
+    ``_Absent`` when the file does not exist; ``None`` when there is no path or the file
+    cannot be read. A result whose ``tool_use`` is not found has no name."""
     if not path:
         return None
     names: dict[str, str] = {}
@@ -94,6 +100,8 @@ def _tool_results(path: Any) -> list[tuple[str, str | None]] | None:
                         names[block["id"]] = str(block.get("name"))
                     elif block.get("type") == "tool_result":
                         results.append(str(block.get("tool_use_id")))
+    except FileNotFoundError:
+        return _Absent()
     except OSError:
         return None
     return [(r, names.get(r)) for r in results]
@@ -138,6 +146,7 @@ class Guard:
         timeout: float = 60.0,
         max_sessions: int = 1024,
         store: str | os.PathLike[str] | None = None,
+        writable_dirs: Iterable[str | os.PathLike[str]] = (),
     ) -> None:
         if max_sessions < 1:
             raise ValueError("max_sessions must be at least 1")
@@ -147,7 +156,13 @@ class Guard:
         self.subagents = dict(subagents or {})
         self.timeout = timeout
         self.max_sessions = max_sessions
-        self.store = None if store is None else os.fspath(store)
+        self.store = None if store is None else os.path.realpath(os.fspath(store))
+        # Where the agent's tools can write: the store must be outside all of them.
+        self.writable_dirs = [os.getcwd(), *(os.fspath(d) for d in writable_dirs)]
+        try:
+            self._check_store()
+        except TrustGraphError as e:
+            raise ValueError(e.message) from None
         self._conversations: OrderedDict[str, _Conversation] = OrderedDict()
         self._lock = threading.Lock()
 
@@ -176,7 +191,7 @@ class Guard:
         results than were stored, and a broken marker once broken."""
         if self.store is None:
             return
-        os.makedirs(self.store, mode=0o700, exist_ok=True)
+        self._check_store()
         with self._lock:
             old = self._load(session_id) or {}
             stored = old.get("token") if isinstance(old.get("token"), str) else None
@@ -197,6 +212,36 @@ class Guard:
             except BaseException:
                 os.unlink(tmp)
                 raise
+
+    def _check_store(self, data: Mapping[str, Any] | None = None) -> None:
+        """The store must be a 0700 directory of this user, outside every directory the
+        agent's tools can write (the hook's ``cwd``, ``writable_dirs``, the transcript's)."""
+        if self.store is None:
+            return
+        dirs = list(self.writable_dirs)
+        if data is not None:
+            dirs += [data.get("cwd"), os.path.dirname(str(data.get("transcript_path") or ""))]
+        for d in dirs:
+            if not d:
+                continue
+            inside = os.path.realpath(os.fspath(d))
+            if self.store == inside or self.store.startswith(inside.rstrip(os.sep) + os.sep):
+                raise TrustGraphError(
+                    "unsafe_store",
+                    f"the store {self.store} is inside {inside}, which the agent's tools can write: it could "
+                    "rewrite the stored sessions; keep the store outside every path the agent can write",
+                )
+        if not os.path.lexists(self.store):
+            os.makedirs(self.store, mode=0o700)
+            os.chmod(self.store, 0o700)
+        st = os.lstat(self.store)
+        uid = os.getuid() if hasattr(os, "getuid") else st.st_uid
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != uid or stat.S_IMODE(st.st_mode) & 0o077:
+            raise TrustGraphError(
+                "unsafe_store",
+                f"the store {self.store} must be a directory owned by this user with mode 0700 "
+                f"(it is {oct(stat.S_IMODE(st.st_mode))})",
+            )
 
     # -- sessions --------------------------------------------------------
 
@@ -222,8 +267,11 @@ class Guard:
             fresh.broken = main.broken
         else:
             results = _tool_results(transcript_path)
-            # First seen at a prompt with no transcript yet: a new SDK session, seen from its start.
-            fresh = _Conversation(main, complete=results == [] or (results is None and prompt))
+            # Seen from its start: a readable transcript without results, or (at a prompt) no
+            # transcript file yet. No path, or one that cannot be read, verifies nothing.
+            fresh = _Conversation(
+                main, complete=results is not None and (not isinstance(results, _Absent) or prompt) and not results
+            )
         with self._lock:
             c = self._conversations.setdefault(session_id, fresh)
             self._conversations.move_to_end(session_id)
@@ -237,10 +285,8 @@ class Guard:
         """Refuse when the transcript holds a mapped source's result the guard never recorded,
         or cannot be read and the guard has not seen the SDK session from its start."""
         results = _tool_results(transcript_path)
-        if results is None:
-            if not c.complete:
-                raise TrustGraphError("history_unverifiable", _UNVERIFIABLE.format(path=transcript_path))
-            return
+        if results is None or (isinstance(results, _Absent) and not c.complete):
+            raise TrustGraphError("history_unverifiable", _UNVERIFIABLE.format(path=transcript_path))
         for tool_use_id, name in results:
             if (name is None or name in self.sources) and tool_use_id not in c.recorded:
                 reason = _RESUMED.format(tool=name or "an unknown tool")
@@ -274,6 +320,7 @@ class Guard:
 
     def _for(self, data: Mapping[str, Any], *, verify: bool = False) -> tuple[_Conversation, Session]:
         _require(data, "session_id", "transcript_path")
+        self._check_store(data)
         c = self._conversation(data["session_id"], data["transcript_path"])
         if c.broken is not None:
             raise TrustGraphError("session_broken", c.broken)
@@ -285,6 +332,7 @@ class Guard:
 
     async def user_prompt_submit(self, data: Any, tool_use_id: str | None, context: Any) -> dict[str, Any]:
         try:
+            await asyncio.to_thread(self._check_store, data)
             await asyncio.to_thread(
                 self._conversation, data["session_id"], data.get("transcript_path"), prompt=True
             )
@@ -296,6 +344,7 @@ class Guard:
         spec = self.actions.get(data.get("tool_name", ""))
         if spec is None:
             try:  # note the SDK session before any result reaches its transcript
+                await asyncio.to_thread(self._check_store, data)
                 await asyncio.to_thread(self._conversation, data["session_id"], data.get("transcript_path"))
             except Exception:
                 pass
@@ -353,6 +402,7 @@ class Guard:
 
     def _start(self, data: Mapping[str, Any]) -> None:
         _require(data, "session_id", "agent_id", "transcript_path")
+        self._check_store(data)
         sid, agent_id = data["session_id"], data["agent_id"]
         c = self._conversation(sid, data["transcript_path"])
         client = self.subagents.get(data.get("agent_type") or "", self.client)

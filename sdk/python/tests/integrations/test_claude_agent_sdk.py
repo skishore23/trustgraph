@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+import os
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -75,8 +76,8 @@ class FakeCLI(Transport):
         self.waiting[request_id] = future
         await self.inbox.put({"type": "control_request", "request_id": request_id, "request": {
             "subtype": "hook_callback", "callback_id": self.callbacks[event],
-            "input": {k: v for k, v in {"hook_event_name": event, "session_id": "s1", "cwd": "/",
-                                        "transcript_path": "/t", **data}.items() if k not in data.get("_drop", ())},
+            "input": {k: v for k, v in {"hook_event_name": event, "session_id": "s1", "cwd": "/nonexistent-cwd",
+                                        "transcript_path": "/nonexistent-transcripts/t", **data}.items() if k not in data.get("_drop", ())},
             "tool_use_id": data.get("tool_use_id")}})
         answer = await asyncio.wait_for(future, 30)
         assert answer["subtype"] == "success", answer
@@ -178,7 +179,7 @@ def test_subagent_not_cleared_for_parent_is_refused(handoff_server: Server) -> N
         cli.waiting[request_id] = future
         await cli.inbox.put({"type": "control_request", "request_id": request_id, "request": {
             "subtype": "hook_callback", "callback_id": cli.callbacks["SubagentStart"],
-            "input": {"hook_event_name": "SubagentStart", "session_id": "s1", "transcript_path": "/t", **sub}}})
+            "input": {"hook_event_name": "SubagentStart", "session_id": "s1", "transcript_path": "/nonexistent-transcripts/t", **sub}}})
         assert (await future)["subtype"] == "error"  # with on_failure="block" the subagent does not start
         reason = denied(await cli.hook("PreToolUse", tool("mcp__slack__post", {"text": "x"}, **sub)))
         assert reason and "session_broken" in reason
@@ -256,7 +257,8 @@ class ClaudeHooks:
 
 def transcript(tmp_path: Any, with_result: bool, tool_use_id: str = "t", name: str = "mcp__drive__salaries") -> str:
     """A transcript in the Claude Code shape: assistant tool_use, then a user tool_result."""
-    path = tmp_path / "transcript.jsonl"
+    (tmp_path / "transcripts").mkdir(exist_ok=True)
+    path = tmp_path / "transcripts" / "transcript.jsonl"
     lines = [{"type": "user", "message": {"role": "user", "content": "read the salaries"}}]
     if with_result:
         lines.append({"type": "assistant", "message": {"role": "assistant", "content": [
@@ -342,7 +344,7 @@ def test_nested_subagent_inherits_its_spawner(handoff_server: Server, parent: st
 
 def test_history_appearing_after_the_first_hook_is_refused(server: Server, tmp_path: Any) -> None:
     """A fork or resume whose earlier results show up in the transcript after the guard first saw it."""
-    path = tmp_path / "transcript.jsonl"
+    path = tmp_path / "transcripts" / "transcript.jsonl"
     with ClaudeHooks(planner_guard(server)) as cli:
         cli.run(cli.hook("UserPromptSubmit", {"prompt": "go", "transcript_path": str(path)}))  # no file yet
         cli.run(cli.hook("PostToolUse", tool("mcp__drive__roadmap", response=ROADMAP, tool_use_id="r1",
@@ -372,3 +374,63 @@ def test_missing_hook_fields_fail_closed(server: Server) -> None:
         assert answer["continue"] is False and "unsupported_framework" in answer["hookSpecificOutput"]["updatedToolOutput"]
 
     asyncio.run(drive(planner_guard(server), script))
+
+
+# -- the store must be out of the agent's reach, and the transcript readable --
+
+
+def test_store_inside_a_writable_directory_is_refused(server: Server, tmp_path: Any, monkeypatch: Any) -> None:
+    """The third review's c1.py: the agent's own Bash/Write could rewrite a store it can reach."""
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(ValueError, match="inside"):
+        planner_guard(server, store=tmp_path / "store")  # under the process's cwd
+    with pytest.raises(ValueError, match="inside"):
+        planner_guard(server, store=tmp_path / "x", writable_dirs=[tmp_path])
+    (tmp_path / "elsewhere").mkdir()
+    monkeypatch.chdir(tmp_path / "elsewhere")
+    other = tmp_path / "work"
+    other.mkdir()
+    guard = planner_guard(server, store=other / "store")
+
+    async def script(cli: FakeCLI) -> None:  # the hook's cwd is the agent's working directory
+        await cli.hook("PostToolUse", tool("mcp__drive__roadmap", response=ROADMAP, cwd=str(other)))
+        reason = denied(await cli.hook("PreToolUse", tool("mcp__slack__post", {"text": "Q3"}, cwd=str(other))))
+        assert reason and "unsafe_store" in reason
+
+    asyncio.run(drive(guard, script))
+
+
+def test_store_with_a_loose_mode_is_refused(server: Server, tmp_path: Any) -> None:
+    store = tmp_path / "store"
+    store.mkdir(mode=0o755)
+    store.chmod(0o755)
+    with pytest.raises(ValueError, match="0700"):
+        planner_guard(server, store=store)
+    store.chmod(0o700)
+    guard = planner_guard(server, store=store)
+    store.chmod(0o777)  # loosened later: refused at the next save
+
+    async def script(cli: FakeCLI) -> None:
+        answer = await cli.hook("PostToolUse", tool("mcp__drive__roadmap", response=ROADMAP))
+        assert answer["continue"] is False and "0700" in answer["hookSpecificOutput"]["updatedToolOutput"]
+
+    asyncio.run(drive(guard, script))
+    store.chmod(0o700)
+
+
+@pytest.mark.parametrize("how", ["null", "empty", "unreadable"])
+def test_a_transcript_that_cannot_be_read_is_refused(server: Server, tmp_path: Any, how: str) -> None:
+    """The third review's c2.py: a resumed session whose transcript_path is null, empty or unreadable."""
+    path = transcript(tmp_path, with_result=True)
+    given = {"null": None, "empty": "", "unreadable": path}[how]
+    if how == "unreadable":
+        os.chmod(path, 0)
+    try:
+        with ClaudeHooks(planner_guard(server)) as cli:
+            cli.run(cli.hook("UserPromptSubmit", {"prompt": "go", "transcript_path": given}))
+            cli.run(cli.hook("PostToolUse", tool("mcp__drive__roadmap", response=ROADMAP, transcript_path=given)))
+            reason = denied(cli.run(cli.hook("PreToolUse", tool("mcp__slack__post", {"text": "Q3"},
+                                                                transcript_path=given))))
+    finally:
+        os.chmod(path, 0o600)
+    assert reason and "history_unverifiable" in reason
