@@ -2,9 +2,11 @@
 //! streamable HTTP transport.
 //!
 //! Every request is authenticated by the agent's bearer token (and charged
-//! to its rate limit) before rmcp sees it. In `connection` mode each MCP
-//! session is bound to the agent that opened it, and only that agent may use
-//! it. Only tools are offered: no resources, prompts, sampling or
+//! to its rate limit) before rmcp sees it. In both modes each MCP session is
+//! bound to the agent that opened it, and only that agent may use or close
+//! it. Upstream descriptions, titles and schema text are cleaned before
+//! agents see them, and a tool whose schema is over the cap is not offered.
+//! Only tools are offered: no resources, prompts, sampling or
 //! elicitation. The protocol versions offered are those with sessions.
 
 use std::borrow::Cow;
@@ -22,14 +24,12 @@ use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, Stream
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 use serde_json::{Value, json};
 
-use super::{Gateway, HANDOFF_TOOL, RECEIVE_TOOL};
+use super::{Gateway, HANDOFF_TOOL, MAX_SCHEMA_BYTES, RECEIVE_TOOL};
 use crate::serve::{ApiError, BODY_LIMIT, ServeJournal, Server};
 
 const SESSION_HEADER: &str = "mcp-session-id";
-/// Longest upstream tool description passed to agents, in characters.
+/// Longest upstream tool description or title passed to agents, in characters.
 const MAX_DESCRIPTION: usize = 1024;
-/// Largest upstream input schema passed to agents, serialized.
-const MAX_SCHEMA_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 struct Agent(String);
@@ -56,6 +56,38 @@ fn description(text: Option<&str>) -> String {
         .take(MAX_DESCRIPTION)
         .collect();
     clean.trim().to_string()
+}
+
+/// An upstream input schema with every `description` and `title` string in
+/// it cleaned like a description. `None` when it is over the size cap: the
+/// tool is then not offered at all.
+fn clean_schema(schema: &JsonObject) -> Option<JsonObject> {
+    fn walk(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                for (key, v) in map.iter_mut() {
+                    match v {
+                        Value::String(s) if key == "description" || key == "title" => {
+                            *s = description(Some(s));
+                        }
+                        other => walk(other),
+                    }
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(walk),
+            _ => {}
+        }
+    }
+    let fits = serde_json::to_vec(schema).is_ok_and(|b| b.len() <= MAX_SCHEMA_BYTES);
+    if !fits {
+        return None;
+    }
+    let mut value = Value::Object(schema.clone());
+    walk(&mut value);
+    match value {
+        Value::Object(map) => Some(map),
+        _ => None,
+    }
 }
 
 fn builtins() -> Vec<Tool> {
@@ -133,21 +165,19 @@ impl<J: ServeJournal> ServerHandler for Handler<J> {
                 let Some(found) = offered.iter().find(|t| t.name == tool.name) else {
                     continue;
                 };
-                let schema_fits = serde_json::to_vec(&*found.input_schema)
-                    .is_ok_and(|b| b.len() <= MAX_SCHEMA_BYTES);
-                let schema = if schema_fits {
-                    (*found.input_schema).clone()
-                } else {
-                    json!({"type": "object"})
-                        .as_object()
-                        .cloned()
-                        .unwrap_or_default()
+                // A tool whose schema is over the cap is closed: not offered.
+                let Some(schema) = clean_schema(&found.input_schema) else {
+                    continue;
                 };
-                tools.push(Tool::new(
+                let mut offered = Tool::new(
                     tool.exposed.clone(),
                     description(found.description.as_deref()),
                     schema,
-                ));
+                );
+                if let Some(title) = found.title.as_deref() {
+                    offered.title = Some(description(Some(title)));
+                }
+                tools.push(offered);
             }
         }
         Ok(ListToolsResult {
@@ -185,7 +215,10 @@ impl<J: ServeJournal> ServerHandler for Handler<J> {
 }
 
 /// Authenticate, charge the rate limit, and keep each MCP session to the
-/// agent that opened it.
+/// agent that opened it (in both modes: another agent's token can neither
+/// use nor DELETE it). An id the gateway does not know, such as one the
+/// operator ended or one from before a restart, is 404, so the client
+/// initialises again.
 async fn authenticate<J: ServeJournal>(
     State(gateway): State<Arc<Gateway<J>>>,
     mut request: Request,
@@ -225,7 +258,10 @@ async fn authenticate<J: ServeJournal>(
         return ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too_many_sessions",
-            "this agent has the most open gateway sessions allowed; close some, or the operator can end them on the operator page",
+            format!(
+                "this agent has {} open gateway connections, the most allowed; none is ever closed for it, so close some, or the operator can end them on the operator page",
+                super::MAX_CONNECTIONS_PER_AGENT
+            ),
         )
         .into_response();
     }

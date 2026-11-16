@@ -8,12 +8,18 @@
 //! anything the engine does not.
 //!
 //! The rules that make it fail closed:
+//! - What is checked is exactly what is forwarded. A call may carry only the
+//!   arguments its tool lists (`arguments`); anything else is refused. The
+//!   output an action is checked as is the canonical JSON of every argument
+//!   it forwards.
 //! - A read result is returned only after it is registered as its source and
 //!   recorded in the session (`SessionCarry`); otherwise it is withheld.
 //! - An action is forwarded only on an `allow` from a completed check of an
-//!   output derived from everything the session carries. A session that has
-//!   read nothing is refused (`nothing_read`) unless the tool says
-//!   `allow_without_reads: true`; then it is forwarded unchecked and logged.
+//!   output derived from everything the session carries. An allow that an
+//!   approval gave uses the approval up: one approval releases one call.
+//! - A session that has read nothing is refused (`nothing_read`) unless the
+//!   tool says `allow_without_reads: true` (agent mode only); then it is
+//!   forwarded unchecked and logged.
 //! - A tool that is not listed, or whose source the agent may not use, gets
 //!   the same "not available" error and the upstream is not called.
 //! - Upstream failures of any kind are short tool errors with no detail.
@@ -24,7 +30,7 @@ mod handler;
 pub mod handoff;
 mod upstream;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -39,15 +45,24 @@ use self::config::{Config, Kind, SessionMode, Tool, UNCLASSIFIED};
 use self::handoff::{LIFETIME_SECONDS, Payload, Signer};
 use self::upstream::{CallError, Upstreams};
 use super::{
-    ApiError, CheckRequest, GatewayView, OutputRequest, ServeJournal, Server, SourceRequest,
-    sha256_hex,
+    ApiError, CheckRequest, ConnectionView, GatewayView, OutputRequest, ServeJournal, Server,
+    SourceRequest, sha256_hex,
 };
 
 /// The gateway's own tools, exposed to every agent.
 pub const HANDOFF_TOOL: &str = "trustgraph__handoff";
 pub const RECEIVE_TOOL: &str = "trustgraph__receive";
-/// Live MCP connections per agent in `connection` mode.
+/// Live MCP connections per agent, in both modes. At the cap a new
+/// connection is refused; none is ever evicted or idled out.
 pub const MAX_CONNECTIONS_PER_AGENT: usize = 64;
+/// Calls held for approval whose arguments are kept, in memory only.
+pub const MAX_HELD_CALLS: usize = 256;
+/// Characters of each argument value shown to the operator.
+pub const SHOWN_CHARS: usize = 2000;
+/// Largest upstream input schema, serialized; a tool with a larger one is closed.
+pub const MAX_SCHEMA_BYTES: usize = 64 * 1024;
+/// Sessions that may not act, kept across restarts (agent mode).
+const BLOCKED_FILE: &str = "gateway.blocked";
 
 /// A tool error as the agent sees it.
 #[derive(Debug, Clone)]
@@ -79,7 +94,7 @@ impl ToolFail {
         Self::new(
             "tool_misconfigured",
             format!(
-                "`{}` names a source or action the active policy does not have, so it is closed; the operator must fix gateway.yaml or the policy",
+                "`{}` does not match the active policy or what its upstream publishes, so it is closed; the operator must fix gateway.yaml, the policy or the upstream",
                 tool.exposed
             ),
         )
@@ -113,20 +128,45 @@ impl From<ApiError> for ToolFail {
     }
 }
 
-/// One live MCP connection in `connection` mode.
+/// One live MCP connection.
 #[derive(Debug, Clone)]
 struct Conn {
+    /// The operator page's handle; not the MCP session id.
+    id: String,
     agent: String,
-    mcp: String,
+    /// The gateway session it serves: `conn:…` or `agent:<name>`.
+    session: String,
     started_at: u64,
+    last_active: u64,
 }
 
 #[derive(Default)]
 struct Connections {
-    /// MCP session id -> gateway session id.
-    by_mcp: HashMap<String, String>,
-    /// Gateway session id -> connection.
-    sessions: BTreeMap<String, Conn>,
+    /// MCP session id -> connection.
+    by_mcp: HashMap<String, Conn>,
+}
+
+impl Connections {
+    fn live_session(&self, session: &str) -> bool {
+        self.by_mcp.values().any(|c| c.session == session)
+    }
+}
+
+/// A call held for approval: what it would forward. Memory only.
+#[derive(Debug, Clone)]
+struct HeldCall {
+    tool: String,
+    action: String,
+    content: Option<String>,
+    arguments: JsonObject,
+    sha256: String,
+}
+
+#[derive(Default)]
+struct Held {
+    calls: BTreeMap<String, HeldCall>,
+    /// Decision ids, oldest first.
+    order: VecDeque<String>,
 }
 
 /// What the server's operator routes see of the gateway.
@@ -134,12 +174,114 @@ pub(crate) struct Shared {
     config: Config,
     conns: Mutex<Connections>,
     manager: Arc<LocalSessionManager>,
+    held: Mutex<Held>,
+    /// Sessions that refused a hand-off and may not act until ended.
+    blocked: Mutex<BTreeSet<String>>,
+    blocked_path: PathBuf,
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 impl Shared {
     fn conns(&self) -> std::sync::MutexGuard<'_, Connections> {
-        self.conns.lock().unwrap_or_else(|p| p.into_inner())
+        lock(&self.conns)
     }
+
+    fn is_blocked(&self, session: &str) -> bool {
+        lock(&self.blocked).contains(session)
+    }
+
+    /// Mark `session` as unable to act, kept across restarts.
+    fn block(&self, session: &str) {
+        let mut blocked = lock(&self.blocked);
+        if blocked.insert(session.to_string()) {
+            save_blocked(&self.blocked_path, &blocked);
+        }
+    }
+
+    fn unblock(&self, session: &str) -> bool {
+        let mut blocked = lock(&self.blocked);
+        let was = blocked.remove(session);
+        if was {
+            save_blocked(&self.blocked_path, &blocked);
+        }
+        was
+    }
+
+    fn hold(&self, decision: &str, call: HeldCall) {
+        let mut held = lock(&self.held);
+        if held.calls.insert(decision.to_string(), call).is_none() {
+            held.order.push_back(decision.to_string());
+        }
+        while held.order.len() > MAX_HELD_CALLS {
+            if let Some(old) = held.order.pop_front() {
+                held.calls.remove(&old);
+            }
+        }
+    }
+
+    fn release(&self, decision: &str) {
+        let mut held = lock(&self.held);
+        if held.calls.remove(decision).is_some() {
+            held.order.retain(|d| d != decision);
+        }
+    }
+
+    /// Close an MCP session in the background.
+    fn close_mcp(&self, mcp: &str) {
+        let manager = self.manager.clone();
+        let mcp = mcp.to_string();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                use rmcp::transport::streamable_http_server::session::SessionManager;
+                let _ = manager.close_session(&mcp.into()).await;
+            });
+        }
+    }
+}
+
+fn load_blocked(path: &Path, mode: SessionMode) -> BTreeSet<String> {
+    let set: BTreeSet<String> = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    // Connection sessions end with the process; agent sessions survive it.
+    set.into_iter()
+        .filter(|s| mode == SessionMode::Agent && s.starts_with("agent:"))
+        .collect()
+}
+
+fn save_blocked(path: &Path, blocked: &BTreeSet<String>) {
+    let text = serde_json::to_vec(blocked).unwrap_or_default();
+    let tmp = path.with_extension("tmp");
+    let written = std::fs::write(&tmp, text).and_then(|()| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(&tmp, path)
+    });
+    if let Err(e) = written {
+        eprintln!(
+            "trustgraph gateway: cannot write {}: {e}; a blocked session is still blocked until this process ends",
+            path.display()
+        );
+    }
+}
+
+/// An argument value as the operator sees it: its text when it is a
+/// string, else its canonical JSON; at most `SHOWN_CHARS` characters.
+fn shown_argument(name: &str, value: &Value) -> Value {
+    let text = match value {
+        Value::String(s) => s.clone(),
+        other => serde_json::to_string(&canonical(other)).unwrap_or_default(),
+    };
+    let total = text.chars().count();
+    let shown: String = text.chars().take(SHOWN_CHARS).collect();
+    json!({"name": name, "value": shown, "more": total.saturating_sub(SHOWN_CHARS)})
 }
 
 impl GatewayView for Shared {
@@ -154,42 +296,96 @@ impl GatewayView for Shared {
             .collect()
     }
 
-    fn connections(&self) -> Vec<(String, String, u64)> {
-        self.conns()
-            .sessions
-            .iter()
-            .map(|(id, c)| (id.clone(), c.agent.clone(), c.started_at))
+    fn connections(&self) -> Vec<ConnectionView> {
+        let mut out: Vec<ConnectionView> = self
+            .conns()
+            .by_mcp
+            .values()
+            .map(|c| ConnectionView {
+                connection: c.id.clone(),
+                agent: c.agent.clone(),
+                session: c.session.clone(),
+                started_at: c.started_at,
+                last_active: c.last_active,
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            (&a.agent, a.started_at, &a.connection).cmp(&(&b.agent, b.started_at, &b.connection))
+        });
+        out
+    }
+
+    fn at_cap(&self) -> Vec<String> {
+        let mut count: BTreeMap<&str, usize> = BTreeMap::new();
+        let conns = self.conns();
+        for c in conns.by_mcp.values() {
+            *count.entry(c.agent.as_str()).or_default() += 1;
+        }
+        count
+            .into_iter()
+            .filter(|(_, n)| *n >= MAX_CONNECTIONS_PER_AGENT)
+            .map(|(agent, _)| agent.to_string())
             .collect()
     }
 
     fn close(&self, session: &str) -> bool {
-        let conn = {
+        let closed: Vec<String> = {
             let mut conns = self.conns();
-            let conn = conns.sessions.remove(session);
-            if let Some(c) = &conn {
-                conns.by_mcp.remove(&c.mcp);
+            let mcps: Vec<String> = conns
+                .by_mcp
+                .iter()
+                .filter(|(_, c)| c.session == session)
+                .map(|(m, _)| m.clone())
+                .collect();
+            for mcp in &mcps {
+                conns.by_mcp.remove(mcp);
             }
-            conn
+            mcps
         };
-        let Some(conn) = conn else {
-            return false;
-        };
-        self.close_mcp(&conn.mcp);
-        true
-    }
-}
-
-impl Shared {
-    /// Close an MCP session in the background.
-    fn close_mcp(&self, mcp: &str) {
-        let manager = self.manager.clone();
-        let mcp = mcp.to_string();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                use rmcp::transport::streamable_http_server::session::SessionManager;
-                let _ = manager.close_session(&mcp.into()).await;
-            });
+        for mcp in &closed {
+            self.close_mcp(mcp);
         }
+        let unblocked = self.unblock(session);
+        !closed.is_empty() || unblocked
+    }
+
+    fn close_connection(&self, connection: &str) -> bool {
+        let mcp = {
+            let mut conns = self.conns();
+            let mcp = conns
+                .by_mcp
+                .iter()
+                .find(|(_, c)| c.id == connection)
+                .map(|(m, _)| m.clone());
+            if let Some(mcp) = &mcp {
+                conns.by_mcp.remove(mcp);
+            }
+            mcp
+        };
+        match mcp {
+            Some(mcp) => {
+                self.close_mcp(&mcp);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn held_call(&self, decision: &str) -> Option<Value> {
+        let held = lock(&self.held);
+        let call = held.calls.get(decision)?;
+        let arguments: Vec<Value> = canonical_map(&call.arguments)
+            .iter()
+            .map(|(name, value)| shown_argument(name, value))
+            .collect();
+        Some(json!({
+            "tool": call.tool,
+            "action": call.action,
+            "content": call.content,
+            "held": true,
+            "arguments": arguments,
+            "sha256": call.sha256,
+        }))
     }
 }
 
@@ -204,41 +400,110 @@ pub struct Gateway<J: ServeJournal> {
 /// always hash the same.
 fn canonical(value: &Value) -> Value {
     match value {
-        Value::Object(map) => {
-            let sorted: BTreeMap<&String, Value> =
-                map.iter().map(|(k, v)| (k, canonical(v))).collect();
-            Value::Object(sorted.into_iter().map(|(k, v)| (k.clone(), v)).collect())
-        }
+        Value::Object(map) => Value::Object(
+            canonical_map(map)
+                .into_iter()
+                .map(|(k, v)| (k.clone(), v))
+                .collect(),
+        ),
         Value::Array(items) => Value::Array(items.iter().map(canonical).collect()),
         other => other.clone(),
     }
 }
 
-/// The output content of an action call: the named argument (its text when
-/// it is a string), or all arguments.
-fn content_bytes(arguments: &JsonObject, name: Option<&str>) -> Result<Vec<u8>, ToolFail> {
-    match name {
-        None => Ok(
-            serde_json::to_vec(&canonical(&Value::Object(arguments.clone()))).unwrap_or_default(),
-        ),
-        Some(name) => match arguments.get(name) {
-            Some(Value::String(text)) => Ok(text.as_bytes().to_vec()),
-            Some(other) => Ok(serde_json::to_vec(&canonical(other)).unwrap_or_default()),
-            None => Err(ToolFail::new(
-                "invalid_arguments",
-                format!(
-                    "the call has no `{name}` argument, which is its output; it was not forwarded"
-                ),
-            )),
-        },
+fn canonical_map(map: &JsonObject) -> BTreeMap<&String, Value> {
+    map.iter().map(|(k, v)| (k, canonical(v))).collect()
+}
+
+/// The output of an action call: the canonical JSON (sorted keys, no
+/// whitespace) of every argument it forwards.
+pub fn canonical_arguments(arguments: &JsonObject) -> Vec<u8> {
+    // Written by hand so key order never depends on serde_json's features.
+    fn write(value: &Value, out: &mut String) {
+        match value {
+            Value::Object(map) => {
+                out.push('{');
+                let sorted: BTreeMap<&String, &Value> = map.iter().collect();
+                for (i, (k, v)) in sorted.into_iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&Value::String(k.clone()).to_string());
+                    out.push(':');
+                    write(v, out);
+                }
+                out.push('}');
+            }
+            Value::Array(items) => {
+                out.push('[');
+                for (i, v) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write(v, out);
+                }
+                out.push(']');
+            }
+            other => out.push_str(&other.to_string()),
+        }
     }
+    let mut out = String::new();
+    write(&Value::Object(arguments.clone()), &mut out);
+    out.into_bytes()
 }
 
 /// What a checked action call may do.
 enum Forward {
-    Checked,
+    /// Allowed; `Some(decision)` when an approval allowed it and was used up.
+    Checked(Option<String>),
     /// `allow_without_reads` and the session has read nothing.
     Unchecked,
+}
+
+/// Problems of one listed tool against the tool its upstream publishes,
+/// and the upstream arguments it does not forward.
+pub fn schema_report(
+    tool: &Tool,
+    published: Option<&rmcp::model::Tool>,
+) -> (Vec<String>, Vec<String>) {
+    let mut problems = Vec::new();
+    let Some(published) = published else {
+        problems.push(format!(
+            "tools.{}: the upstream does not offer a tool named `{}`",
+            tool.key, tool.name
+        ));
+        return (problems, Vec::new());
+    };
+    let size = serde_json::to_vec(&*published.input_schema).map_or(usize::MAX, |b| b.len());
+    if size > MAX_SCHEMA_BYTES {
+        problems.push(format!(
+            "tools.{}: the upstream's input schema is {size} bytes, over the {MAX_SCHEMA_BYTES}-byte cap",
+            tool.key
+        ));
+        return (problems, Vec::new());
+    }
+    let Some(properties) = published
+        .input_schema
+        .get("properties")
+        .and_then(Value::as_object)
+    else {
+        return (problems, Vec::new());
+    };
+    for name in &tool.arguments {
+        if !properties.contains_key(name) {
+            problems.push(format!(
+                "tools.{}.arguments: `{name}` is not an argument the upstream tool takes (it takes: {})",
+                tool.key,
+                properties.keys().cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
+    }
+    let unforwarded = properties
+        .keys()
+        .filter(|k| !tool.arguments.contains(*k))
+        .cloned()
+        .collect();
+    (problems, unforwarded)
 }
 
 /// Build the gateway over a server: check the config against the active
@@ -268,13 +533,21 @@ pub fn attach<J: ServeJournal>(
     if config.session == SessionMode::Connection {
         // A session must not end because it idled: a client that quietly
         // reconnected would shed what it read. Connections end when the
-        // client closes them, the operator ends them, or on restart.
+        // client closes them, the operator ends them, or on restart. (In
+        // agent mode an idle connection may close: the session is the
+        // agent's and is kept.)
         manager.session_config.keep_alive = None;
     }
+    let blocked_path = server.settings.state_dir.join(BLOCKED_FILE);
+    let blocked = load_blocked(&blocked_path, config.session);
+    save_blocked(&blocked_path, &blocked);
     let shared = Arc::new(Shared {
         config,
         conns: Mutex::new(Connections::default()),
         manager: Arc::new(manager),
+        held: Mutex::new(Held::default()),
+        blocked: Mutex::new(blocked),
+        blocked_path,
     });
     if server
         .gateway
@@ -320,8 +593,10 @@ fn end_stale_sessions<J: ServeJournal>(
     Ok(())
 }
 
-/// Every two seconds: a connection whose MCP session rmcp closed (the
-/// client's DELETE, or a dropped connection) ends its gateway session.
+/// Every two seconds: forget connections whose MCP session rmcp closed (the
+/// client's DELETE, or a dropped connection), and end every `conn:` session
+/// that no live connection serves, including one a call still in flight
+/// would otherwise have left behind.
 async fn reconcile<J: ServeJournal>(gateway: std::sync::Weak<Gateway<J>>) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -337,35 +612,13 @@ async fn reconcile<J: ServeJournal>(gateway: std::sync::Weak<Gateway<J>>) {
             .keys()
             .map(|k| k.to_string())
             .collect();
-        let closed: Vec<String> = {
-            let mut conns = gateway.shared.conns();
-            let gone: Vec<(String, String)> = conns
-                .by_mcp
-                .iter()
-                .filter(|(mcp, _)| !live.contains(*mcp))
-                .map(|(m, s)| (m.clone(), s.clone()))
-                .collect();
-            for (mcp, session) in &gone {
-                conns.by_mcp.remove(mcp);
-                conns.sessions.remove(session);
-            }
-            gone.into_iter().map(|(_, s)| s).collect()
-        };
-        if closed.is_empty() {
-            continue;
-        }
-        let server = gateway.server.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            let Ok(mut rt) = server.lock() else {
-                return;
-            };
-            for session in closed {
-                if rt.engine().session(&session).is_some() {
-                    let _ = server.handle(&mut rt, Event::EndSession { session });
-                }
-            }
-        })
-        .await;
+        gateway
+            .shared
+            .conns()
+            .by_mcp
+            .retain(|mcp, _| live.contains(mcp));
+        let g = gateway.clone();
+        let _ = tokio::task::spawn_blocking(move || g.reap()).await;
     }
 }
 
@@ -376,6 +629,27 @@ impl<J: ServeJournal> Gateway<J> {
 
     pub fn config(&self) -> &Config {
         &self.shared.config
+    }
+
+    /// End every `conn:` engine session no live connection serves. Under
+    /// the runtime lock, then the connection table, as `carry` takes them,
+    /// so a session cannot gain reads after it is judged gone.
+    fn reap(&self) {
+        let Ok(mut rt) = self.server.lock() else {
+            return;
+        };
+        let orphans: Vec<String> = {
+            let conns = self.shared.conns();
+            rt.engine()
+                .sessions()
+                .into_iter()
+                .map(|s| s.session)
+                .filter(|s| s.starts_with("conn:") && !conns.live_session(s))
+                .collect()
+        };
+        for session in orphans {
+            let _ = self.server.handle(&mut rt, Event::EndSession { session });
+        }
     }
 
     /// Run `f` on a blocking thread: the runtime lock is never held across an await.
@@ -394,40 +668,41 @@ impl<J: ServeJournal> Gateway<J> {
     /// Bind a new MCP session to the agent that opened it. `false` when the
     /// agent already has the most live connections allowed.
     fn bind(&self, mcp: &str, agent: &str) -> bool {
-        if self.shared.config.session != SessionMode::Connection {
-            return true;
-        }
-        let started_at = self.server.time.now();
+        let now = self.server.time.now();
         let mut conns = self.shared.conns();
-        let open = conns.sessions.values().filter(|c| c.agent == agent).count();
+        let open = conns.by_mcp.values().filter(|c| c.agent == agent).count();
         if open >= MAX_CONNECTIONS_PER_AGENT {
             return false;
         }
-        let session = format!("conn:{}", &super::auth::random_secret()[..24]);
-        conns.by_mcp.insert(mcp.to_string(), session.clone());
-        conns.sessions.insert(
-            session,
+        let session = match self.shared.config.session {
+            SessionMode::Connection => format!("conn:{}", &super::auth::random_secret()[..24]),
+            SessionMode::Agent => format!("agent:{agent}"),
+        };
+        conns.by_mcp.insert(
+            mcp.to_string(),
             Conn {
+                id: format!("c-{}", &super::auth::random_secret()[..16]),
                 agent: agent.to_string(),
-                mcp: mcp.to_string(),
-                started_at,
+                session,
+                started_at: now,
+                last_active: now,
             },
         );
         true
     }
 
-    /// True when `mcp` may be used by `agent`: in `connection` mode it must
-    /// be a session this agent opened.
+    /// True when `mcp` is a live connection this agent opened; then its
+    /// last activity is now.
     fn may_use(&self, mcp: &str, agent: &str) -> bool {
-        if self.shared.config.session != SessionMode::Connection {
-            return true;
+        let now = self.server.time.now();
+        let mut conns = self.shared.conns();
+        match conns.by_mcp.get_mut(mcp) {
+            Some(c) if c.agent == agent => {
+                c.last_active = now;
+                true
+            }
+            _ => false,
         }
-        let conns = self.shared.conns();
-        conns
-            .by_mcp
-            .get(mcp)
-            .and_then(|s| conns.sessions.get(s))
-            .is_some_and(|c| c.agent == agent)
     }
 
     /// The gateway session of one call.
@@ -443,13 +718,24 @@ impl<J: ServeJournal> Gateway<J> {
                 };
                 let mcp = mcp.ok_or_else(missing)?;
                 let conns = self.shared.conns();
-                let session = conns.by_mcp.get(mcp).ok_or_else(missing)?;
-                match conns.sessions.get(session) {
-                    Some(c) if c.agent == agent => Ok(session.clone()),
+                match conns.by_mcp.get(mcp) {
+                    Some(c) if c.agent == agent => Ok(c.session.clone()),
                     _ => Err(missing()),
                 }
             }
         }
+    }
+
+    /// A `conn:` session is live while a connection serves it; agent
+    /// sessions always are. Called under the runtime lock.
+    fn session_live(&self, session: &str) -> Result<(), ToolFail> {
+        if session.starts_with("conn:") && !self.shared.conns().live_session(session) {
+            return Err(ToolFail::new(
+                "session_ended",
+                "this connection was closed while the call was in flight; nothing was recorded and the result is withheld",
+            ));
+        }
+        Ok(())
     }
 
     // ----- one tool call -----
@@ -481,9 +767,16 @@ impl<J: ServeJournal> Gateway<J> {
                             ));
                         }
                     };
+                    let shared = self.shared.clone();
+                    let receiver = session.clone();
                     let value = self
                         .blocking(move |g| g.receive(&agent, &session, &token))
-                        .await?;
+                        .await
+                        .inspect_err(|_| {
+                            // Refusing a hand-off must never leave the
+                            // receiver freer than accepting it.
+                            shared.block(&receiver);
+                        })?;
                     Ok(structured(value))
                 }
                 _ => {
@@ -494,12 +787,44 @@ impl<J: ServeJournal> Gateway<J> {
                         .get(&name)
                         .cloned()
                         .ok_or_else(ToolFail::not_available)?;
+                    config::check_arguments(&tool.arguments, &arguments).map_err(|why| {
+                        ToolFail::new(
+                            "invalid_arguments",
+                            format!("{why}; the call was not forwarded"),
+                        )
+                    })?;
+                    self.published_ok(&tool).await?;
                     self.call_tool(agent, session, tool, arguments).await
                 }
             }
         }
         .await;
         outcome.unwrap_or_else(|fail| fail.result())
+    }
+
+    /// The upstream still publishes `tool`, with a schema under the cap that
+    /// takes every argument the config forwards.
+    async fn published_ok(&self, tool: &Tool) -> Result<(), ToolFail> {
+        let upstream = self
+            .upstreams
+            .get(&tool.upstream)
+            .ok_or_else(ToolFail::not_available)?;
+        let published = upstream
+            .tools()
+            .await
+            .map_err(|e| ToolFail::upstream(e, &tool.upstream))?;
+        let found = published.iter().find(|t| t.name == tool.name);
+        if found.is_none() {
+            return Err(ToolFail::not_available());
+        }
+        let (problems, _) = schema_report(tool, found);
+        if !problems.is_empty() {
+            for p in &problems {
+                eprintln!("trustgraph gateway: {p}; the tool is closed");
+            }
+            return Err(ToolFail::misconfigured(tool));
+        }
+        Ok(())
     }
 
     async fn call_tool(
@@ -541,26 +866,37 @@ impl<J: ServeJournal> Gateway<J> {
                         "this call matches no rule of the gateway config, so it is blocked; it was not forwarded",
                     ));
                 };
-                let sha = sha256_hex(&content_bytes(&arguments, rule.content.as_deref())?);
+                if let Some(name) = &rule.content
+                    && !arguments.contains_key(name)
+                {
+                    return Err(ToolFail::new(
+                        "invalid_arguments",
+                        format!(
+                            "the call has no `{name}` argument, which is its content; it was not forwarded"
+                        ),
+                    ));
+                }
+                let held = HeldCall {
+                    tool: tool.exposed.clone(),
+                    action: rule.action.clone(),
+                    content: rule.content.clone(),
+                    sha256: sha256_hex(&canonical_arguments(&arguments)),
+                    arguments: arguments.clone(),
+                };
                 let allow_without_reads = *allow_without_reads;
                 let tool2 = tool.clone();
                 let forward = self
                     .blocking(move |g| {
-                        g.decide(
-                            &agent,
-                            &session,
-                            &tool2,
-                            &rule.action,
-                            sha,
-                            allow_without_reads,
-                        )
+                        g.decide(&agent, &session, &tool2, held, allow_without_reads)
                     })
                     .await?;
-                if let Forward::Unchecked = forward {
-                    eprintln!(
+                match forward {
+                    Forward::Unchecked => eprintln!(
                         "trustgraph gateway: `{}` was called with nothing read and forwarded without a check (allow_without_reads)",
                         tool.exposed
-                    );
+                    ),
+                    Forward::Checked(Some(decision)) => self.shared.release(&decision),
+                    Forward::Checked(None) => {}
                 }
                 Ok(self.forward(&tool, arguments).await?.0)
             }
@@ -677,6 +1013,7 @@ impl<J: ServeJournal> Gateway<J> {
     /// already carries (the lineage, not the bytes, decides).
     fn carry(&self, agent: &str, session: &str, artifacts: Vec<String>) -> Result<(), ToolFail> {
         let mut rt = self.server.lock()?;
+        self.session_live(session)?;
         let engine = rt.engine();
         let mut carried: BTreeSet<String> = engine
             .session(session)
@@ -711,20 +1048,27 @@ impl<J: ServeJournal> Gateway<J> {
         }
     }
 
-    /// Check an action call: record its content as an output of everything
-    /// the session carries, then check it. `Ok` only on allow (or, with
-    /// `allow_without_reads`, when the session has read nothing).
+    /// Check an action call: record the canonical JSON of its arguments as
+    /// an output of everything the session carries, then check it. `Ok`
+    /// only on allow (or, with `allow_without_reads`, when the session has
+    /// read nothing). An allow from an approval uses the approval up.
     fn decide(
         &self,
         agent: &str,
         session: &str,
         tool: &Tool,
-        action: &str,
-        sha256: String,
+        call: HeldCall,
         allow_without_reads: bool,
     ) -> Result<Forward, ToolFail> {
+        if self.shared.is_blocked(session) {
+            return Err(ToolFail::new(
+                "session_blocked",
+                "this session was handed a token it refused, so it may not act; the operator must end the session on the operator page",
+            ));
+        }
         let carried = {
             let rt = self.server.lock()?;
+            self.session_live(session)?;
             let policy = rt
                 .engine()
                 .policy()
@@ -753,7 +1097,7 @@ impl<J: ServeJournal> Gateway<J> {
                 OutputRequest {
                     inputs: carried,
                     step: format!("gateway:{}", tool.exposed),
-                    sha256: Some(sha256),
+                    sha256: Some(call.sha256.clone()),
                     content: None,
                 },
             )
@@ -768,11 +1112,12 @@ impl<J: ServeJournal> Gateway<J> {
             .as_str()
             .ok_or_else(|| ToolFail::new("internal", "no artifact id"))?
             .to_string();
-        let decision = self.server.check(
+        let action = call.action.clone();
+        let decision = self.server.check_once(
             agent,
             CheckRequest {
                 artifact,
-                action: action.to_string(),
+                action: action.clone(),
                 recipients: None,
             },
         )?;
@@ -783,15 +1128,20 @@ impl<J: ServeJournal> Gateway<J> {
         let reason = decision["reason"].as_str().unwrap_or_default().to_string();
         let extra = Some(json!({"decision": id, "verdict": decision["verdict"].clone()}));
         match decision["verdict"].as_str() {
-            Some("allow") => Ok(Forward::Checked),
-            Some("needs_approval") => Err(ToolFail {
-                code: "needs_approval".into(),
-                message: format!(
-                    "`{action}` was not forwarded: {reason}. It is held for approval as decision {}; retry the same call after a reviewer approves it",
-                    id.get(..12).unwrap_or(&id)
-                ),
-                extra,
-            }),
+            Some("allow") => Ok(Forward::Checked(
+                (decision["consumed"] == true).then_some(id),
+            )),
+            Some("needs_approval") => {
+                self.shared.hold(&id, call);
+                Err(ToolFail {
+                    code: "needs_approval".into(),
+                    message: format!(
+                        "`{action}` was not forwarded: {reason}. It is held for approval as decision {}; an approval releases one call: retry exactly the same call after a reviewer approves it",
+                        id.get(..12).unwrap_or(&id)
+                    ),
+                    extra,
+                })
+            }
             _ => Err(ToolFail {
                 code: "denied".into(),
                 message: format!("`{action}` was not forwarded: {reason}"),
@@ -831,7 +1181,7 @@ impl<J: ServeJournal> Gateway<J> {
         let invalid = || {
             ToolFail::new(
                 "invalid_handoff",
-                "that is not a valid hand-off token from this gateway, or it has expired",
+                "that is not a valid hand-off token from this gateway, or it has expired; this session may no longer act until the operator ends it",
             )
         };
         let payload = self.signer.verify(token).ok_or_else(invalid)?;
@@ -862,7 +1212,7 @@ impl<J: ServeJournal> Gateway<J> {
                 return Err(ToolFail::new(
                     "not_cleared",
                     format!(
-                        "refused: this hand-off carries `{name}`, which this agent is not cleared for"
+                        "refused: this hand-off carries `{name}`, which this agent is not cleared for; this session may no longer act until the operator ends it"
                     ),
                 ));
             }
@@ -870,6 +1220,35 @@ impl<J: ServeJournal> Gateway<J> {
         };
         self.carry(agent, session, payload.artifacts)?;
         Ok(json!({"received": true, "carries": sources}))
+    }
+
+    /// At start: every reachable upstream's tools against the config. The
+    /// problems; unreachable upstreams are reported on stderr and checked
+    /// again on every call.
+    pub async fn verify_upstreams(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        for (name, upstream) in self.upstreams.iter() {
+            let published = match upstream.tools().await {
+                Ok(tools) => tools,
+                Err(_) => {
+                    eprintln!(
+                        "trustgraph gateway: upstream `{name}` is not reachable at start; its tools' arguments are checked when it connects, and the tools stay closed until they match"
+                    );
+                    continue;
+                }
+            };
+            for tool in self
+                .shared
+                .config
+                .tools
+                .values()
+                .filter(|t| &t.upstream == name)
+            {
+                let found = published.iter().find(|t| t.name == tool.name);
+                problems.extend(schema_report(tool, found).0);
+            }
+        }
+        problems
     }
 }
 
@@ -910,6 +1289,9 @@ pub async fn main(options: super::Options, config_path: PathBuf, port: u16) -> i
             return 1;
         }
     };
+    for warning in config::warnings(&config) {
+        eprintln!("warning: {warning}");
+    }
     let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
         Ok(l) => l,
         Err(e) => {
@@ -939,6 +1321,17 @@ pub async fn main(options: super::Options, config_path: PathBuf, port: u16) -> i
             return 1;
         }
     };
+    let problems = gateway.verify_upstreams().await;
+    if !problems.is_empty() {
+        eprintln!(
+            "error: {} does not match what its upstreams publish:",
+            config_path.display()
+        );
+        for p in problems {
+            eprintln!("  {p}");
+        }
+        return 1;
+    }
     if let Err(code) = super::banner(&server, port, "TrustGraph gateway", "/gateway/mcp") {
         return code;
     }
@@ -951,8 +1344,9 @@ pub async fn main(options: super::Options, config_path: PathBuf, port: u16) -> i
 }
 
 /// `trustgraph gateway check`: validate `gateway.yaml` against a policy and
-/// say in plain English what it does. Returns the exit code.
-pub fn check(config_path: &Path, policy_path: &Path) -> i32 {
+/// say in plain English what it does. Upstreams whose variables are set
+/// here are contacted to check argument names. Returns the exit code.
+pub async fn check(config_path: &Path, policy_path: &Path) -> i32 {
     let config = match load_config(config_path) {
         Ok(c) => c,
         Err(problems) => {
@@ -981,10 +1375,21 @@ pub fn check(config_path: &Path, policy_path: &Path) -> i32 {
         );
         return 1;
     };
-    let problems = config::check_against(&config, &policy);
+    let mut problems: Vec<String> = config::check_against(&config, &policy)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let (published, contact) = contact_upstreams(&config).await;
+    for tool in config.tools.values() {
+        if let Some(Some(tools)) = published.get(&tool.upstream) {
+            let found = tools.iter().find(|t| t.name == tool.name);
+            problems.extend(schema_report(tool, found).0);
+        }
+    }
+    problems.extend(contact.problems);
     if !problems.is_empty() {
         println!(
-            "{} does not match {} ({} problem(s)):",
+            "{} does not match {} or its upstreams ({} problem(s)):",
             config_path.display(),
             policy_path.display(),
             problems.len()
@@ -994,20 +1399,82 @@ pub fn check(config_path: &Path, policy_path: &Path) -> i32 {
         }
         return 1;
     }
-    for line in summary(&config, &policy) {
+    for line in summary(&config, &policy, &published) {
         println!("{line}");
     }
-    let missing: Vec<String> = config::env_names(&config)
-        .into_iter()
-        .filter(|n| std::env::var_os(n).is_none())
-        .collect();
-    if !missing.is_empty() {
+    for warning in config::warnings(&config) {
+        println!("warning: {warning}");
+    }
+    for line in contact.notes {
+        println!("{line}");
+    }
+    if !contact.missing.is_empty() {
         println!(
             "warning: not set here, and required where the gateway runs: {}",
-            missing.join(", ")
+            contact.missing.join(", ")
         );
     }
     0
+}
+
+#[derive(Default)]
+struct Contact {
+    problems: Vec<String>,
+    notes: Vec<String>,
+    missing: Vec<String>,
+}
+
+/// The tools of every upstream that can be reached from here (by name;
+/// `None` when it was not contacted), with what kept the others out.
+async fn contact_upstreams(
+    config: &Config,
+) -> (BTreeMap<String, Option<Vec<rmcp::model::Tool>>>, Contact) {
+    let mut contact = Contact {
+        missing: config::env_names(config)
+            .into_iter()
+            .filter(|n| std::env::var_os(n).is_none())
+            .collect(),
+        ..Contact::default()
+    };
+    let mut reachable = config.clone();
+    reachable.upstreams.retain(|name, upstream| {
+        let names: Vec<String> = match upstream {
+            config::Upstream::Http { headers, .. } => headers,
+            config::Upstream::Stdio { env, .. } => env,
+        }
+        .iter()
+        .flat_map(|(_, t)| t.names().map(str::to_string).collect::<Vec<_>>())
+        .collect();
+        let ready = names.iter().all(|n| std::env::var_os(n).is_some());
+        if !ready {
+            contact.notes.push(format!(
+                "note: upstream `{name}` was not contacted (its variables are not set here), so its argument names were not checked"
+            ));
+        }
+        ready
+    });
+    let mut published: BTreeMap<String, Option<Vec<rmcp::model::Tool>>> =
+        config.upstreams.keys().map(|n| (n.clone(), None)).collect();
+    let lookup = |name: &str| std::env::var(name).ok();
+    let upstreams = match upstream::resolve(&reachable, &lookup) {
+        Ok(u) => u,
+        Err(problems) => {
+            contact.problems.extend(problems);
+            return (published, contact);
+        }
+    };
+    for (name, upstream) in upstreams.iter() {
+        match upstream.tools().await {
+            Ok(tools) => {
+                published.insert(name.clone(), Some(tools));
+            }
+            Err(e) => contact.notes.push(format!(
+                "note: upstream `{name}` could not be contacted ({}), so its argument names were not checked",
+                e.code()
+            )),
+        }
+    }
+    (published, contact)
 }
 
 fn people(names: &BTreeSet<String>) -> String {
@@ -1030,14 +1497,27 @@ fn when_text(when: &[config::Matcher]) -> String {
     }
 }
 
-/// The plain-English summary `gateway check` prints.
-pub fn summary(config: &Config, policy: &Policy) -> Vec<String> {
+fn names(set: &BTreeSet<String>) -> String {
+    if set.is_empty() {
+        "none".into()
+    } else {
+        set.iter().cloned().collect::<Vec<_>>().join(", ")
+    }
+}
+
+/// The plain-English summary `gateway check` prints. `published` holds the
+/// tools of each upstream that was contacted.
+pub fn summary(
+    config: &Config,
+    policy: &Policy,
+    published: &BTreeMap<String, Option<Vec<rmcp::model::Tool>>>,
+) -> Vec<String> {
     let mut lines = vec![format!(
         "Sessions: {} ({}).",
         config.session.as_str(),
         match config.session {
             SessionMode::Connection =>
-                "each MCP connection is one session; it assumes the host opens a new connection per task and the agent cannot reconnect at will",
+                "each MCP connection is one session; it assumes the host opens a new connection per task with a fresh agent context, and that the agent cannot reconnect at will: a client that reconnects by itself starts with an empty session. Use `session: agent` when the host cannot guarantee that",
             SessionMode::Agent =>
                 "one session per agent for the gateway's lifetime; only the operator can end it",
         }
@@ -1090,7 +1570,7 @@ pub fn summary(config: &Config, policy: &Policy) -> Vec<String> {
                 allow_without_reads,
             } => {
                 lines.push(format!(
-                    "  {} is an action, checked against everything the session read before it is forwarded:",
+                    "  {} is an action, checked against everything the session read before it is forwarded; the output checked is every forwarded argument:",
                     tool.exposed
                 ));
                 for rule in rules {
@@ -1100,12 +1580,12 @@ pub fn summary(config: &Config, policy: &Policy) -> Vec<String> {
                         .map(|a| policy.people(&a.audience))
                         .unwrap_or_default();
                     lines.push(format!(
-                        "    {}: `{}` with {} as the output (reaches {})",
+                        "    {}: `{}`{} (reaches {})",
                         when_text(&rule.when),
                         rule.action,
                         rule.content
                             .as_deref()
-                            .map_or("all arguments".to_string(), |c| format!("`{c}`")),
+                            .map_or(String::new(), |c| format!(", content `{c}`")),
                         people(&audience)
                     ));
                 }
@@ -1130,6 +1610,22 @@ pub fn summary(config: &Config, policy: &Policy) -> Vec<String> {
                 tool.exposed,
                 people(&agents_of(UNCLASSIFIED))
             )),
+        }
+        lines.push(format!(
+            "    forwards only the arguments: {}; a call with any other is refused",
+            names(&tool.arguments)
+        ));
+        if let Some(Some(tools)) = published.get(&tool.upstream)
+            && let Some(found) = tools.iter().find(|t| t.name == tool.name)
+        {
+            let unforwarded: BTreeSet<String> =
+                schema_report(tool, Some(found)).1.into_iter().collect();
+            if !unforwarded.is_empty() {
+                lines.push(format!(
+                    "    upstream arguments NOT forwardable: {}",
+                    names(&unforwarded)
+                ));
+            }
         }
     }
     lines.push(format!(

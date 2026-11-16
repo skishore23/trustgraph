@@ -7,8 +7,11 @@
 //! interpolation and only in upstream `headers` and `env` values; resolved
 //! values are [`Secret`]s, which never print.
 //!
-//! Matching is fail-closed by construction (see [`safe_for_matching`]): an
-//! argument that is not a plain string, or holds a `..` path segment or a
+//! Every tool has an argument allow-list (`arguments`); a call carrying any
+//! other argument is refused, so what is checked is exactly what is
+//! forwarded. Matching is fail-closed by construction (see
+//! [`safe_for_matching`] and [`safe_path_for_matching`]): an argument that
+//! is not a plain string (or a list of them), or holds a `..` segment or a
 //! control character, never matches a `when` rule, so the call falls to
 //! `otherwise`.
 
@@ -41,9 +44,15 @@ const TOP_KEYS: &[&str] = &[
 ];
 const HTTP_KEYS: &[&str] = &["url", "headers"];
 const STDIO_KEYS: &[&str] = &["command", "env"];
-const READS_KEYS: &[&str] = &["reads", "otherwise"];
-const ACTS_KEYS: &[&str] = &["acts", "otherwise", "allow_without_reads"];
-const PASSTHROUGH_KEYS: &[&str] = &["passthrough", "untracked"];
+const READS_KEYS: &[&str] = &["reads", "otherwise", "arguments"];
+const ACTS_KEYS: &[&str] = &["acts", "otherwise", "allow_without_reads", "arguments"];
+const PASSTHROUGH_KEYS: &[&str] = &["passthrough", "untracked", "arguments"];
+const MATCHER_KEYS: &[&str] = &["glob", "type"];
+/// Longest argument name.
+pub const MAX_ARGUMENT_NAME: usize = 128;
+/// Shortest `${env:…}` value accepted: redacting a shorter one by
+/// substring would be meaningless.
+pub const MIN_SECRET_CHARS: usize = 12;
 const READ_RULE_KEYS: &[&str] = &["when", "source"];
 const ACT_RULE_KEYS: &[&str] = &["when", "action", "content"];
 
@@ -128,10 +137,12 @@ pub enum Upstream {
 }
 
 /// One argument glob of a `when` rule.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Matcher {
     pub argument: String,
     pub glob: String,
+    /// `type: path` (the default in `reads` rules): odd path forms never match.
+    pub path: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -144,7 +155,8 @@ pub struct ReadRule {
 pub struct ActRule {
     pub when: Vec<Matcher>,
     pub action: String,
-    /// The argument that is the output; `None` means all arguments.
+    /// The argument shown to the operator as the content: a label only. The
+    /// checked output is always the canonical JSON of every forwarded argument.
     pub content: Option<String>,
 }
 
@@ -173,6 +185,8 @@ pub struct Tool {
     /// `upstream__tool`, as agents see it.
     pub exposed: String,
     pub kind: Kind,
+    /// The only argument names a call may carry.
+    pub arguments: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -318,7 +332,9 @@ impl Cx {
         out
     }
 
-    fn when(&mut self, v: Option<&&Value>, path: &str) -> Vec<Matcher> {
+    /// A `when` mapping: `argument: glob`, or `argument: {glob, type}` with
+    /// `type` `path` or `text` (`default_path` when not given).
+    fn when(&mut self, v: Option<&&Value>, path: &str, default_path: bool) -> Vec<Matcher> {
         let Some(v) = v else {
             return Vec::new();
         };
@@ -327,21 +343,75 @@ impl Cx {
             return Vec::new();
         };
         let mut out = Vec::new();
-        for (argument, glob) in self.entries(m, &path, None) {
+        for (argument, value) in self.entries(m, &path, None) {
             let here = join(&path, &argument);
-            if argument.is_empty() {
-                self.error(&here, "an argument name must not be empty");
+            if !valid_argument_name(&argument) {
+                self.error(&here, "not a valid argument name");
                 continue;
             }
-            match self.string(glob, &here) {
+            let (glob, is_path) = match value {
+                Value::Mapping(spec) => {
+                    let keys = self.entries(spec, &here, Some(MATCHER_KEYS));
+                    let is_path = match keys.get("type") {
+                        None => default_path,
+                        Some(Value::String(t)) if t == "path" => true,
+                        Some(Value::String(t)) if t == "text" => false,
+                        Some(_) => {
+                            self.error(&join(&here, "type"), "must be `path` or `text`");
+                            continue;
+                        }
+                    };
+                    let Some(glob) = keys.get("glob") else {
+                        self.error(&join(&here, "glob"), "required: the glob to match");
+                        continue;
+                    };
+                    (self.string(glob, &join(&here, "glob")), is_path)
+                }
+                other => (self.string(other, &here), default_path),
+            };
+            match glob {
                 Some(glob) if glob.len() > MAX_GLOB_BYTES => {
                     self.error(&here, format!("a glob is at most {MAX_GLOB_BYTES} bytes"))
                 }
-                Some(glob) => out.push(Matcher { argument, glob }),
+                Some(glob) => out.push(Matcher {
+                    argument,
+                    glob,
+                    path: is_path,
+                }),
                 None => {}
             }
         }
         out
+    }
+
+    /// An `arguments:` list of names, no two equal ignoring case; `None`
+    /// when the key is absent.
+    fn arguments(&mut self, v: Option<&&Value>, path: &str) -> Option<BTreeSet<String>> {
+        let v = v?;
+        let path = join(path, "arguments");
+        let Value::Sequence(items) = v else {
+            self.error(&path, "expected a list of argument names");
+            return Some(BTreeSet::new());
+        };
+        let mut out = BTreeSet::new();
+        let mut folded = BTreeSet::new();
+        for (i, item) in items.iter().enumerate() {
+            let here = format!("{path}[{i}]");
+            let Some(name) = self.string(item, &here) else {
+                continue;
+            };
+            if !valid_argument_name(&name) {
+                self.error(&here, "not a valid argument name");
+            } else if !folded.insert(name.to_lowercase()) {
+                self.error(
+                    &here,
+                    format!("`{name}` is listed twice (names are compared ignoring case)"),
+                );
+            } else {
+                out.insert(name);
+            }
+        }
+        Some(out)
     }
 }
 
@@ -407,6 +477,37 @@ fn valid_upstream(name: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
         && !name.contains("__")
         && !name.ends_with('_')
+}
+
+/// An argument name: non-empty text without control characters.
+fn valid_argument_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= MAX_ARGUMENT_NAME && !name.chars().any(char::is_control)
+}
+
+/// The `user:password@host:port` part of a URL.
+fn url_authority(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    rest.split(['/', '?', '#']).next().unwrap_or_default()
+}
+
+/// True for an `http://` URL whose host is not loopback: what it carries
+/// (credentials included) travels in clear.
+pub fn cleartext_remote(url: &str) -> bool {
+    if !url.starts_with("http://") {
+        return false;
+    }
+    let authority = url_authority(url);
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        rest.split(']').next().unwrap_or_default()
+    } else {
+        authority.split(':').next().unwrap_or_default()
+    };
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host == "::1"
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    !loopback
 }
 
 /// What an MCP client accepts in a tool name.
@@ -541,7 +642,7 @@ pub fn parse(text: &str) -> Result<Config, Vec<Problem>> {
                         );
                         continue;
                     }
-                    let Some(kind) = tool_kind(&mut cx, value, &path) else {
+                    let Some((kind, arguments)) = tool_kind(&mut cx, value, &path, session) else {
                         continue;
                     };
                     tools.insert(
@@ -552,6 +653,7 @@ pub fn parse(text: &str) -> Result<Config, Vec<Problem>> {
                             name: name.to_string(),
                             exposed,
                             kind,
+                            arguments,
                         },
                     );
                 }
@@ -596,6 +698,13 @@ fn upstream(cx: &mut Cx, value: &Value, path: &str) -> Option<Upstream> {
             cx.error(&url_path, "must start with https:// or http://");
             return None;
         }
+        if url_authority(&url).contains('@') {
+            cx.error(
+                &url_path,
+                "must not hold a user name or password; put credentials in `headers`",
+            );
+            return None;
+        }
         let headers = keys
             .get("headers")
             .map(|v| cx.templates(v, &join(path, "headers")))
@@ -635,7 +744,12 @@ fn upstream(cx: &mut Cx, value: &Value, path: &str) -> Option<Upstream> {
     }
 }
 
-fn tool_kind(cx: &mut Cx, value: &Value, path: &str) -> Option<Kind> {
+fn tool_kind(
+    cx: &mut Cx,
+    value: &Value,
+    path: &str,
+    session: SessionMode,
+) -> Option<(Kind, BTreeSet<String>)> {
     let m = cx.map(value, path)?;
     let keys = cx.entries(m, path, None);
     let kinds = ["reads", "acts", "passthrough"]
@@ -663,7 +777,7 @@ fn tool_kind(cx: &mut Cx, value: &Value, path: &str) -> Option<Kind> {
                 continue;
             };
             let rk = cx.entries(rm, &here, Some(READ_RULE_KEYS));
-            let when = cx.when(rk.get("when"), &here);
+            let when = cx.when(rk.get("when"), &here, true);
             let Some(source) = rk.get("source") else {
                 cx.error(&join(&here, "source"), "required: the source this read is");
                 continue;
@@ -681,7 +795,26 @@ fn tool_kind(cx: &mut Cx, value: &Value, path: &str) -> Option<Kind> {
             return None;
         };
         let otherwise = cx.string(otherwise, &otherwise_path)?;
-        Some(Kind::Reads { rules, otherwise })
+        // By default the arguments the rules name; a list may add more.
+        let mut arguments = cx
+            .arguments(keys.get("arguments"), path)
+            .unwrap_or_default();
+        for m in rules.iter().flat_map(|r| &r.when) {
+            let clash = arguments
+                .iter()
+                .any(|a| a != &m.argument && a.to_lowercase() == m.argument.to_lowercase());
+            if clash {
+                cx.error(
+                    &join(path, "arguments"),
+                    format!(
+                        "`{}` differs only in case from a listed argument",
+                        m.argument
+                    ),
+                );
+            }
+            arguments.insert(m.argument.clone());
+        }
+        Some((Kind::Reads { rules, otherwise }, arguments))
     } else if keys.contains_key("acts") {
         let keys = cx.entries(m, path, Some(ACTS_KEYS));
         let rules_path = join(path, "acts");
@@ -699,7 +832,7 @@ fn tool_kind(cx: &mut Cx, value: &Value, path: &str) -> Option<Kind> {
                 continue;
             };
             let rk = cx.entries(rm, &here, Some(ACT_RULE_KEYS));
-            let when = cx.when(rk.get("when"), &here);
+            let when = cx.when(rk.get("when"), &here, false);
             let content = rk
                 .get("content")
                 .and_then(|v| cx.string(v, &join(&here, "content")));
@@ -733,10 +866,45 @@ fn tool_kind(cx: &mut Cx, value: &Value, path: &str) -> Option<Kind> {
             None => false,
             Some(v) => cx.bool(v, &join(path, "allow_without_reads"))?,
         };
-        Some(Kind::Acts {
-            rules,
-            allow_without_reads,
-        })
+        if allow_without_reads && session != SessionMode::Agent {
+            cx.error(
+                &join(path, "allow_without_reads"),
+                "requires `session: agent`: in connection mode a new connection would be a way to shed what was read",
+            );
+        }
+        let Some(arguments) = cx.arguments(keys.get("arguments"), path) else {
+            cx.error(
+                &join(path, "arguments"),
+                "required for an acts tool: list every argument a call may carry, e.g. `arguments: [channel, text]`; a call with any other argument is refused",
+            );
+            return None;
+        };
+        for (i, rule) in rules.iter().enumerate() {
+            let here = format!("{rules_path}[{i}]");
+            for m in &rule.when {
+                if !arguments.contains(&m.argument) {
+                    cx.error(
+                        &join(&join(&here, "when"), &m.argument),
+                        format!("`{}` is not in `arguments`", m.argument),
+                    );
+                }
+            }
+            if let Some(content) = &rule.content
+                && !arguments.contains(content)
+            {
+                cx.error(
+                    &join(&here, "content"),
+                    format!("`{content}` is not in `arguments`"),
+                );
+            }
+        }
+        Some((
+            Kind::Acts {
+                rules,
+                allow_without_reads,
+            },
+            arguments,
+        ))
     } else {
         let keys = cx.entries(m, path, Some(PASSTHROUGH_KEYS));
         let here = join(path, "passthrough");
@@ -748,7 +916,10 @@ fn tool_kind(cx: &mut Cx, value: &Value, path: &str) -> Option<Kind> {
             None => false,
             Some(v) => cx.bool(v, &join(path, "untracked"))?,
         };
-        Some(Kind::Passthrough { untracked })
+        let arguments = cx
+            .arguments(keys.get("arguments"), path)
+            .unwrap_or_default();
+        Some((Kind::Passthrough { untracked }, arguments))
     }
 }
 
@@ -783,6 +954,7 @@ pub fn tool_problems(tool: &Tool, policy: &Policy) -> Vec<Problem> {
                 source(&rule.source, format!("{path}.reads[{i}].source"));
             }
             source(otherwise, join(&path, "otherwise"));
+            problems.extend(otherwise_problems(&path, rules, otherwise, policy));
         }
         Kind::Acts { rules, .. } => {
             for (i, rule) in rules.iter().enumerate() {
@@ -806,6 +978,94 @@ pub fn tool_problems(tool: &Tool, policy: &Policy) -> Vec<Problem> {
     problems
 }
 
+/// `otherwise` must be at least as restrictive as every rule's source:
+/// classification trusts the upstream's own naming (a link or alias may
+/// point elsewhere), so an unmatched call must never be freer than a
+/// matched one. Its readers and its agents must each be a subset of every
+/// rule source's.
+fn otherwise_problems(
+    path: &str,
+    rules: &[ReadRule],
+    otherwise: &str,
+    policy: &Policy,
+) -> Vec<Problem> {
+    let mut problems = Vec::new();
+    let Some(fallback) = policy.sources.get(otherwise) else {
+        return problems;
+    };
+    let fallback_readers = policy.people(&fallback.readers);
+    for rule in rules {
+        let Some(source) = policy.sources.get(&rule.source) else {
+            continue;
+        };
+        let extra_readers: Vec<String> = fallback_readers
+            .difference(&policy.people(&source.readers))
+            .cloned()
+            .collect();
+        let extra_agents: Vec<String> = fallback
+            .agents
+            .difference(&source.agents)
+            .cloned()
+            .collect();
+        let mut why = Vec::new();
+        if !extra_readers.is_empty() {
+            why.push(format!("its readers include {}", extra_readers.join(", ")));
+        }
+        if !extra_agents.is_empty() {
+            why.push(format!("its agents include {}", extra_agents.join(", ")));
+        }
+        if !why.is_empty() {
+            problems.push(Problem {
+                path: join(path, "otherwise"),
+                message: format!(
+                    "`{otherwise}` must be at least as restrictive as `{}`, but {}, who may not use `{}`; name the most restrictive source here",
+                    rule.source,
+                    why.join(" and "),
+                    rule.source
+                ),
+            });
+        }
+    }
+    problems
+}
+
+/// Warnings that do not stop the gateway: rules no call can reach, and
+/// upstreams reached in clear over the network.
+pub fn warnings(config: &Config) -> Vec<Problem> {
+    let mut out = Vec::new();
+    for (name, upstream) in &config.upstreams {
+        if let Upstream::Http { url, .. } = upstream
+            && cleartext_remote(url)
+        {
+            out.push(Problem {
+                path: format!("upstreams.{name}.url"),
+                message: "plain http:// to a host that is not loopback: its credentials and every call travel in clear; use https://".into(),
+            });
+        }
+    }
+    for tool in config.tools.values() {
+        let path = join("tools", &tool.key);
+        let (whens, key): (Vec<&[Matcher]>, &str) = match &tool.kind {
+            Kind::Reads { rules, .. } => {
+                (rules.iter().map(|r| r.when.as_slice()).collect(), "reads")
+            }
+            Kind::Acts { rules, .. } => (rules.iter().map(|r| r.when.as_slice()).collect(), "acts"),
+            Kind::Passthrough { .. } => continue,
+        };
+        for (j, later) in whens.iter().enumerate() {
+            // An earlier rule whose matchers are all in this one matches
+            // every call this one would: this one is never reached.
+            if let Some(i) = (0..j).find(|&i| whens[i].iter().all(|m| later.contains(m))) {
+                out.push(Problem {
+                    path: format!("{path}.{key}[{j}]"),
+                    message: format!("never reached: `{key}[{i}]` matches every call it would"),
+                });
+            }
+        }
+    }
+    out
+}
+
 /// Every environment variable the config names.
 pub fn env_names(config: &Config) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
@@ -823,9 +1083,9 @@ pub fn env_names(config: &Config) -> BTreeSet<String> {
 
 /// True when `value` may be matched against a `when` glob: a string of at
 /// most `MAX_MATCH_BYTES` bytes with no control character (NUL included)
-/// and no `..` path segment (split on `/` and `\`). Anything else never
-/// matches, so it falls to `otherwise`: the upstream may normalise a path
-/// the gateway sees as `Product/../HR/x` into one the rule did not mean.
+/// and no `..` segment (split on `/` and `\`). Anything else never matches,
+/// so it falls to `otherwise`: the upstream may normalise a path the
+/// gateway sees as `Product/../HR/x` into one the rule did not mean.
 pub fn safe_for_matching(value: &serde_json::Value) -> Option<&str> {
     let text = value.as_str()?;
     let safe = text.len() <= MAX_MATCH_BYTES
@@ -834,8 +1094,36 @@ pub fn safe_for_matching(value: &serde_json::Value) -> Option<&str> {
     safe.then_some(text)
 }
 
-/// Glob match, case-sensitive: `**` matches anything, `*` anything but `/`,
-/// `?` one character but `/`; every other character is literal.
+/// [`safe_for_matching`], and for an argument declared `type: path`: ASCII
+/// only, no `%`, `~` or `\`, no leading `/` or `./`, and no empty, `.` or
+/// `..` segment. An upstream may decode, expand or normalise any of these
+/// into a path the rule did not mean, so they never match.
+pub fn safe_path_for_matching(value: &serde_json::Value) -> Option<&str> {
+    let text = safe_for_matching(value)?;
+    let safe = text.is_ascii()
+        && !text.contains(['%', '~', '\\'])
+        && !text.starts_with('/')
+        && !text
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..");
+    safe.then_some(text)
+}
+
+/// Characters `**` never matches: list and header separators, whitespace,
+/// markup and quotes, and control characters.
+fn stops_globstar(c: char) -> bool {
+    matches!(c, ',' | ';' | '<' | '>' | '"') || c.is_whitespace() || c.is_control()
+}
+
+/// Characters `*` and `?` never match: those, and `/`.
+fn stops_star(c: char) -> bool {
+    c == '/' || stops_globstar(c)
+}
+
+/// Glob match, case-sensitive: `*` matches any run and `?` one character,
+/// but neither matches `/`, `,`, `;`, whitespace, `<`, `>`, `"` or a control
+/// character; `**` is `*` that also crosses `/`. Every other character is
+/// literal.
 pub fn glob(pattern: &str, text: &str) -> bool {
     enum Tok {
         Lit(char),
@@ -866,9 +1154,9 @@ pub fn glob(pattern: &str, text: &str) -> bool {
         for j in (0..=n).rev() {
             here[j] = match tok {
                 Tok::Lit(c) => j < n && t[j] == *c && next[j + 1],
-                Tok::One => j < n && t[j] != '/' && next[j + 1],
-                Tok::Star => next[j] || (j < n && t[j] != '/' && here[j + 1]),
-                Tok::Globstar => next[j] || (j < n && here[j + 1]),
+                Tok::One => j < n && !stops_star(t[j]) && next[j + 1],
+                Tok::Star => next[j] || (j < n && !stops_star(t[j]) && here[j + 1]),
+                Tok::Globstar => next[j] || (j < n && !stops_globstar(t[j]) && here[j + 1]),
             };
         }
         next = here;
@@ -876,8 +1164,27 @@ pub fn glob(pattern: &str, text: &str) -> bool {
     next[0]
 }
 
+/// One matcher against one argument value: a safe string that matches, or
+/// a non-empty list whose every element is one. Objects, numbers and
+/// anything else never match.
+pub fn value_matches(m: &Matcher, value: &serde_json::Value) -> bool {
+    let one = |v: &serde_json::Value| {
+        let safe = if m.path {
+            safe_path_for_matching(v)
+        } else {
+            safe_for_matching(v)
+        };
+        safe.is_some_and(|text| glob(&m.glob, text))
+    };
+    match value {
+        serde_json::Value::String(_) => one(value),
+        serde_json::Value::Array(items) => !items.is_empty() && items.iter().all(one),
+        _ => false,
+    }
+}
+
 /// The rule matchers of one call: every named argument must be present and
-/// safe, and match its glob.
+/// match its glob.
 pub fn when_matches(
     when: &[Matcher],
     arguments: &serde_json::Map<String, serde_json::Value>,
@@ -885,7 +1192,48 @@ pub fn when_matches(
     when.iter().all(|m| {
         arguments
             .get(&m.argument)
-            .and_then(safe_for_matching)
-            .is_some_and(|text| glob(&m.glob, text))
+            .is_some_and(|value| value_matches(m, value))
     })
+}
+
+/// An argument name as it may appear in an error: control characters
+/// escaped, at most 64 characters.
+fn shown_name(name: &str) -> String {
+    let mut out: String = name.chars().take(64).flat_map(char::escape_debug).collect();
+    if name.chars().count() > 64 {
+        out.push('…');
+    }
+    out
+}
+
+/// A call's arguments against the tool's allow-list: every name listed,
+/// and no two equal ignoring case. The error names the offending argument.
+pub fn check_arguments(
+    allowed: &BTreeSet<String>,
+    arguments: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    for name in arguments.keys() {
+        if !allowed.contains(name) {
+            let listed: Vec<&str> = allowed.iter().map(String::as_str).collect();
+            return Err(format!(
+                "`{}` is not an argument the gateway forwards for this tool (it forwards: {})",
+                shown_name(name),
+                if listed.is_empty() {
+                    "none".to_string()
+                } else {
+                    listed.join(", ")
+                }
+            ));
+        }
+    }
+    let mut folded = BTreeSet::new();
+    for name in arguments.keys() {
+        if !folded.insert(name.to_lowercase()) {
+            return Err(format!(
+                "two arguments are named `{}` ignoring case",
+                shown_name(name)
+            ));
+        }
+    }
+    Ok(())
 }

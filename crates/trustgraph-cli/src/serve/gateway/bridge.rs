@@ -10,8 +10,24 @@ use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig
 use rmcp::transport::{StreamableHttpClientTransport, Transport};
 use rmcp::{RoleClient, RoleServer};
 
-/// Read the agent's token file: exactly one 64-character hex token.
+/// Read the agent's token file: exactly one 64-character hex token, in a
+/// file no group or other user can read.
 fn read_token(path: &Path) -> Result<String, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "{} is readable by other users (mode {:o}); run `chmod 600` on it",
+                path.display(),
+                mode & 0o777
+            ));
+        }
+    }
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let token = text.trim();
@@ -25,8 +41,20 @@ fn read_token(path: &Path) -> Result<String, String> {
     Ok(token.to_string())
 }
 
-/// Relay until either side closes. Returns the exit code.
-pub async fn run(url: &str, token_file: &Path) -> i32 {
+/// Relay until either side closes. Returns the exit code. A plain
+/// `http://` URL to a host that is not loopback is refused unless
+/// `allow_insecure`: the agent's token would travel in clear.
+pub async fn run(url: &str, token_file: &Path, allow_insecure: bool) -> i32 {
+    if super::config::cleartext_remote(url) && !allow_insecure {
+        eprintln!(
+            "trustgraph gateway stdio: {url} is plain http:// to a host that is not loopback, so the agent's token would travel in clear; use https://, or pass --allow-insecure"
+        );
+        return 2;
+    }
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        eprintln!("trustgraph gateway stdio: --url must start with http:// or https://");
+        return 2;
+    }
     let token = match read_token(token_file) {
         Ok(t) => t,
         Err(e) => {
