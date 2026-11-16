@@ -26,7 +26,7 @@ tools:
   slack.post_message:
     arguments: [channel, text]             # required: a call with any other argument is refused
     acts:
-      - when: { channel: "#engineering" }
+      - when: { channel: "#engineering" }  # exact: who the post reaches; never a wildcard here
         action: post_to_engineering
         content: text                      # shown to the operator; the check covers every argument
     otherwise: block

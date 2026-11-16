@@ -677,7 +677,7 @@ pub fn check_schema_types(
             ));
         }
         if let (Value::Array(items), Some(item_types)) =
-            (value, schema.get("items").and_then(|items| declared(items)))
+            (value, schema.get("items").and_then(&declared))
             && let Some(bad) = items
                 .iter()
                 .find(|item| !item_types.iter().any(|t| of_type(t, item)))

@@ -27,6 +27,7 @@ SLACK_BOT_TOKEN=demo-slack-token-0001 target/debug/trustgraph gateway \
 ```
 
 ```text
+warning: tools.slack.post_message.arguments: not constrained by any `when`: text; each is hashed into the checked output and shown to the approver, but can hold anything, so it must not be able to choose who the call reaches
 upstream `slack`: fake_upstream: starting with credential [redacted]
 trustgraph gateway: upstream `slack`: connected, 12 tools
 trustgraph gateway: upstream `drive`: connected, 12 tools
@@ -59,12 +60,18 @@ planner slack__post_message #engineering: error: TrustGraph gateway: `post_to_en
 planner slack__post_message #engineering, plus Channel #all-company: error: TrustGraph gateway: `Channel` is not an argument the gateway forwards for this tool (it forwards: channel, text); the call was not forwarded (invalid_arguments)
 ```
 
-Neither `post_message` call reached the chat server.
+Neither `post_message` call reached the chat server. The warning is
+expected: `text` is the message, which the approver reads; it does not
+choose who the post reaches (`channel` does, and the rule matches it
+exactly). Stop the gateway with Ctrl-C or SIGTERM: it stops its stdio
+upstreams and removes their private `HOME` directories.
 
 Check a config against a policy before you start the gateway. When the
 variables an upstream needs are set, `gateway check` also connects to it
 and compares the arguments the config forwards with the ones the upstream
-tool takes:
+tool takes. Connecting to a stdio upstream means **running its configured
+`command`** on this machine; pass `--offline` to check only the config and
+the policy (the upstream checks are then skipped, and the output says so):
 
 ```sh
 SLACK_BOT_TOKEN=demo-slack-token-0001 trustgraph gateway check \
@@ -72,6 +79,7 @@ SLACK_BOT_TOKEN=demo-slack-token-0001 trustgraph gateway check \
 ```
 
 ```text
+upstream `slack`: fake_upstream: starting with credential [redacted]
 Sessions: connection (each MCP connection is one session; it assumes the host opens a new connection per task with a fresh agent context, and that the agent cannot reconnect at will: a client that reconnects by itself starts with an empty session. Use `session: agent` when the host cannot guarantee that).
 Upstreams: drive (runs target/debug/examples/fake_upstream), slack (runs target/debug/examples/fake_upstream).
 Agents see 4 tools; every other upstream tool is invisible and uncallable:
@@ -82,16 +90,18 @@ Agents see 4 tools; every other upstream tool is invisible and uncallable:
     otherwise: `unmatched` (usable by planner)
     forwards only the arguments: path; a call with any other is refused
   slack__post_message is an action, checked against everything the session read before it is forwarded; the output checked is every forwarded argument:
-    when `channel` matches `#engineering`: `post_to_engineering`, content `text` (reaches ravi, sam)
+    when `channel` is exactly `#engineering`: `post_to_engineering`, content `text` (reaches ravi, sam)
     otherwise: blocked, never forwarded
     a call from a session that has read nothing is refused (nothing_read)
     forwards only the arguments: channel, text; a call with any other is refused
     upstream arguments NOT forwardable: blocks, thread
   trustgraph__handoff and trustgraph__receive pass what a session carries to another agent's session
+warning: tools.slack.post_message.arguments: not constrained by any `when`: text; each is hashed into the checked output and shown to the approver, but can hold anything, so it must not be able to choose who the call reaches
 ```
 
-`gateway check` runs each stdio upstream it can to ask for its tools. Run
-it where you would run the gateway.
+`gateway check` runs each stdio upstream whose variables are set here, to
+ask for its tools, so run it where you would run the gateway, and only on a
+config whose commands you trust; with `--offline` it runs nothing.
 
 ## Connecting agents
 
@@ -163,10 +173,16 @@ tools:
   slack.post_message:
     arguments: [channel, text]  # required for acts: a call with any other argument is refused
     acts:
-      - when: { channel: "#engineering" }
+      - when: { channel: "#engineering" }   # exact: the value must be `#engineering`
         action: post_to_engineering
         content: text           # shown to the operator; the check covers every argument
     otherwise: block            # the only value: an unmatched call is never forwarded
+  slack.send_email:
+    arguments: [to, subject, body]
+    acts:
+      - when: { to: { pattern: "*@corp.com", type: email } }   # a strict address at corp.com
+        action: email_staff
+        content: body
   drive.search:
     passthrough: true
     arguments: [query]
@@ -226,7 +242,9 @@ tools:
   in `gateway check`; if a policy activation breaks it later, the tool is
   closed (`tool_misconfigured`) until it is fixed.
 - **acts.** The tool is a policy action. The first rule whose `when` matches
-  gives the action. A call that matches no rule is blocked. `content` names
+  gives the action; a `when` value matches exactly unless the rule gives a
+  `type` (see [How `when` matches](#how-when-matches)). A call that matches
+  no rule is blocked. `content` names
   the argument the operator sees as the content; it is only a label. The
   output that is checked is always every forwarded argument (see
   [What a call does](#what-a-call-does)). `allow_without_reads: true` lets a

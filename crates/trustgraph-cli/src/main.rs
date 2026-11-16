@@ -51,7 +51,8 @@ enum GatewayCommand {
         #[arg(long)]
         allow_insecure: bool,
     },
-    /// Validate a gateway config against a policy and say what it does.
+    /// Validate a gateway config against a policy and say what it does; this
+    /// RUNS configured stdio upstream commands unless --offline is given.
     ///
     /// Unless --offline is given, `check` connects to every configured upstream
     /// whose environment variables are set here, to compare the arguments the
