@@ -452,7 +452,7 @@ async fn a_held_action_is_forwarded_on_retry_after_approval() {
         .as_str()
         .unwrap()
         .to_string();
-    assert!(text(&held).contains("held for approval"));
+    assert!(text(&held).contains("held for approval"), "{held}");
     assert!(calls(&h.slack_log, "post_message").is_empty());
 
     let operator = h.login().await;

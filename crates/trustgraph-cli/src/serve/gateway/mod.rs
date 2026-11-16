@@ -787,14 +787,14 @@ impl<J: ServeJournal> Gateway<J> {
             Some("needs_approval") => Err(ToolFail {
                 code: "needs_approval".into(),
                 message: format!(
-                    "`{action}` is held for approval (decision {}): {reason}. It was not forwarded; retry the same call after a reviewer approves it",
+                    "`{action}` was not forwarded: {reason}. It is held for approval as decision {}; retry the same call after a reviewer approves it",
                     id.get(..12).unwrap_or(&id)
                 ),
                 extra,
             }),
             _ => Err(ToolFail {
                 code: "denied".into(),
-                message: format!("`{action}` is denied: {reason}. It was not forwarded"),
+                message: format!("`{action}` was not forwarded: {reason}"),
                 extra,
             }),
         }
