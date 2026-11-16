@@ -15,13 +15,22 @@ from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage  # noqa: E402
 from langchain_core.tools import tool  # noqa: E402
 from langgraph.checkpoint.memory import InMemorySaver  # noqa: E402
+from typing import Annotated  # noqa: E402
+
 from langgraph.graph import END, START, MessagesState, StateGraph  # noqa: E402
 from langgraph.prebuilt import ToolNode  # noqa: E402
 
 import json  # noqa: E402
 
 from trustgraph import TrustGraphError  # noqa: E402
-from trustgraph.integrations.langchain import Action, Guard, agent_node, as_action, as_source  # noqa: E402
+from trustgraph.integrations.langchain import (  # noqa: E402
+    Action,
+    Guard,
+    agent_node,
+    as_action,
+    as_source,
+    merge_tokens,
+)
 
 from ..conftest import Server  # noqa: E402
 from ..test_server import recording  # noqa: E402
@@ -57,17 +66,22 @@ def calls(*names_args: tuple[str, dict[str, Any]]) -> AIMessage:
     return AIMessage("", tool_calls=[{"name": n, "args": a, "id": f"call_{i}"} for i, (n, a) in enumerate(names_args)])
 
 
-def graph_of(node: ToolNode) -> Any:
+class GuardState(MessagesState):
+    trustgraph: Annotated[str, merge_tokens]
+
+
+def graph_of(node: ToolNode, state: Any = MessagesState) -> Any:
     """A one-node graph: ToolNode needs the graph runtime."""
-    g = StateGraph(MessagesState)
+    g = StateGraph(state)
     g.add_node("tools", node)
     g.add_edge(START, "tools")
     g.add_edge("tools", END)
     return g.compile()
 
 
-def run_tools(node: ToolNode, message: AIMessage, config: dict[str, Any] | None = None) -> list[ToolMessage]:
-    return graph_of(node).invoke({"messages": [message]}, config or {})["messages"][1:]
+def run_tools(node: ToolNode, message: AIMessage, config: dict[str, Any] | None = None,
+              state: Any = MessagesState) -> list[ToolMessage]:
+    return graph_of(node, state).invoke({"messages": [message]}, config or {})["messages"][1:]
 
 
 class ScriptedModel(GenericFakeChatModel):
@@ -130,12 +144,12 @@ def test_guard_per_thread_sessions(server: Server) -> None:
     node = ToolNode([read_salaries, read_roadmap, post_message], wrap_tool_call=guard.wrap_tool_call)
     a = {"configurable": {"thread_id": "a"}}
     b = {"configurable": {"thread_id": "b"}}
-    run_tools(node, calls(("read_salaries", {})), a)
-    run_tools(node, calls(("read_roadmap", {})), b)
-    [denied] = run_tools(node, calls(("post_message", {"text": "x"})), a)  # thread a read salaries earlier
-    [allowed] = run_tools(node, calls(("post_message", {"text": "y"})), b)
+    run_tools(node, calls(("read_salaries", {})), a, GuardState)
+    run_tools(node, calls(("read_roadmap", {})), b, GuardState)
+    [denied] = run_tools(node, calls(("post_message", {"text": "x"})), a, GuardState)  # thread a read salaries earlier
+    [allowed] = run_tools(node, calls(("post_message", {"text": "y"})), b, GuardState)
     assert denied.status == "error" and allowed.content == "posted" and posted == ["y"]
-    [refused] = run_tools(node, calls(("post_message", {"text": "z"})))  # no thread, no session
+    [refused] = run_tools(node, calls(("post_message", {"text": "z"})), None, GuardState)  # no thread, no session
     assert refused.status == "error" and posted == ["y"]
 
 
@@ -170,7 +184,11 @@ def test_async_tool_node(server: Server) -> None:
 
 
 class HandoffState(MessagesState):
-    trustgraph: str
+    trustgraph: Annotated[str, merge_tokens]
+
+
+class PlainState(MessagesState):
+    trustgraph: str  # declared, but without the reducer
 
 
 def handoff_graph(server: Server, first: str, first_tool: str, second: str, second_calls: list[AIMessage]):
@@ -359,11 +377,13 @@ def two_nodes(server: Server, state: Any, checkpointer: Any = None) -> Any:
     return g.compile(checkpointer=checkpointer)
 
 
-def test_agent_node_refuses_a_state_without_the_key(handoff_server: Server) -> None:
+@pytest.mark.parametrize("state, code", [(MessagesState, "state_key_undeclared"),
+                                         (PlainState, "state_key_without_reducer")])
+def test_agent_node_refuses_a_state_without_the_key(handoff_server: Server, state: Any, code: str) -> None:
     """The reviewer's lc2.py: MessagesState has no `trustgraph`, so LangGraph dropped the token."""
     with pytest.raises(TrustGraphError) as e:
-        two_nodes(handoff_server, MessagesState).invoke({"messages": []})
-    assert e.value.code == "handoff_missing" and posted == []
+        two_nodes(handoff_server, state).invoke({"messages": [], "trustgraph": ""})
+    assert e.value.code == code and posted == []
 
 
 def test_agent_node_requires_a_token_after_the_first(handoff_server: Server) -> None:
@@ -378,7 +398,7 @@ def test_agent_node_requires_a_token_after_the_first(handoff_server: Server) -> 
     assert e.value.code == "handoff_missing"
     with pytest.raises(TrustGraphError) as e:
         g.compile().invoke({"messages": [], "trustgraph": "tg1.forged"})
-    assert e.value.code == "invalid_handoff"
+    assert e.value.code == "session_broken"  # merged as an unreadable token: a broken marker
 
 
 def test_agent_node_carries_the_token_across_checkpointed_runs(handoff_server: Server) -> None:
@@ -391,16 +411,12 @@ def test_agent_node_carries_the_token_across_checkpointed_runs(handoff_server: S
     with pytest.raises(TrustGraphError) as e:
         graph.invoke({"messages": [HumanMessage("again")]}, config)
     assert e.value.code == "unknown_artifact" and posted == []
-    with pytest.raises(TrustGraphError) as e:  # resetting the token on a thread with history
+    with pytest.raises(TrustGraphError) as e:  # an empty token in the input does not reset it
         graph.invoke({"messages": [HumanMessage("again")], "trustgraph": ""}, config)
-    assert e.value.code == "resumed_without_session" and posted == []
+    assert e.value.code == "unknown_artifact" and posted == []
 
 
 # -- Guard: resumed, checkpointed and evicted threads -----------------------
-
-
-class GuardState(MessagesState):
-    trustgraph: str
 
 
 def checkpointed(node: ToolNode, state: Any) -> Any:
@@ -420,33 +436,72 @@ def last(graph: Any, message: AIMessage, thread: str) -> ToolMessage:
     return graph.invoke({"messages": [message]}, {"configurable": {"thread_id": thread}})["messages"][-1]
 
 
-@pytest.mark.parametrize("state", [GuardState, MessagesState])
-def test_guard_thread_resumed_by_a_new_guard(server: Server, state: Any) -> None:
+def test_guard_thread_resumed_by_a_new_guard(server: Server) -> None:
     """A new process (a new Guard) resumes a checkpointed thread that read salaries."""
     first = guard_for(server)
     graph = checkpointed(ToolNode([read_salaries, read_roadmap, post_message], wrap_tool_call=first.wrap_tool_call),
-                         state)
+                         GuardState)
     assert last(graph, calls(("read_salaries", {})), "a").content == "nina: 120k, sam: 95k"
     second = guard_for(server)
     graph.builder.nodes["tools"].runnable._wrap_tool_call = second.wrap_tool_call  # type: ignore[attr-defined]
     msg = last(graph, calls(("post_message", {"text": "x"})), "a")
-    assert msg.status == "error" and posted == []
-    if state is GuardState:  # restored from the token kept in the checkpoint: the real reason
-        assert "`salaries`" in msg.content and "denied" in msg.content
-    else:  # nowhere to keep the token: refused as unrecorded history
-        assert "unrecorded_history" in msg.content
+    assert msg.status == "error" and "`salaries`" in msg.content and "denied" in msg.content and posted == []
 
 
-@pytest.mark.parametrize("state", [GuardState, MessagesState])
-def test_guard_evicted_thread_is_not_unchecked(server: Server, state: Any) -> None:
+def test_guard_evicted_thread_is_not_unchecked(server: Server) -> None:
     guard = guard_for(server, max_threads=1)
     graph = checkpointed(ToolNode([read_salaries, read_roadmap, post_message], wrap_tool_call=guard.wrap_tool_call),
-                         state)
+                         GuardState)
     last(graph, calls(("read_salaries", {})), "a")
     last(graph, calls(("read_roadmap", {})), "b")  # evicts thread a
     msg = last(graph, calls(("post_message", {"text": "x"})), "a")
-    assert msg.status == "error" and posted == []
-    assert ("`salaries`" in msg.content) if state is GuardState else ("unrecorded_history" in msg.content)
+    assert msg.status == "error" and "`salaries`" in msg.content and posted == []
+
+
+@pytest.mark.parametrize("state, code", [(MessagesState, "state_key_undeclared"),
+                                         (PlainState, "state_key_without_reducer")])
+def test_guard_threads_need_the_reducer(server: Server, state: Any, code: str) -> None:
+    graph = checkpointed(ToolNode([read_salaries, post_message], wrap_tool_call=guard_for(server).wrap_tool_call),
+                         state)
+    msg = last(graph, calls(("read_salaries", {})), "a")
+    assert msg.status == "error" and code in msg.content and "120k" not in msg.content
+
+
+def parallel(*names: str, start: int = 0) -> AIMessage:
+    return AIMessage("", tool_calls=[{"name": n, "args": a, "id": f"p{start + i}"}
+                                     for i, (n, a) in enumerate((n, {"text": "x"} if n == "post_message" else {})
+                                                                for n in names)])
+
+
+def test_guard_parallel_sources_in_a_tool_node(server: Server) -> None:
+    """The re-review's g1.py: two source calls in one step wrote one last-value key twice."""
+    graph = checkpointed(ToolNode([read_salaries, read_roadmap, post_message],
+                                  wrap_tool_call=guard_for(server).wrap_tool_call), GuardState)
+    config = {"configurable": {"thread_id": "a"}}
+    out = graph.invoke({"messages": [parallel("read_salaries", "read_roadmap")]}, config)
+    assert [m.status for m in out["messages"][1:]] == ["success", "success"]
+    from trustgraph._session import _parse
+    assert len(_parse(out["trustgraph"])[0]) == 2  # both sources carried
+    msg = last(graph, parallel("post_message", start=2), "a")
+    assert msg.status == "error" and "`salaries`" in msg.content and posted == []
+    # Overwriting the token with "" does not shed it, even for a new guard (a new process).
+    second = guard_for(server)
+    graph.builder.nodes["tools"].runnable._wrap_tool_call = second.wrap_tool_call  # type: ignore[attr-defined]
+    out = graph.invoke({"messages": [parallel("post_message", start=3)], "trustgraph": ""}, config)
+    assert out["messages"][-1].status == "error" and "`salaries`" in out["messages"][-1].content and posted == []
+
+
+def test_guard_parallel_sources_in_create_agent(server: Server) -> None:
+    """The re-review's g2.py: the same with create_agent and the middleware."""
+    guard = guard_for(server)
+    model = ScriptedModel(messages=iter([parallel("read_salaries", "read_roadmap"), parallel("post_message", start=2),
+                                         AIMessage("done")]))
+    agent = create_agent(model, [read_salaries, read_roadmap, post_message], middleware=[guard.middleware()],
+                         checkpointer=InMemorySaver())
+    out = agent.invoke({"messages": [HumanMessage("go")]}, {"configurable": {"thread_id": "1"}})
+    results = [m for m in out["messages"] if isinstance(m, ToolMessage)]
+    assert [m.status for m in results] == ["success", "success", "error"]
+    assert "`salaries`" in results[2].content and posted == []
 
 
 def test_guard_new_session_on_a_resumed_thread_is_refused(server: Server) -> None:

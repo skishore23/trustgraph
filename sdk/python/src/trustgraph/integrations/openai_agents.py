@@ -110,7 +110,8 @@ class _Run:
             sessions = list(self.sessions.values())
             stored = context.get(CONTEXT_KEY)
             context[CONTEXT_KEY] = merge_tokens(
-                stored if stored is None or isinstance(stored, str) else "not a token", *(s.persist() for s in sessions)
+                stored if stored is None or isinstance(stored, str) else "not a token", None,
+                *(s.persist() for s in sessions),
             )
 
 

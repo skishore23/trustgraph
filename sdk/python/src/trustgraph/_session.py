@@ -217,7 +217,7 @@ def _parse(token: str) -> tuple[list[str], str | None]:
         raise TrustGraphError("invalid_handoff", "not a TrustGraph hand-off token") from None
 
 
-def merge_tokens(*tokens: str | None) -> str:
+def merge_tokens(left: str | None, right: str | None, *more: str | None) -> str:
     """The union of tokens: every artifact any of them carries, and a broken
     marker if any of them is broken or cannot be read. Empty values are
     ignored; with nothing to merge the result is ``""``.
@@ -228,7 +228,7 @@ def merge_tokens(*tokens: str | None) -> str:
     ids: dict[str, None] = {}
     broken: str | None = None
     found = False
-    for token in tokens:
+    for token in (left, right, *more):
         if not token:
             continue
         found = True

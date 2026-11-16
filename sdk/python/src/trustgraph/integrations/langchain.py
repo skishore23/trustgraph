@@ -21,19 +21,19 @@ import threading
 import weakref
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping
-from typing import Any
+from typing import Annotated, Any
 
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig, RunnableLambda
 from langchain_core.tools import BaseTool, ToolException
 from typing_extensions import NotRequired  # noqa: F401  (evaluated in the middleware's state schema)
 
 from .._client import Client
 from .._errors import TrustGraphError
-from .._session import Session, current_session
+from .._session import Session, current_session, merge_tokens
 from ._common import Action, as_spec, blocked_message, check_action, not_registered_message, require_session
 
-__all__ = ["Action", "Guard", "agent_node", "as_action", "as_source"]
+__all__ = ["Action", "Guard", "agent_node", "as_action", "as_source", "merge_tokens"]
 
 _PLUMBING = {"run_manager", "callbacks", "config"}
 KEY = "trustgraph"  # the graph-state key that holds the hand-off token
@@ -151,21 +151,61 @@ def _messages(state: Any) -> list[Any]:
     return list(state) if isinstance(state, list) else []
 
 
+def _version() -> str:
+    try:
+        from importlib.metadata import version
+
+        return f"langgraph {version('langgraph')}"
+    except Exception:
+        return "langgraph (version unknown)"
+
+
+def _check_state_key(config: Mapping[str, Any] | None, key: str) -> None:
+    """Fail closed unless the running graph declares ``key`` with ``merge_tokens`` as its reducer.
+
+    Without the reducer, two results in one step crash the run (a last-value
+    channel takes one write), and a node or the graph input could replace the
+    token with a smaller one; undeclared, LangGraph drops it silently."""
+    try:
+        from langgraph.channels.base import BaseChannel
+
+        read = (config or {})["configurable"]["__pregel_read"]
+        channels = next(
+            a for a in read.args if isinstance(a, Mapping) and any(isinstance(v, BaseChannel) for v in a.values())
+        )
+    except Exception:
+        raise TrustGraphError(
+            "unsupported_framework",
+            f"{_version()}: cannot read the graph's channels to check that `{key}` is declared with "
+            "merge_tokens, so the hand-off token cannot be kept safely",
+        ) from None
+    channel = channels.get(key)
+    if channel is None or getattr(channel, "operator", None) is not merge_tokens:
+        raise TrustGraphError(
+            "state_key_undeclared" if channel is None else "state_key_without_reducer",
+            f"declare `{key}: Annotated[str, merge_tokens]` (from trustgraph.integrations.langchain) in the "
+            "graph state: it keeps the hand-off token, and the reducer makes parallel results merge and keeps "
+            "the token from being replaced by a smaller one",
+        )
+
+
 class Guard:
     """Map tool names to sources and actions at the tool-execution step.
 
     The session is the current one (``with client.session():`` around the
     run). If there is none and ``client`` is given, each LangGraph thread
     (``config["configurable"]["thread_id"]``) gets its own session, restored
-    from the hand-off token in ``state["trustgraph"]`` when there is one; the
-    guard writes that token back after every registered result. At most
+    from the token in ``state["trustgraph"]``; the guard merges its session's
+    token back there after every mapped call. That key must be declared
+    ``Annotated[str, merge_tokens]`` (``middleware()`` declares it for
+    ``create_agent``); otherwise mapped calls are refused. At most
     ``max_threads`` thread sessions are kept in memory (least recently used
     first out). Tools in neither map run untouched.
 
-    A mapped call is refused when the conversation already holds a result of a
-    mapped source tool that the session did not record and the session carries
-    no hand-off token: that is a resumed, checkpointed or evicted thread with a
-    new session, which would drop the restriction.
+    A mapped call is refused, and the session broken, when the conversation
+    already holds a result of a mapped source tool that the session did not
+    record and the session carries no hand-off token: that is a resumed,
+    checkpointed or evicted thread with a new session.
     """
 
     def __init__(
@@ -197,6 +237,7 @@ class Guard:
         thread = ((config or {}).get("configurable") or {}).get("thread_id")
         if self.client is None or thread is None:
             raise TrustGraphError("no_session", "no active TrustGraph session for this run")
+        _check_state_key(config, KEY)
         thread = str(thread)
         with self._lock:
             s = self._threads.get(thread)
@@ -207,7 +248,7 @@ class Guard:
         s = self.client.session()
         if token:
             try:
-                s.receive(token)  # a failure breaks `s`: every mapped call of the thread is refused
+                s.receive(token)  # a failure (or a broken marker) breaks `s`: the thread is refused
             except TrustGraphError:
                 pass
         with self._lock:
@@ -217,43 +258,59 @@ class Guard:
                 self._threads.popitem(last=False)
         return s
 
-    def _owned(self) -> bool:
-        return current_session() is None
-
     def _check_history(self, s: Session, request: Any) -> None:
         if s.carried:
             return
         recorded = self._recorded.get(s, set())
         # `request.state` is the state before this call, so it never holds this call's own result.
-        for m in _messages(getattr(request, "state", None)):
-            if (
-                isinstance(m, ToolMessage)
-                and m.name in self.sources
-                and m.status != "error"
-                and m.tool_call_id not in recorded
-            ):
-                raise TrustGraphError(
-                    "unrecorded_history",
+        for m in _messages(request.state):
+            if isinstance(m, ToolMessage) and m.name in self.sources and m.tool_call_id not in recorded:
+                why = (
                     f"this conversation already holds a result of `{m.name}` that this TrustGraph session did "
-                    "not record (a resumed or checkpointed thread with a new session); carry the thread's "
-                    f"hand-off token in `state[{KEY!r}]`, or start a new thread",
+                    "not record (a resumed or checkpointed thread with a new session)"
                 )
+                s.mark_broken(why)
+                raise TrustGraphError("unrecorded_history", why)
 
-    def _config(self, request: Any) -> Mapping[str, Any] | None:
-        runtime = getattr(request, "runtime", None)
-        return getattr(runtime, "config", None)
+    @staticmethod
+    def _config(request: Any) -> Mapping[str, Any] | None:
+        return getattr(request.runtime, "config", None)
 
     def _session(self, request: Any) -> Session:
-        s = self.session_for(self._config(request), getattr(request, "state", None))
+        if not hasattr(request, "state") or not hasattr(request, "runtime"):
+            raise TrustGraphError(
+                "unsupported_framework",
+                f"{_version()}: the tool-call request has no `state` / `runtime`, so the guard cannot see the "
+                "conversation it protects",
+            )
+        s = self.session_for(self._config(request), request.state)
         self._check_history(s, request)
         return s
+
+    def _note(self, request: Any) -> Session | None:
+        """Record this call's result as seen by its session (a withheld result too)."""
+        try:
+            s = self.session_for(self._config(request), getattr(request, "state", None))
+        except TrustGraphError:
+            return None
+        with self._lock:
+            self._recorded.setdefault(s, set()).add(request.tool_call["id"])
+        return s
+
+    def _reply(self, request: Any, message: ToolMessage, s: Session | None) -> Any:
+        if s is None or current_session() is not None:
+            return message
+        from langgraph.types import Command
+
+        # The thread's session is the guard's: keep its token (or broken marker) with the thread.
+        return Command(update={"messages": [message], KEY: s.persist()})
 
     @staticmethod
     def _error(request: Any, text: str) -> ToolMessage:
         call = request.tool_call
         return ToolMessage(content=text, tool_call_id=call["id"], name=call["name"], status="error")
 
-    def _before(self, request: Any) -> ToolMessage | None:
+    def _before(self, request: Any) -> Any:
         name = request.tool_call["name"]
         try:
             if name in self.actions:
@@ -263,9 +320,19 @@ class Guard:
                 self._session(request)
         except TrustGraphError as e:
             if name in self.actions:
-                return self._error(request, blocked_message(e, self.actions[name].name))
-            return self._error(request, not_registered_message(self.sources[name], e))
+                return self._reply(request, self._error(request, blocked_message(e, self.actions[name].name)),
+                                   self._owned_session(request))
+            s = self._note(request)
+            return self._reply(request, self._error(request, not_registered_message(self.sources[name], e)), s)
         return None
+
+    def _owned_session(self, request: Any) -> Session | None:
+        if current_session() is not None:
+            return None
+        try:
+            return self.session_for(self._config(request), getattr(request, "state", None))
+        except TrustGraphError:
+            return None
 
     def _after(self, request: Any, result: Any) -> Any:
         name = request.tool_call["name"]
@@ -275,19 +342,12 @@ class Guard:
         try:
             if not isinstance(result, ToolMessage):
                 raise TrustGraphError("unsupported_result", "only a ToolMessage result can be registered")
-            owned = self._owned()
             s = self._session(request)
             s.read(source, result.content)
-            with self._lock:
-                self._recorded.setdefault(s, set()).add(result.tool_call_id)
-            if owned:
-                from langgraph.types import Command
-
-                # Keep the thread's token with the thread's checkpoint, to restore from.
-                return Command(update={"messages": [result], KEY: s.handoff()})
+            self._note(request)
+            return self._reply(request, result, s)
         except TrustGraphError as e:
-            return self._error(request, not_registered_message(source, e))
-        return result
+            return self._reply(request, self._error(request, not_registered_message(source, e)), self._note(request))
 
     def wrap_tool_call(self, request: Any, execute: Callable[[Any], Any]) -> Any:
         """For ``ToolNode(wrap_tool_call=...)``."""
@@ -308,13 +368,14 @@ class Guard:
         """A LangChain ``AgentMiddleware`` for ``create_agent(middleware=[...])``.
 
         Put it last in the list (innermost), so it checks the arguments the
-        tool actually runs with."""
+        tool actually runs with. It declares ``trustgraph`` (with
+        ``merge_tokens``) in the agent's state."""
         from langchain.agents.middleware import AgentMiddleware, AgentState
 
         guard = self
 
         class TrustGraphState(AgentState):  # type: ignore[misc]
-            trustgraph: NotRequired[str]
+            trustgraph: NotRequired[Annotated[str, merge_tokens]]
 
         class TrustGraphMiddleware(AgentMiddleware):  # type: ignore[misc]
             state_schema = TrustGraphState
@@ -329,7 +390,7 @@ class Guard:
 
 
 def _has_history(state: Mapping[str, Any]) -> bool:
-    return any(getattr(m, "type", None) in ("ai", "tool") for m in _messages(state))
+    return any(isinstance(m, (AIMessage, ToolMessage)) for m in _messages(state))
 
 
 def agent_node(client: Client, agent: Any, *, key: str = KEY, first: bool = False) -> RunnableLambda:
@@ -338,22 +399,22 @@ def agent_node(client: Client, agent: Any, *, key: str = KEY, first: bool = Fals
 
     The session starts carrying ``state[key]`` (the previous agent's hand-off)
     and the node writes its own hand-off token back to ``state[key]``. Declare
-    ``key: str`` in the graph's state schema and start the graph with
-    ``{key: ""}``: LangGraph silently drops undeclared keys, so the node
-    raises ``handoff_missing`` before running the agent when the key is absent.
-    Only the node marked ``first=True`` may start from an empty token, and not
-    when the state already holds model or tool messages (a resumed thread whose
-    token was reset). Every other node requires a valid token. If the receiving
-    agent is not cleared for what the token carries, the node raises and the
-    graph run stops.
+    ``key: Annotated[str, merge_tokens]`` in the graph's state schema; the node
+    raises before running the agent when it is undeclared or has another
+    reducer. Only the node marked ``first=True`` may start from an empty token,
+    and not when the state already holds model or tool messages (a resumed
+    thread). Every other node requires a valid token. If the receiving agent
+    is not cleared for what the token carries, the node raises and the graph
+    run stops.
     """
 
-    def carry(state: Any) -> str | None:
+    def carry(state: Any, config: RunnableConfig) -> str | None:
+        _check_state_key(config, key)
         if not isinstance(state, Mapping) or key not in state:
             raise TrustGraphError(
                 "handoff_missing",
-                f"the graph state has no `{key}` key, so the hand-off would be lost: declare `{key}: str` in the "
-                f"state schema and start the graph with {{{key!r}: ''}}",
+                f"the graph state has no `{key}`, so the hand-off would be lost: declare "
+                f"`{key}: Annotated[str, merge_tokens]` in the state schema",
             )
         token = state[key]
         if token:
@@ -367,22 +428,22 @@ def agent_node(client: Client, agent: Any, *, key: str = KEY, first: bool = Fals
         if _has_history(state):
             raise TrustGraphError(
                 "resumed_without_session",
-                f"`{key}` is empty but the conversation already holds model or tool messages (a resumed thread); "
-                f"keep the thread's `{key}` from its checkpoint instead of passing an empty one",
+                f"`{key}` is empty but the conversation already holds model or tool messages (a resumed thread "
+                "whose token was lost)",
             )
         return None
 
     def update(state: Mapping[str, Any], result: Any, s: Session) -> Any:
         out = dict(result) if isinstance(result, Mapping) else {}
-        out[key] = s.handoff()
+        out[key] = s.handoff()  # raises on a broken session: the node fails and nothing is written
         return out
 
     def run(state: Mapping[str, Any], config: RunnableConfig) -> Any:
-        with client.session(carry=carry(state)) as s:
+        with client.session(carry=carry(state, config)) as s:
             return update(state, agent.invoke(state, config), s)
 
     async def arun(state: Mapping[str, Any], config: RunnableConfig) -> Any:
-        token = carry(state)
+        token = carry(state, config)
         s = await asyncio.to_thread(client.session, token)
         async with s:
             return update(state, await agent.ainvoke(state, config), s)
