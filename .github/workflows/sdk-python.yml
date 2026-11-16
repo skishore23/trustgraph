@@ -72,12 +72,15 @@ jobs:
           - extra: langchain
             module: langgraph
             tests: test_langchain.py
+            example: langgraph
           - extra: openai-agents
             module: agents
             tests: test_openai_agents.py
+            example: openai-agents
           - extra: claude-agent-sdk
             module: claude_agent_sdk
             tests: test_claude_agent_sdk.py
+            example: claude-agent-sdk
           - extra: mcp
             module: mcp
             tests: test_mcp.py
@@ -100,3 +103,9 @@ jobs:
           TRUSTGRAPH_BIN: ${{ github.workspace }}/bin/trustgraph
           OPENAI_AGENTS_DISABLE_TRACING: '1'
         run: pytest -q sdk/python/tests/integrations/${{ matrix.tests }}
+      - name: The example's output matches its README
+        if: matrix.example
+        env:
+          TRUSTGRAPH_BIN: ${{ github.workspace }}/bin/trustgraph
+          OPENAI_AGENTS_DISABLE_TRACING: '1'
+        run: python examples/integrations/check.py ${{ matrix.example }}

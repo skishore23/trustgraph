@@ -11,10 +11,10 @@ requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
-# The versions the tests ran against; see docs/integrations.md.
-langchain = ["langchain==1.5.0", "langchain-core==1.8.1", "langgraph==1.2.22"]
-openai-agents = ["openai-agents==0.24.0"]
-claude-agent-sdk = ["claude-agent-sdk==0.2.182"]
+# Lower bounds are the versions the tests ran against (docs/integrations.md).
+langchain = ["langchain>=1.5.0,<2", "langchain-core>=1.8.1,<2", "langgraph>=1.2.22,<2"]
+openai-agents = ["openai-agents>=0.24.0,<1"]
+claude-agent-sdk = ["claude-agent-sdk>=0.2.182,<1"]
 mcp = ["mcp==2.3.0", "pyyaml>=6"]
 test = ["pytest>=8"]
 
