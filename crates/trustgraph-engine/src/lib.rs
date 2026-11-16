@@ -18,7 +18,8 @@
 //! yet. Artifacts, Graph operations and lineage also grow with every agent
 //! call (remembered pending decisions are capped at 64 per agent and 1,024 in
 //! all; stored proposals at 32 for the operator, 32 for all agents with 8
-//! per agent, and one, the latest, from the policy file). A server that
+//! per agent, and one, the latest, from the policy file; live gateway
+//! sessions at 1,024, 64 per agent, each carrying at most 64 artifacts). A server that
 //! exposes this runtime to agents must add per-agent quotas, as
 //! `trustgraph serve` does; [`Runtime::agent_usage`] gives what each agent's
 //! journal records take, rebuilt at open.
@@ -40,7 +41,9 @@ mod runtime;
 /// engine bugs are compiled in. Production builds must have it false.
 pub const FAULT_INJECTION: bool = cfg!(feature = "fault-injection");
 
-pub use engine::{Engine, LiveApproval, PendingDecision, ProposalOrigin, StoredProposal};
+pub use engine::{
+    Engine, GatewaySession, LiveApproval, PendingDecision, ProposalOrigin, StoredProposal,
+};
 #[cfg(feature = "fault-injection")]
 pub use event::Fault;
 pub use event::{Event, Reply};

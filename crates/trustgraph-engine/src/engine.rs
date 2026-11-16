@@ -38,6 +38,31 @@ const MAX_DECISIONS_PER_AGENT: usize = 64;
 const SCHEMA: &str = "any";
 const OUTPUT_PORT: &str = "out";
 const RECEIPT: &str = "trustgraph-engine";
+/// Live gateway sessions, in all and per agent.
+const MAX_SESSIONS: usize = 1024;
+const MAX_SESSIONS_PER_AGENT: usize = 64;
+/// Artifacts one gateway session may carry: what one output may take as inputs.
+const MAX_SESSION_ARTIFACTS: usize = crate::rules::MAX_INPUTS;
+
+/// A gateway session: what one agent's session has read or received.
+#[derive(Debug, Clone, Serialize)]
+struct Session {
+    agent: String,
+    started_at: u64,
+    artifacts: BTreeSet<String>,
+}
+
+/// A live gateway session, as `Engine::sessions` lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GatewaySession {
+    pub session: String,
+    pub agent: String,
+    pub started_at: u64,
+    /// Sorted artifact ids.
+    pub artifacts: Vec<String>,
+    /// Source names those artifacts derive from.
+    pub sources: Vec<String>,
+}
 
 /// A `NeedsApproval` decision, kept so it can be approved or revoked.
 #[derive(Debug, Clone, Serialize)]
@@ -159,6 +184,8 @@ pub struct Engine {
     approvals: BTreeMap<String, Granted>,
     /// Oldest first.
     proposals: Vec<Proposal>,
+    /// Live gateway sessions by id.
+    sessions: BTreeMap<String, Session>,
 }
 
 type Handled = Result<Reply, Reply>;
@@ -209,6 +236,12 @@ impl Engine {
                 self.activate_proposal(at, proposal, operator)
             }
             Event::ProposeFromFile { policy } => self.propose_from_file(policy),
+            Event::SessionCarry {
+                session,
+                agent,
+                artifacts,
+            } => self.session_carry(at, session, agent, artifacts),
+            Event::EndSession { session } => self.end_session(session),
         };
         handled.unwrap_or_else(|rejected| rejected)
     }
@@ -335,6 +368,34 @@ impl Engine {
             .collect()
     }
 
+    /// Live gateway sessions, by id.
+    pub fn sessions(&self) -> Vec<GatewaySession> {
+        self.sessions
+            .iter()
+            .map(|(id, s)| self.session_view(id, s))
+            .collect()
+    }
+
+    /// One live gateway session.
+    pub fn session(&self, id: &str) -> Option<GatewaySession> {
+        self.sessions.get(id).map(|s| self.session_view(id, s))
+    }
+
+    fn session_view(&self, id: &str, s: &Session) -> GatewaySession {
+        let sources: BTreeSet<String> = s
+            .artifacts
+            .iter()
+            .flat_map(|a| self.lineage(a).unwrap_or_default())
+            .collect();
+        GatewaySession {
+            session: id.to_string(),
+            agent: s.agent.clone(),
+            started_at: s.started_at,
+            artifacts: s.artifacts.iter().cloned().collect(),
+            sources: sources.into_iter().collect(),
+        }
+    }
+
     fn approval_is_live(&self, decision: &str, at: u64) -> bool {
         self.approvals
             .get(decision)
@@ -343,7 +404,8 @@ impl Engine {
 
     /// SHA-256 over everything that affects future replies: the policy digest,
     /// revision, clock, artifacts, lineage, source permissions, action rules,
-    /// remembered decisions, approvals with expiry, and proposals.
+    /// remembered decisions, approvals with expiry, proposals and gateway
+    /// sessions.
     pub fn state_digest(&self) -> String {
         #[derive(Serialize)]
         struct State<'a> {
@@ -362,6 +424,7 @@ impl Engine {
             next_seq: u64,
             approvals: &'a BTreeMap<String, Granted>,
             proposals: Vec<(&'a String, &'a ProposalOrigin)>,
+            sessions: &'a BTreeMap<String, Session>,
         }
         let permissions = self
             .sources
@@ -395,6 +458,7 @@ impl Engine {
             next_seq: self.next_seq,
             approvals: &self.approvals,
             proposals: self.proposals.iter().map(|p| (&p.id, &p.origin)).collect(),
+            sessions: &self.sessions,
         };
         digest::structured("engine-state-v2", &state).0
     }
@@ -574,40 +638,7 @@ impl Engine {
     }
 
     fn record_output(&mut self, agent: &str, step: &str, inputs: &[String], sha: &str) -> Handled {
-        let policy = self.active()?;
-        if !policy.agents.contains(agent) {
-            return Err(reject(
-                "unknown_agent",
-                format!("`{}` is not an agent in the active policy", clip(agent)),
-            ));
-        }
-        for input in inputs {
-            if !self
-                .graph
-                .artifacts()
-                .contains_key(&ArtifactId(input.clone()))
-            {
-                return Err(reject(
-                    "unknown_artifact",
-                    format!("no artifact `{}`", clip(input)),
-                ));
-            }
-        }
-        for input in inputs {
-            let names = self.source_names(input)?;
-            if let Some(name) = names.iter().find(|n| {
-                !policy
-                    .sources
-                    .get(*n)
-                    .is_some_and(|s| s.agents.contains(agent))
-            }) {
-                let [agent, name] = echo([agent, name]);
-                return Err(reject(
-                    "agent_cannot_use_source",
-                    format!("agent `{agent}` may not use source `{name}`"),
-                ));
-            }
-        }
+        self.agent_may_use(agent, inputs)?;
 
         let key: OutputKey = (agent.into(), step.into(), inputs.to_vec(), sha.into());
         if let Some(id) = self.outputs.get(&key) {
@@ -659,6 +690,106 @@ impl Engine {
             .clone();
         self.outputs.insert(key, id.clone());
         Ok(Reply::Artifact { id })
+    }
+
+    /// `agent` is an agent of the active policy, every input exists, and
+    /// the agent may use every source each input derives from.
+    fn agent_may_use(&self, agent: &str, inputs: &[String]) -> Result<(), Reply> {
+        let policy = self.active()?;
+        if !policy.agents.contains(agent) {
+            return Err(reject(
+                "unknown_agent",
+                format!("`{}` is not an agent in the active policy", clip(agent)),
+            ));
+        }
+        for input in inputs {
+            if !self
+                .graph
+                .artifacts()
+                .contains_key(&ArtifactId(input.clone()))
+            {
+                return Err(reject(
+                    "unknown_artifact",
+                    format!("no artifact `{}`", clip(input)),
+                ));
+            }
+        }
+        for input in inputs {
+            let names = self.source_names(input)?;
+            if let Some(name) = names.iter().find(|n| {
+                !policy
+                    .sources
+                    .get(*n)
+                    .is_some_and(|s| s.agents.contains(agent))
+            }) {
+                let [agent, name] = echo([agent, name]);
+                return Err(reject(
+                    "agent_cannot_use_source",
+                    format!("agent `{agent}` may not use source `{name}`"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn session_carry(
+        &mut self,
+        at: u64,
+        session: &str,
+        agent: &str,
+        artifacts: &[String],
+    ) -> Handled {
+        self.agent_may_use(agent, artifacts)?;
+        let existing = self.sessions.get(session);
+        if let Some(existing) = existing
+            && existing.agent != agent
+        {
+            return Err(reject(
+                "session_agent_mismatch",
+                "that session belongs to another agent",
+            ));
+        }
+        if existing.is_none() {
+            let of_agent = self.sessions.values().filter(|s| s.agent == agent).count();
+            if self.sessions.len() >= MAX_SESSIONS || of_agent >= MAX_SESSIONS_PER_AGENT {
+                return Err(reject(
+                    "too_many_sessions",
+                    format!(
+                        "at most {MAX_SESSIONS} gateway sessions, {MAX_SESSIONS_PER_AGENT} per agent, may be live"
+                    ),
+                ));
+            }
+        }
+        let mut carried = existing.map(|s| s.artifacts.clone()).unwrap_or_default();
+        carried.extend(artifacts.iter().cloned());
+        if carried.len() > MAX_SESSION_ARTIFACTS {
+            return Err(reject(
+                "session_full",
+                format!("a session may carry at most {MAX_SESSION_ARTIFACTS} artifacts"),
+            ));
+        }
+        let entry = self
+            .sessions
+            .entry(session.to_string())
+            .or_insert_with(|| Session {
+                agent: agent.to_string(),
+                started_at: at,
+                artifacts: BTreeSet::new(),
+            });
+        entry.artifacts = carried;
+        Ok(Reply::Session {
+            session: session.to_string(),
+            artifacts: entry.artifacts.iter().cloned().collect(),
+        })
+    }
+
+    fn end_session(&mut self, session: &str) -> Handled {
+        if self.sessions.remove(session).is_none() {
+            return Err(reject("unknown_session", "no live session with that id"));
+        }
+        Ok(Reply::SessionEnded {
+            session: session.to_string(),
+        })
     }
 
     fn check(

@@ -97,11 +97,13 @@ pub struct Runtime<J: Journal> {
     usage: BTreeMap<String, AgentUsage>,
 }
 
-/// The agent a record is attributed to: `RecordOutput`, `Check` and an
-/// agent's `ProposePolicy` name one. `RegisterSource` names none.
+/// The agent a record is attributed to: `RecordOutput`, `Check`,
+/// `SessionCarry` and an agent's `ProposePolicy` name one. `RegisterSource` names none.
 fn record_agent(event: &Event) -> Option<&str> {
     match event {
-        Event::RecordOutput { agent, .. } | Event::Check { agent, .. } => Some(agent),
+        Event::RecordOutput { agent, .. }
+        | Event::Check { agent, .. }
+        | Event::SessionCarry { agent, .. } => Some(agent),
         Event::ProposePolicy { agent, .. } => agent.as_deref(),
         _ => None,
     }
