@@ -12,6 +12,7 @@ session read to the next agent's session, so restrictions follow the work.
 | Framework | How it plugs in | Can the agent bypass it? |
 | --- | --- | --- |
 | [LangChain / LangGraph](#langchain-and-langgraph) | Tool wrappers, or `ToolNode` `wrap_tool_call` / `create_agent` middleware | Only through tools you did not wrap or map |
+| [OpenAI Agents SDK](#openai-agents-sdk) | Function-tool input and output guardrails; run hooks for hand-offs | Only through tools you did not map, or tool kinds guardrails do not cover |
 
 A library integration is only as strong as the host program: a tool called
 without the wrapper, or a tool missing from the map, is not checked. Sessions
@@ -66,3 +67,50 @@ Not covered: tools that return a `Command` cannot be sources (the result is
 withheld); tool calls a graph makes outside `ToolNode` or `create_agent` are
 not seen by the guard; the hand-off token lives in graph state, so any node
 that rewrites `state["trustgraph"]` can drop restrictions.
+
+## OpenAI Agents SDK
+
+Tested with openai-agents 0.24.0.
+
+```sh
+pip install "./sdk/python[openai-agents]"
+```
+
+```python
+import trustgraph
+from trustgraph.integrations.openai_agents import Guard
+
+guard = Guard(
+    clients={"planner": trustgraph.Client(token_file="~/.trustgraph/serve/tokens/planner.token")},
+    sources={"read_salaries": "salaries"},
+    actions={"post_message": "post_to_engineering"},
+)
+guard.protect(planner)  # planner = Agent(name="planner", tools=[read_salaries, post_message], ...)
+result = guard.run_sync(planner, "Post the Q3 plan")
+```
+
+- **Tools.** An action is a tool input guardrail: it records the call's
+  arguments (or `Action(..., content=lambda args: ...)`) and checks them before
+  the tool runs. A source is a tool output guardrail: it registers the result
+  before the model sees it. `as_source(tool, ...)` and `as_action(tool, ...)`
+  return a guarded copy of one `FunctionTool`; `guard.protect(*agents)` does
+  this for every mapped tool of those agents.
+- **Blocked calls.** The guardrail returns `reject_content`: the tool does
+  not run, or its result is withheld, and the model receives "TrustGraph
+  blocked …", "TrustGraph held …" (needs approval, with the decision id) or
+  "could not complete the check".
+- **Sessions.** `guard.run` / `guard.run_sync` give each agent of the run its
+  own session, from its entry in `clients`; an agent with no client is
+  refused. Without `Guard.run`, the guardrails use the current session
+  (`with client.session():`). For `Runner.run_streamed`, wrap the call in
+  `with guard.scope():` and pass `hooks=guard.hooks()`.
+- **Hand-offs.** On every hand-off the receiving agent's session receives what
+  the previous agent's session saw (`RunHooks.on_handoff`). If the receiving
+  agent is not cleared for it, the run stops with `TrustGraphError`.
+  Example: [examples/integrations/openai-agents](../examples/integrations/openai-agents).
+
+Not covered: hosted tools (web search, file search, hosted MCP, code
+interpreter, image generation), computer, shell and apply-patch tools, and
+the hand-off call itself do not go through tool guardrails. `Agent.as_tool()`
+runs a nested agent whose session is not linked to the caller's: map the
+agent-tool itself as a source if what it returns must stay restricted.
