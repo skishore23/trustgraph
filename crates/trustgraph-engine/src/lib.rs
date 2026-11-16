@@ -8,6 +8,7 @@
 mod engine;
 mod event;
 mod journal;
+mod rules;
 mod runtime;
 
 pub use engine::Engine;
