@@ -81,10 +81,9 @@ These become real the moment agents can reach the runtime over HTTP or MCP.
   output. A human-approved, audited "release" exception is the likely first
   feature request after part 3.
 
-## Not yet verified
+## Verified after merge
 
-- The four Kani harnesses in `crates/trustgraph-core/src/decision.rs` have not
-  run: Kani is not installed locally. The `Bounded permission proofs` workflow
-  runs them on a pull request or a push to `main` that touches
-  `crates/trustgraph-core`. Record the result in `docs/verification.md` only
-  after that run.
+- All ten Kani harnesses, including the four new ones in
+  `crates/trustgraph-core/src/decision.rs`, passed in
+  [CI run 43787456648](https://github.com/skishore23/trustgraph/actions/runs/43787456648)
+  on commit `c48d64c`. Results are recorded in `docs/verification.md`.

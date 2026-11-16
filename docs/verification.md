@@ -46,7 +46,7 @@ intersection, ordered unique output, and subset correctness with unwind 8. The
 larger unwind permits merges of disjoint key ranges. No safety, overflow or
 unwinding assertions are disabled. An insufficient loop bound fails verification.
 
-**Decision kernel bounds:** the three gate harnesses cover all 1,024 fact combinations; `approval_window_is_exact_and_overflow_free` covers arbitrary u64 inputs; all four are loop-free, so no unwind bound is needed. Their results will be recorded after a CI run.
+**Decision kernel bounds:** the three gate harnesses cover all 1,024 fact combinations; `approval_window_is_exact_and_overflow_free` covers arbitrary u64 inputs; all four are loop-free, so no unwind bound is needed. Their first CI result is recorded under [CI confirmation](#ci-confirmation).
 
 These are bounded proofs of the production iterator kernels with slice iterators,
 not an unbounded theorem for arbitrary sizes, types, graph shapes, or schedules.
@@ -111,6 +111,30 @@ failed (13 unreachable). The other five completed in 19.20, 7.56, 13.26, 7.26 an
 11.99 solver seconds, respectively, in the table's order. This supersedes the
 local inconclusive outcome for that extension, without changing the bounds or
 expanding the proof to the BTreeSet adapters or the whole application.
+
+[GitHub Actions run 43787456648](https://github.com/skishore23/trustgraph/actions/runs/43787456648)
+verified code commit `c48d64cd8078d66de32ed9945a689e4e41cbae37` on 2026-11-15,
+the first run to include the decision kernel: **all ten harnesses successfully
+verified, zero failures**.
+
+| Harness | Result | Verification seconds |
+| --- | --- | ---: |
+| `decision::gate_allows_only_when_every_fact_holds` | 0 of 13 checks failed | 0.03 |
+| `decision::approval_cannot_turn_a_denial_into_allow` | 0 of 14 checks failed | 0.04 |
+| `decision::needs_approval_implies_otherwise_allowed` | 0 of 14 checks failed | 0.04 |
+| `decision::approval_window_is_exact_and_overflow_free` | 0 of 4 checks failed | 0.07 |
+| `permissions::recipient_must_be_permitted_by_every_input` | 0 of 584 checks failed (6 unreachable) | 15.44 |
+| `permissions::duplicate_or_reordered_inputs_preserve_readers` | 0 of 516 checks failed (6 unreachable) | 6.19 |
+| `permissions::composition_is_associative` | 0 of 515 checks failed (6 unreachable) | 10.63 |
+| `permissions::subset_kernel_matches_membership` | 0 of 616 checks failed (18 unreachable) | 5.91 |
+| `permissions::intersection_kernel_matches_membership` | 0 of 742 checks failed (18 unreachable) | 9.86 |
+| `permissions::arbitrary_keys_match_set_specification` | 0 of 597 checks failed (13 unreachable) | 142.54 |
+
+The four decision harnesses cover the allow / needs-approval / deny ordering and
+the approval time window that `trustgraph_policy::decide` and the runtime engine
+both call. They do not cover how those callers compute the ten facts, group
+expansion, the journal, or the simulator; those are covered by tests and the
+seeded simulator, not by proof.
 
 Compilation reports potentially unsupported `caller_location` and a foreign
 function in the crate. Kani inserts reachable-unsupported checks; those checks
