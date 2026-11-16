@@ -55,6 +55,16 @@ fn validate(policy_yaml: &str) -> Result<String, OpenError> {
     Ok(policy.digest())
 }
 
+fn engine_rejected(message: String) -> OpenError {
+    OpenError::InvalidPolicy(vec![Diagnostic {
+        severity: Severity::Error,
+        path: String::new(),
+        code: "engine_rejected",
+        message,
+        suggestion: None,
+    }])
+}
+
 impl<J: Journal> Runtime<J> {
     pub fn open(journal: J, policy_yaml: &str, at: u64) -> Result<Self, OpenError> {
         Self::open_with_fault(journal, policy_yaml, at, Fault::None)
@@ -70,9 +80,23 @@ impl<J: Journal> Runtime<J> {
         fault: Fault,
     ) -> Result<Self, OpenError> {
         let wanted = validate(policy_yaml)?;
+        let genesis = |policy_yaml: &str| Event::Genesis {
+            policy: policy_yaml.to_string(),
+        };
         let records = journal.load()?;
+        if records.is_empty() {
+            // Nothing may be journaled that the engine would refuse.
+            let reply = Engine::new()
+                .with_fault(fault)
+                .apply(at, &genesis(policy_yaml));
+            if let Reply::Rejected { code: _, message } = reply {
+                return Err(engine_rejected(message));
+            }
+        }
         let mut engine = Engine::new().with_fault(fault);
         let mut previous_at = 0;
+        // Digest of the policy in the last Genesis the engine accepted.
+        let mut file_digest: Option<String> = None;
         for (index, record) in records.iter().enumerate() {
             let replay = |reason: String| OpenError::Replay {
                 seq: record.seq,
@@ -90,8 +114,14 @@ impl<J: Journal> Runtime<J> {
             }
             previous_at = record.at;
             let reply = engine.apply(record.at, &record.event);
-            if let (true, Reply::Rejected { code, message }) = (is_genesis, &reply) {
-                return Err(replay(format!("Genesis was rejected: {code}: {message}")));
+            match (&reply, is_genesis) {
+                (Reply::Rejected { code, message }, true) if index == 0 => {
+                    return Err(replay(format!("Genesis was rejected: {code}: {message}")));
+                }
+                // A later rejected Genesis was rejected the same way live.
+                (Reply::Rejected { .. }, _) => {}
+                (_, true) => file_digest = engine.policy().map(|p| p.digest()),
+                _ => {}
             }
         }
         let (last_seq, last_hash) = records
@@ -104,18 +134,13 @@ impl<J: Journal> Runtime<J> {
             last_hash,
             last_at: previous_at,
         };
-        let active = runtime.engine.policy().map(|p| p.digest());
-        if active.as_deref() != Some(wanted.as_str()) {
+        // The file wins only when it changed since the last start; an in-band
+        // activation since then is kept.
+        if file_digest.as_deref() != Some(wanted.as_str()) {
             let at = at.max(runtime.last_at);
-            let genesis = Event::Genesis {
-                policy: policy_yaml.to_string(),
-            };
-            let reply = runtime.append_and_apply(at, genesis)?;
-            if let Reply::Rejected { code, message } = reply {
-                return Err(OpenError::Replay {
-                    seq: runtime.last_seq,
-                    reason: format!("Genesis was rejected: {code}: {message}"),
-                });
+            let reply = runtime.append_and_apply(at, genesis(policy_yaml))?;
+            if let Reply::Rejected { message, .. } = reply {
+                return Err(engine_rejected(message));
             }
         }
         Ok(runtime)

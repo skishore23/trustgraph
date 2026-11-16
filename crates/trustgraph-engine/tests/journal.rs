@@ -172,11 +172,7 @@ fn second_open_is_locked() {
 
 #[test]
 fn torn_tail_is_dropped() {
-    for tail in [
-        "{\"seq\":99,\"at\":1,\"ev",
-        "{\"seq\":99,\"at\":1,\"ev\n",
-        "not json\n",
-    ] {
+    for tail in ["{\"seq\":99,\"at\":1,\"ev", "not json", "{"] {
         let dir = tempfile::tempdir().unwrap();
         let mut rt = Runtime::open(file_journal(dir.path()), SPEC, 0).unwrap();
         ten_events(&mut rt);
@@ -372,11 +368,8 @@ fn clock_regression_is_not_journaled() {
     ));
     let journal = rt.into_journal();
     assert_eq!(journal.records().len(), 3, "genesis + two accepted events");
-    let digest = {
-        let rt = Runtime::open(journal.clone(), SPEC, 0).unwrap();
-        rt.engine().state_digest()
-    };
-    assert_eq!(digest.len(), 64);
+    let rt = Runtime::open(journal, SPEC, 0).unwrap();
+    assert_eq!(rt.engine().state_digest(), digest);
 }
 
 #[test]
@@ -465,4 +458,158 @@ fn file_permissions_are_private() {
         assert_eq!(mode(&sub), 0o700);
         assert_eq!(mode(&sub.join("journal.jsonl")), 0o600);
     }
+}
+
+#[test]
+fn terminated_bad_final_line_is_corrupt_not_torn() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = Runtime::open(file_journal(dir.path()), SPEC, 0).unwrap();
+    rt.handle(1, register_roadmap()).unwrap();
+    drop(rt);
+    let good = text(dir.path());
+
+    // Terminated but unparseable.
+    fs::write(
+        dir.path().join("journal.jsonl"),
+        format!("{good}not json\n"),
+    )
+    .unwrap();
+    assert!(matches!(
+        FileJournal::open(dir.path()).unwrap().load(),
+        Err(JournalError::Corrupt { seq: 3, .. })
+    ));
+
+    // Valid JSON, wrong hash.
+    let mut last: Record = serde_json::from_str(good.lines().last().unwrap()).unwrap();
+    last.hash = "0".repeat(64);
+    let mut lines: Vec<String> = good.lines().map(str::to_string).collect();
+    *lines.last_mut().unwrap() = serde_json::to_string(&last).unwrap();
+    fs::write(dir.path().join("journal.jsonl"), lines.join("\n") + "\n").unwrap();
+    assert!(matches!(
+        FileJournal::open(dir.path()).unwrap().load(),
+        Err(JournalError::Corrupt { seq: 2, .. })
+    ));
+}
+
+#[test]
+fn a_later_rejected_genesis_does_not_brick_the_journal() {
+    let bad = Event::Genesis {
+        policy: "not: [yaml".into(),
+    };
+    let dir = sealed_journal_dir(&[(0, genesis_event()), (1, bad.clone())]);
+    let rt = Runtime::open(file_journal(dir.path()), SPEC, 5).unwrap();
+    assert_eq!(rt.engine().policy_revision(), 1);
+    assert_eq!(text(dir.path()).lines().count(), 2, "nothing appended");
+    drop(rt);
+
+    // A rejected FIRST record is still fatal.
+    let dir = sealed_journal_dir(&[(0, bad)]);
+    assert!(matches!(
+        Runtime::open(file_journal(dir.path()), SPEC, 5),
+        Err(OpenError::Replay { seq: 1, .. })
+    ));
+}
+
+fn activate_in_band(rt: &mut Runtime<MemoryJournal>, at: u64, policy: &str) {
+    let id = match rt
+        .handle(
+            at,
+            Event::ProposePolicy {
+                agent: None,
+                policy: policy.into(),
+            },
+        )
+        .unwrap()
+    {
+        Reply::Proposed { id, .. } => id,
+        other => panic!("{other:?}"),
+    };
+    let reply = rt
+        .handle(
+            at,
+            Event::ActivatePolicy {
+                proposal: id,
+                operator: "leo".into(),
+            },
+        )
+        .unwrap();
+    assert!(matches!(reply, Reply::Activated { .. }), "{reply:?}");
+}
+
+#[test]
+fn restart_keeps_an_in_band_activation() {
+    let mut rt = Runtime::open(MemoryJournal::new(), SPEC, 0).unwrap();
+    activate_in_band(&mut rt, 1, &narrowed());
+    assert_eq!(rt.engine().policy_revision(), 2);
+    // An approval issued after the activation.
+    let sheet = artifact(
+        rt.handle(
+            2,
+            Event::RegisterSource {
+                source: "price_sheet".into(),
+                sha256: sha(3),
+            },
+        )
+        .unwrap(),
+    );
+    let out = artifact(
+        rt.handle(
+            3,
+            Event::RecordOutput {
+                agent: "mailer".into(),
+                step: "draft".into(),
+                inputs: vec![sheet],
+                sha256: sha(10),
+            },
+        )
+        .unwrap(),
+    );
+    let email = Event::Check {
+        agent: "mailer".into(),
+        artifact: out,
+        action: "email_customer".into(),
+        recipients: None,
+    };
+    let decision = match rt.handle(4, email.clone()).unwrap() {
+        Reply::Decision { id, verdict, .. } => {
+            assert_eq!(verdict, Verdict::NeedsApproval);
+            id
+        }
+        other => panic!("{other:?}"),
+    };
+    let approved = rt
+        .handle(
+            5,
+            Event::Approve {
+                decision,
+                reviewer: "leo".into(),
+            },
+        )
+        .unwrap();
+    assert!(matches!(approved, Reply::Approved { .. }), "{approved:?}");
+    let digest = rt.engine().state_digest();
+    let active = rt.engine().policy().unwrap().digest();
+    let journal = rt.into_journal();
+    let len = journal.records().len();
+
+    // The ORIGINAL file again: it did not change, so nothing is appended.
+    let rt = Runtime::open(journal, SPEC, 100).unwrap();
+    assert_eq!(rt.engine().state_digest(), digest);
+    assert_eq!(rt.engine().policy().unwrap().digest(), active);
+    assert_eq!(rt.engine().policy_revision(), 2);
+    let journal = rt.into_journal();
+    assert_eq!(journal.records().len(), len);
+
+    // A reformatted copy of the same policy is not a change either.
+    let reformatted = format!("# edited\n\n{SPEC}\n\n# end\n");
+    let rt = Runtime::open(journal, &reformatted, 100).unwrap();
+    let journal = rt.into_journal();
+    assert_eq!(journal.records().len(), len);
+
+    // A different file wins: one new Genesis, revision + 1.
+    let third = SPEC.replace("valid_for: 30m", "valid_for: 20m");
+    assert_ne!(third, SPEC);
+    let rt = Runtime::open(journal, &third, 100).unwrap();
+    assert_eq!(rt.engine().policy_revision(), 3);
+    assert_eq!(rt.into_journal().records().len(), len + 1);
 }

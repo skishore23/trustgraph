@@ -3,6 +3,11 @@
 //!
 //! One record per line. `hash` is the SHA-256 of the canonical encoding of
 //! `(prev, seq, at, event)`, so any edit, reorder or gap breaks the chain.
+//!
+//! Limits: the chain detects edits, reordering and gaps inside the file. It
+//! does NOT detect removal of trailing records or deletion of the whole file,
+//! because there is no external head anchor. Protect the file with filesystem
+//! permissions and keep it outside any agent workspace.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -147,12 +152,18 @@ pub struct FileJournal {
     file: File,
     chain: Chain,
     loaded: bool,
+    /// Set when a failed write could not be undone, or its durability is
+    /// unknown. Cleared only by a successful `load`.
+    poisoned: bool,
 }
+
+const POISONED: &str = "journal poisoned: reload required";
 
 impl FileJournal {
     pub fn open(dir: &Path) -> Result<Self, JournalError> {
         create_dir(dir)?;
         let path = dir.join(FILE_NAME);
+        let existed = path.exists();
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
         #[cfg(unix)]
@@ -161,6 +172,9 @@ impl FileJournal {
             options.mode(0o600);
         }
         let file = options.open(&path).map_err(io)?;
+        if !existed {
+            sync_dir(dir)?;
+        }
         if let Err(error) = file.try_lock_exclusive() {
             let contended = fs2::lock_contended_error().raw_os_error();
             let held = error.kind() == std::io::ErrorKind::WouldBlock
@@ -176,6 +190,7 @@ impl FileJournal {
             file,
             chain: Chain::new(),
             loaded: false,
+            poisoned: false,
         })
     }
 
@@ -193,7 +208,29 @@ fn create_dir(dir: &Path) -> Result<(), JournalError> {
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(0o700);
     }
-    builder.create(dir).map_err(io)
+    let existed = dir.exists();
+    builder.create(dir).map_err(io)?;
+    if !existed && let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+
+/// fsync a directory so a new entry in it is durable. Platforms that cannot
+/// open or sync a directory are skipped; other failures are errors.
+fn sync_dir(dir: &Path) -> Result<(), JournalError> {
+    #[cfg(unix)]
+    {
+        use std::io::ErrorKind;
+        match File::open(dir).and_then(|d| d.sync_all()) {
+            Ok(()) => {}
+            Err(e) if matches!(e.kind(), ErrorKind::InvalidInput | ErrorKind::Unsupported) => {}
+            Err(e) => return Err(io(e)),
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 impl Journal for FileJournal {
@@ -219,30 +256,24 @@ impl Journal for FileJournal {
                     reason: format!("line is longer than {MAX_LINE} bytes"),
                 });
             }
-            let is_last = next.is_empty();
-            let parsed = serde_json::from_slice::<Record>(line);
-            match (complete, parsed) {
-                (true, Ok(record)) => {
-                    chain.accept(&record).map_err(|e| match e {
-                        JournalError::Corrupt { reason, .. } => JournalError::Corrupt {
-                            seq: line_no,
-                            reason,
-                        },
-                        other => other,
-                    })?;
-                    good_len += line.len() + 1;
-                    records.push(record);
-                }
-                // A torn tail: the last line is incomplete or unparseable.
-                (false, _) | (true, Err(_)) if is_last => break,
-                (_, Err(error)) => {
-                    return Err(JournalError::Corrupt {
-                        seq: line_no,
-                        reason: format!("unparseable record: {error}"),
-                    });
-                }
-                (false, Ok(_)) => unreachable!("an unterminated line is always the last"),
+            if !complete {
+                // Only an unterminated final line is a torn tail.
+                break;
             }
+            let record =
+                serde_json::from_slice::<Record>(line).map_err(|error| JournalError::Corrupt {
+                    seq: line_no,
+                    reason: format!("line {line_no} is unparseable: {error}"),
+                })?;
+            chain.accept(&record).map_err(|e| match e {
+                JournalError::Corrupt { reason, .. } => JournalError::Corrupt {
+                    seq: line_no,
+                    reason: format!("line {line_no}: {reason}"),
+                },
+                other => other,
+            })?;
+            good_len += line.len() + 1;
+            records.push(record);
             rest = next;
         }
         if good_len < data.len() {
@@ -252,10 +283,14 @@ impl Journal for FileJournal {
         self.file.seek(SeekFrom::End(0)).map_err(io)?;
         self.chain = chain;
         self.loaded = true;
+        self.poisoned = false;
         Ok(records)
     }
 
     fn append(&mut self, record: &Record) -> Result<(), JournalError> {
+        if self.poisoned {
+            return Err(JournalError::Io(POISONED.into()));
+        }
         if !self.loaded {
             if self.file.metadata().map_err(io)?.len() > 0 {
                 return Err(JournalError::Io("journal not loaded".into()));
@@ -266,18 +301,93 @@ impl Journal for FileJournal {
         next.accept(record)?;
         let line = record.encode()?;
         let start = self.file.seek(SeekFrom::End(0)).map_err(io)?;
-        let written = self
-            .file
-            .write_all(&line)
-            .and_then(|()| self.file.sync_data());
-        if let Err(error) = written {
-            // Best effort: do not leave half a line behind.
-            let _ = self.file.set_len(start);
-            let _ = self.file.seek(SeekFrom::End(0));
-            return Err(io(error));
+        let written = self.file.write_all(&line);
+        let synced = if written.is_ok() {
+            self.file.sync_data()
+        } else {
+            Ok(())
+        };
+        let file = &mut self.file;
+        let outcome = settle(written, synced, || {
+            file.set_len(start)?;
+            file.sync_data()?;
+            file.seek(SeekFrom::End(0)).map(|_| ())
+        });
+        match outcome {
+            Settled::Done => {
+                self.chain = next;
+                Ok(())
+            }
+            Settled::Failed(error) => Err(io(error)),
+            Settled::Poisoned(error) => {
+                self.poisoned = true;
+                Err(io(error))
+            }
         }
-        self.chain = next;
-        Ok(())
+    }
+}
+
+/// What a write attempt left behind.
+#[derive(Debug)]
+enum Settled {
+    /// Written and durable.
+    Done,
+    /// Not written, and any partial line was removed: safe to continue.
+    Failed(std::io::Error),
+    /// A partial line may remain, or durability is unknown: reload first.
+    Poisoned(std::io::Error),
+}
+
+/// Decide the state after a write. `rollback` removes a partial line.
+fn settle(
+    written: std::io::Result<()>,
+    synced: std::io::Result<()>,
+    rollback: impl FnOnce() -> std::io::Result<()>,
+) -> Settled {
+    match (written, synced) {
+        (Err(error), _) => match rollback() {
+            Ok(()) => Settled::Failed(error),
+            Err(_) => Settled::Poisoned(error),
+        },
+        (Ok(()), Err(error)) => Settled::Poisoned(error),
+        (Ok(()), Ok(())) => Settled::Done,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fail() -> std::io::Result<()> {
+        Err(std::io::Error::other("boom"))
+    }
+
+    #[test]
+    fn settle_poisons_unless_the_partial_write_was_undone() {
+        assert!(matches!(settle(Ok(()), Ok(()), fail), Settled::Done));
+        assert!(matches!(
+            settle(fail(), Ok(()), || Ok(())),
+            Settled::Failed(_)
+        ));
+        assert!(matches!(settle(fail(), Ok(()), fail), Settled::Poisoned(_)));
+        assert!(matches!(
+            settle(Ok(()), fail(), || Ok(())),
+            Settled::Poisoned(_)
+        ));
+    }
+
+    #[test]
+    fn a_poisoned_journal_refuses_appends_until_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = FileJournal::open(dir.path()).unwrap();
+        journal.poisoned = true;
+        let record = Record::seal(1, 0, Event::Genesis { policy: "x".into() }, GENESIS_PREV);
+        assert_eq!(
+            journal.append(&record),
+            Err(JournalError::Io(POISONED.into()))
+        );
+        journal.load().unwrap();
+        journal.append(&record).unwrap();
     }
 }
 
