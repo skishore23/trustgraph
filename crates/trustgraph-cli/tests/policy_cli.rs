@@ -204,7 +204,7 @@ fn schema_validates_shape() {
 #[test]
 fn missing_file_exits_2() {
     let d = tempfile::tempdir().unwrap();
-    for cmd in ["check", "test", "explain"] {
+    for cmd in ["check", "test", "explain", "simulate"] {
         let o = tg(d.path(), &[cmd, "nope.yaml"]);
         assert_eq!(code(&o), 2, "{cmd}");
         assert!(String::from_utf8_lossy(&o.stderr).starts_with("error: cannot read nope.yaml:"));
@@ -241,6 +241,66 @@ fn non_utf8_exits_2() {
     let d = tempfile::tempdir().unwrap();
     std::fs::write(d.path().join("b.yaml"), [0xff, 0xfe, 0x00]).unwrap();
     let o = tg(d.path(), &["check", "b.yaml", "--json"]);
+    assert_eq!(code(&o), 2);
+    assert_eq!(json(&o)["error"]["code"], "io");
+}
+
+#[test]
+fn simulate_rejects_seed_overflow() {
+    let o = sim(&["--seed", "18446744073709551615", "--count", "5", "--json"]);
+    assert_eq!(code(&o), 2, "{}", stdout(&o));
+    let v = json(&o);
+    assert_eq!(v["error"]["code"], "usage");
+    assert_eq!(
+        v["error"]["message"],
+        "--seed plus --count must not exceed 18446744073709551615"
+    );
+    // The simulator's seed range is exclusive of its end, so seed MAX never runs.
+    let o = sim(&["--seed", "18446744073709551615", "--count", "1", "--json"]);
+    assert_eq!(code(&o), 2);
+    // The largest seed that still fits runs exactly one run.
+    let o = sim(&[
+        "--seed",
+        "18446744073709551614",
+        "--count",
+        "1",
+        "--steps",
+        "20",
+        "--json",
+    ]);
+    assert_eq!(code(&o), 0, "{}", stdout(&o));
+    assert!(json(&o)["events"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn simulate_json_has_coverage() {
+    let v = json(&sim(&["--count", "2", "--steps", "30", "--json"]));
+    assert!(v["coverage"].is_object());
+    assert!(!v["coverage"].as_object().unwrap().is_empty());
+}
+
+#[test]
+fn simulate_missing_file_exits_2() {
+    let d = tempfile::tempdir().unwrap();
+    let o = tg(d.path(), &["simulate", "nope.yaml", "--json"]);
+    assert_eq!(code(&o), 2);
+    assert_eq!(json(&o)["error"]["code"], "io");
+}
+
+#[test]
+fn simulate_oversize_file_is_too_large() {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("big.yaml"), vec![b'#'; 300_000]).unwrap();
+    let o = tg(d.path(), &["simulate", "big.yaml", "--json"]);
+    assert_eq!(code(&o), 1);
+    assert_eq!(json(&o)["diagnostics"][0]["code"], "too_large");
+}
+
+#[test]
+fn simulate_non_utf8_exits_2() {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("b.yaml"), [0xff, 0xfe, 0x00]).unwrap();
+    let o = tg(d.path(), &["simulate", "b.yaml", "--json"]);
     assert_eq!(code(&o), 2);
     assert_eq!(json(&o)["error"]["code"], "io");
 }

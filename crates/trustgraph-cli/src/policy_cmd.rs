@@ -491,6 +491,10 @@ fn simulate_cmd(
         let m = format!("--steps must be between 1 and {MAX_STEPS}");
         return fail(out, json, "usage", m);
     }
+    if seed.checked_add(count).is_none() {
+        let m = format!("--seed plus --count must not exceed {}", u64::MAX);
+        return fail(out, json, "usage", m);
+    }
     let text = match read_text(file) {
         Ok(Ok(text)) => text,
         Ok(Err(diagnostic)) => {
@@ -503,8 +507,14 @@ fn simulate_cmd(
         Err(m) => return fail(out, json, "io", m),
     };
     match campaign(&text, seed, count, steps) {
+        Ok(c) if c.events == 0 => fail(
+            out,
+            json,
+            "internal",
+            "the simulation ran no events; refusing to report a clean result".to_string(),
+        ),
         Ok(c) => {
-            let (text, code) = render_simulation(&file.display().to_string(), &c, json);
+            let (text, code) = render_simulation(file, &c, json);
             out.push_str(&text);
             code
         }
@@ -531,8 +541,24 @@ fn thousands(n: u64) -> String {
     s
 }
 
+/// The path as one shell word (single-quoted unless it is plainly safe), and
+/// whether it had to be converted lossily because it is not UTF-8.
+fn shell_quote(path: &Path) -> (String, bool) {
+    let lossy = path.to_str().is_none();
+    let text = path.to_string_lossy();
+    let plain = !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_./:+@%=-".contains(c));
+    if plain && !lossy {
+        (text.into_owned(), false)
+    } else {
+        (format!("'{}'", text.replace('\'', "'\\''")), lossy)
+    }
+}
+
 /// Render a finished campaign: the output text and the exit code.
-fn render_simulation(file: &str, c: &Campaign, json: bool) -> (String, i32) {
+fn render_simulation(file: &Path, c: &Campaign, json: bool) -> (String, i32) {
     let mut out = String::new();
     let ok = c.violations.is_empty();
     let decision = |k: &str| c.decisions.get(k).copied().unwrap_or(0);
@@ -559,6 +585,7 @@ fn render_simulation(file: &str, c: &Campaign, json: bool) -> (String, i32) {
                     "needs_approval": decision("needs_approval"),
                 },
                 "violations": violations,
+                "coverage": c.coverage,
                 "digest": c.digest,
             }))
         );
@@ -574,6 +601,12 @@ fn render_simulation(file: &str, c: &Campaign, json: bool) -> (String, i32) {
         thousands(decision("needs_approval")),
         plural(c.violations.len(), "violation"),
     );
+    let (shown, lossy) = shell_quote(file);
+    let note = if lossy {
+        " # path contains non-UTF-8 bytes; adjust before running"
+    } else {
+        ""
+    };
     for (seed, v) in c.violations.iter().take(PRINTED_VIOLATIONS) {
         outln!(
             out,
@@ -584,7 +617,7 @@ fn render_simulation(file: &str, c: &Campaign, json: bool) -> (String, i32) {
         );
         outln!(
             out,
-            "replay: trustgraph policy simulate {file} --seed {seed} --count 1 --steps {}",
+            "replay: trustgraph policy simulate {shown} --seed {seed} --count 1 --steps {}{note}",
             c.steps
         );
     }
@@ -634,7 +667,7 @@ mod tests {
 
     #[test]
     fn clean_campaign_summary_line() {
-        let (text, code) = render_simulation("p.yaml", &campaign_with(0), false);
+        let (text, code) = render_simulation(Path::new("p.yaml"), &campaign_with(0), false);
         assert_eq!(code, 0);
         assert_eq!(
             text,
@@ -644,7 +677,7 @@ mod tests {
 
     #[test]
     fn human_output_caps_violations_and_shows_replay() {
-        let (text, code) = render_simulation("p.yaml", &campaign_with(25), false);
+        let (text, code) = render_simulation(Path::new("p.yaml"), &campaign_with(25), false);
         assert_eq!(code, 1);
         assert!(text.contains("\u{2014} 25 violations\n"));
         assert_eq!(text.matches("VIOLATION ").count(), 20);
@@ -658,7 +691,7 @@ mod tests {
 
     #[test]
     fn json_output_lists_every_violation() {
-        let (text, code) = render_simulation("p.yaml", &campaign_with(25), true);
+        let (text, code) = render_simulation(Path::new("p.yaml"), &campaign_with(25), true);
         assert_eq!(code, 1);
         let v: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["ok"], false);
@@ -666,5 +699,53 @@ mod tests {
         assert_eq!(v["violations"][24]["seed"], 124);
         assert_eq!(v["violations"][0]["invariant"], "no_leak");
         assert_eq!(v["decisions"]["needs_approval"], 1_684);
+    }
+
+    #[test]
+    fn thousands_formats_boundaries() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1000), "1,000");
+        assert_eq!(thousands(1_000_000), "1,000,000");
+        assert_eq!(thousands(u64::MAX), "18,446,744,073,709,551,615");
+    }
+
+    fn replay_for(path: &str) -> String {
+        let (text, _) = render_simulation(Path::new(path), &campaign_with(1), false);
+        text.lines().nth(2).unwrap().to_string()
+    }
+
+    #[test]
+    fn replay_line_quotes_awkward_paths() {
+        assert_eq!(
+            replay_for("a/b-c_d.yaml"),
+            "replay: trustgraph policy simulate a/b-c_d.yaml --seed 100 --count 1 --steps 200"
+        );
+        assert!(replay_for("my dir/p.yaml").contains("simulate 'my dir/p.yaml' --seed"));
+        assert!(replay_for("it's.yaml").contains("simulate 'it'\\''s.yaml' --seed"));
+        assert!(replay_for("a;rm -rf x.yaml").contains("simulate 'a;rm -rf x.yaml' --seed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replay_line_flags_non_utf8_paths() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = Path::new(std::ffi::OsStr::from_bytes(b"bad\xff.yaml"));
+        let (text, _) = render_simulation(path, &campaign_with(1), false);
+        let line = text.lines().nth(2).unwrap();
+        assert!(
+            line.contains("simulate 'bad\u{fffd}.yaml' --seed"),
+            "{line}"
+        );
+        assert!(line.ends_with(" # path contains non-UTF-8 bytes; adjust before running"));
+    }
+
+    #[test]
+    fn json_includes_coverage() {
+        let mut c = campaign_with(0);
+        c.coverage.insert("agent_decisions".into(), 7);
+        let (text, _) = render_simulation(Path::new("p.yaml"), &c, true);
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["coverage"]["agent_decisions"], 7);
     }
 }

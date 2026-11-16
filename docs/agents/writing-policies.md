@@ -105,7 +105,7 @@ Work in this order. Do not skip steps.
 5. **simulate**: `trustgraph policy simulate FILE [--seed 0] [--count 64] [--steps 200] [--json]` runs the policy through seeded random scenarios on the real runtime (random agents, policy changes, crashes, approval expiry) and checks the safety invariants. Limits: `--count` 1-10000, `--steps` 1-5000, else exit 2. It exits 1 on any violation or if the file has errors. A clean run prints:
 
    ```text
-   64 runs, 13,260 events: 2,426 allow, 3,410 deny, 666 needs_approval — 0 violations
+   64 runs, 13,406 events: 2,461 allow, 3,432 deny, 913 needs_approval — 0 violations
    ```
 
    `--json` (here with `--count 2 --steps 30`) returns:
@@ -113,9 +113,29 @@ Work in this order. Do not skip steps.
    ```json
    {
      "count": 2,
-     "decisions": { "allow": 12, "deny": 16, "needs_approval": 0 },
-     "digest": "4f891bcffe6a8e7b0dc74ae297bbbaf7f384c1d7eb488294f2309ad6aa045f9e",
-     "events": 64,
+     "coverage": {
+       "agent_denied_source": 0,
+       "approval_expired_recheck": 0,
+       "approved_allow": 0,
+       "crash_clean": 2,
+       "crash_lost_write": 2,
+       "crash_torn_tail": 2,
+       "crash_without_resend": 1,
+       "expiry_boundary_at": 0,
+       "expiry_boundary_before": 0,
+       "explicit_recipients_check": 10,
+       "identical_reactivation_with_live_approvals": 0,
+       "narrowing_with_derived_outputs": 0,
+       "recheck_after_identical_reactivation": 0,
+       "revoke_effective": 0,
+       "source_removed_with_derived_outputs": 0,
+       "torn_activate": 0,
+       "torn_approve": 0,
+       "torn_revoke": 0
+     },
+     "decisions": { "allow": 14, "deny": 17, "needs_approval": 0 },
+     "digest": "20c1962e51e9bca9b54bfad484011e87b8ac142b59d11dff4e14a7b42b07da52",
+     "events": 61,
      "first_seed": 0,
      "ok": true,
      "steps": 30,
@@ -123,7 +143,9 @@ Work in this order. Do not skip steps.
    }
    ```
 
-   Each violation has `seed`, `invariant`, `step` and `detail`; human output adds a `replay:` line with the exact command to reproduce it. A violation means a bug in TrustGraph or an unsafe interaction worth reporting. Do not loosen the policy to make it go away. The same seed and options always give the same `digest`.
+   `coverage` counts how often each kind of situation (crashes, approval expiry, revocation, and so on) occurred across the runs; a key at 0 means that path was not exercised, so raise `--count` or `--steps`. It appears in `--json` only.
+
+   Each violation has `seed`, `invariant`, `step` and `detail`; human output adds a `replay:` line with the exact command to reproduce it. A violation means a bug in TrustGraph or an unsafe interaction worth reporting. Do not loosen the policy to make it go away. The same seed and options always give the same `digest`. `--seed` plus `--count` must not exceed 18446744073709551615. Argument-parsing errors (for example a non-numeric `--count`) are reported by the argument parser as plain text on stderr with exit code 2, even with `--json`.
 6. **explain**: `trustgraph policy explain FILE` prints one plain-English line per source and action:
 
    ```text
