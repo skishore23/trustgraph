@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import urllib.error
 import urllib.request
@@ -56,7 +57,7 @@ class Client:
         if (token is None) == (token_file is None):
             raise ValueError("pass exactly one of `token` or `token_file`")
         if token_file is not None:
-            with open(token_file, encoding="utf-8") as f:
+            with open(os.path.expanduser(token_file), encoding="utf-8") as f:
                 token = f.read()
         assert token is not None
         self._token = token.strip()
