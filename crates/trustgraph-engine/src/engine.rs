@@ -44,6 +44,12 @@ struct Remembered {
     intent: ActionIntent,
     /// Insertion order, for deterministic eviction.
     seq: u64,
+    /// When it was last asked, and the policy's reason. For the operator's
+    /// view only; they do not affect replies, so `state_digest` skips them.
+    #[serde(skip)]
+    requested_at: u64,
+    #[serde(skip)]
+    reason: String,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +58,46 @@ struct Proposal {
     policy: Policy,
     /// Proposed with `agent: None` (the operator path), at least once.
     operator: bool,
+    /// The agent that last proposed it; for the operator's view only.
+    agent: Option<String>,
+}
+
+/// A remembered `NeedsApproval` decision with no live approval: what the
+/// operator is asked to approve.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PendingDecision {
+    pub decision: String,
+    pub agent: String,
+    pub action: String,
+    pub artifact: String,
+    /// The people the output would reach.
+    pub recipients: Vec<String>,
+    /// Source names the output derives from.
+    pub sources: Vec<String>,
+    pub reason: String,
+    pub requested_at: u64,
+}
+
+/// A live approval: granted, not revoked and not expired.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LiveApproval {
+    pub decision: String,
+    pub agent: String,
+    pub action: String,
+    pub recipients: Vec<String>,
+    pub reviewer: String,
+    pub expires_at: u64,
+}
+
+/// A stored proposal, compared with the active policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StoredProposal {
+    pub proposal: String,
+    /// The proposing agent, or `None` when the operator proposed it.
+    pub agent: Option<String>,
+    pub widens: bool,
+    pub changes: Vec<trustgraph_policy::Change>,
+    pub explanation: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -158,6 +204,93 @@ impl Engine {
     /// 0 before `Genesis`; incremented by every activation.
     pub fn policy_revision(&self) -> u64 {
         self.revision
+    }
+
+    /// True when the active policy came from a `Genesis` (the policy file),
+    /// false when an `ActivatePolicy` installed it, or before any policy.
+    pub fn policy_from_genesis(&self) -> bool {
+        self.activation
+            .as_ref()
+            .is_some_and(|a| a.operator.is_none())
+    }
+
+    /// Number of artifacts (sources and outputs) the engine holds.
+    pub fn artifact_count(&self) -> usize {
+        self.graph.artifacts().len()
+    }
+
+    /// Remembered `NeedsApproval` decisions without a live approval at `at`,
+    /// oldest request first.
+    pub fn pending_decisions(&self, at: u64) -> Vec<PendingDecision> {
+        let mut out: Vec<_> = self
+            .decisions
+            .iter()
+            .filter(|(id, _)| !self.approval_is_live(id, at))
+            .map(|(id, d)| PendingDecision {
+                decision: id.clone(),
+                agent: d.agent.clone(),
+                action: d.action.clone(),
+                artifact: d.artifact.clone(),
+                recipients: d.intent.recipients.iter().map(|p| p.0.clone()).collect(),
+                sources: self
+                    .lineage(&d.artifact)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
+                reason: d.reason.clone(),
+                requested_at: d.requested_at,
+            })
+            .collect();
+        out.sort_by(|a, b| (a.requested_at, &a.decision).cmp(&(b.requested_at, &b.decision)));
+        out
+    }
+
+    /// Approvals that are live at `at`, soonest expiry first.
+    pub fn live_approvals(&self, at: u64) -> Vec<LiveApproval> {
+        let mut out: Vec<_> = self
+            .approvals
+            .iter()
+            .filter(|(id, _)| self.approval_is_live(id, at))
+            .filter_map(|(id, g)| {
+                let d = self.decisions.get(id)?;
+                Some(LiveApproval {
+                    decision: id.clone(),
+                    agent: d.agent.clone(),
+                    action: d.action.clone(),
+                    recipients: d.intent.recipients.iter().map(|p| p.0.clone()).collect(),
+                    reviewer: g.reviewer.clone(),
+                    expires_at: g.expires_at,
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| (a.expires_at, &a.decision).cmp(&(b.expires_at, &b.decision)));
+        out
+    }
+
+    /// Stored proposals, oldest first, each diffed against the active policy.
+    pub fn stored_proposals(&self) -> Vec<StoredProposal> {
+        let Some(active) = self.policy.as_ref() else {
+            return Vec::new();
+        };
+        self.proposals
+            .iter()
+            .map(|p| {
+                let changes = diff(active, &p.policy);
+                StoredProposal {
+                    proposal: p.id.clone(),
+                    agent: if p.operator { None } else { p.agent.clone() },
+                    widens: changes.widens(),
+                    changes: changes.changes,
+                    explanation: explain(&p.policy),
+                }
+            })
+            .collect()
+    }
+
+    fn approval_is_live(&self, decision: &str, at: u64) -> bool {
+        self.approvals
+            .get(decision)
+            .is_some_and(|g| approval_live(g.issued_at, g.valid_for, at, g.voided))
     }
 
     /// SHA-256 over everything that affects future replies: the policy digest,
@@ -574,6 +707,8 @@ impl Engine {
                         recipients: recipients.cloned(),
                         intent,
                         seq: 0,
+                        requested_at: at,
+                        reason: outcome.reason.clone(),
                     },
                 );
                 Ok(decision_reply(id, outcome))
@@ -740,6 +875,7 @@ impl Engine {
             id,
             policy: proposed,
             operator,
+            agent: agent.map(str::to_string),
         });
         let in_class = self.proposals.iter().filter(|p| p.operator == operator);
         if in_class.count() > MAX_PROPOSALS_PER_CLASS

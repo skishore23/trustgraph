@@ -715,3 +715,65 @@ fn control_character_policy_near_the_limit_never_errors() {
         Ok(Reply::Artifact { .. })
     ));
 }
+
+#[test]
+fn policy_source_survives_reopen_until_the_file_changes() {
+    use trustgraph_engine::PolicySource;
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = Runtime::open(file_journal(dir.path()), SPEC, 0).unwrap();
+    assert_eq!(rt.policy_source(), PolicySource::File);
+    let proposal = match rt
+        .handle(
+            1,
+            Event::ProposePolicy {
+                agent: None,
+                policy: narrowed(),
+            },
+        )
+        .unwrap()
+    {
+        Reply::Proposed { id, .. } => id,
+        other => panic!("{other:?}"),
+    };
+    let activated = rt
+        .handle(
+            2,
+            Event::ActivatePolicy {
+                proposal,
+                operator: "leo".into(),
+            },
+        )
+        .unwrap();
+    assert!(matches!(activated, Reply::Activated { revision: 2, .. }));
+    assert_eq!(rt.policy_source(), PolicySource::Activated);
+    assert_eq!(rt.last_at(), 2);
+    let size = rt.journal().len_bytes().unwrap();
+    assert_eq!(size, text(dir.path()).len() as u64);
+    drop(rt);
+
+    let rt = Runtime::open(file_journal(dir.path()), SPEC, 10).unwrap();
+    assert_eq!(rt.policy_source(), PolicySource::Activated, "same file");
+    assert_eq!(rt.engine().policy_revision(), 2);
+    drop(rt);
+
+    let rt = Runtime::open(file_journal(dir.path()), &narrowed(), 20).unwrap();
+    assert_eq!(
+        rt.policy_source(),
+        PolicySource::File,
+        "a changed file wins"
+    );
+    assert_eq!(rt.engine().policy_revision(), 3);
+}
+
+#[test]
+fn memory_journal_size_matches_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut file = Runtime::open(file_journal(dir.path()), SPEC, 0).unwrap();
+    let mut memory = Runtime::open(MemoryJournal::new(), SPEC, 0).unwrap();
+    file.handle(1, register_roadmap()).unwrap();
+    memory.handle(1, register_roadmap()).unwrap();
+    assert_eq!(
+        file.journal().len_bytes().unwrap(),
+        memory.journal().len_bytes()
+    );
+}

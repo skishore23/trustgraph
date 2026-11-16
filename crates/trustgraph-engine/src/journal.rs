@@ -219,6 +219,11 @@ impl FileJournal {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Current size of the journal file in bytes.
+    pub fn len_bytes(&self) -> Result<u64, JournalError> {
+        self.file.metadata().map(|m| m.len()).map_err(io)
+    }
 }
 
 fn create_dir(dir: &Path) -> Result<(), JournalError> {
@@ -436,6 +441,14 @@ impl MemoryJournal {
 
     pub fn records(&self) -> &[Record] {
         &self.records
+    }
+
+    /// Bytes the records take as journal lines.
+    pub fn len_bytes(&self) -> u64 {
+        self.records
+            .iter()
+            .map(|r| r.line_len().map_or(0, |n| n as u64 + 1))
+            .sum()
     }
 
     fn chain(&self) -> Chain {
