@@ -76,8 +76,7 @@ Decisions are deterministic. There is no model in the decision path.
 Requires Rust 1.90 or newer.
 
 ```sh
-git clone https://github.com/skishore23/trustgraph && cd trustgraph
-cargo install --locked --path crates/trustgraph-cli
+cargo install --locked --git https://github.com/skishore23/trustgraph trustgraph-cli
 
 trustgraph policy init                         # writes trustgraph.policy.yaml
 trustgraph policy check trustgraph.policy.yaml
