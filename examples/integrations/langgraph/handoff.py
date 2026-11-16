@@ -70,13 +70,13 @@ def main():
         return trustgraph.Client(args.url, token_file=os.path.join(args.tokens, agent + ".token"))
 
     graph = StateGraph(State)
-    graph.add_node("researcher", agent_node(client("researcher"), researcher))
+    graph.add_node("researcher", agent_node(client("researcher"), researcher, first=True))
     graph.add_node("planner", agent_node(client("planner"), planner))
     graph.add_edge(START, "researcher")
     graph.add_edge("researcher", "planner")
     graph.add_edge("planner", END)
 
-    out = graph.compile().invoke({"messages": [HumanMessage("Plan Q3 and tell engineering.")]})
+    out = graph.compile().invoke({"messages": [HumanMessage("Plan Q3 and tell engineering.")], "trustgraph": ""})
     for m in out["messages"]:
         if isinstance(m, ToolMessage):
             print(f"{m.name}: [{m.status}] {m.content}")
