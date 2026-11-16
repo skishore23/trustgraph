@@ -2339,7 +2339,12 @@ async fn c2_the_operator_sees_the_arguments_of_a_held_call() {
     let arguments = call["arguments"].as_array().unwrap();
     assert_eq!(arguments[0]["name"], "channel");
     assert_eq!(arguments[0]["value"], "#leadership");
+    assert_eq!(
+        arguments[0]["constrained"], true,
+        "the rule's `when` names it"
+    );
     assert_eq!(arguments[1]["name"], "text");
+    assert_eq!(arguments[1]["constrained"], false);
     let shown = arguments[1]["value"].as_str().unwrap();
     assert_eq!(shown.chars().count(), 2000);
     assert!(long.starts_with(shown));

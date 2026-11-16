@@ -349,10 +349,16 @@ rule should name only paths whose content you know.
 - **Untracked passthrough.** Forwarded and returned as is.
 
 For a call the gateway holds for approval, the operator page shows the tool,
-the action, the recipients and every forwarded argument, each value cut at
-2,000 characters with a "truncated — N more characters" marker, and the
-SHA-256 of the full canonical arguments. Argument text is shown as text,
-with control, bidirectional and invisible characters shown as escapes. The
+the action and the recipients; then the arguments the matched rule's `when`
+names, by their real values (`channel: #engineering`), because they decide
+who the call reaches; then every other forwarded argument, sorted by name,
+one per row, each value cut at 2,000 characters with a "truncated — N more
+characters" marker; and the SHA-256 of the full canonical arguments. The
+confirmation step repeats the matched arguments. Argument text is shown as
+text: newline, carriage return and tab as `\n`, `\r` and `\t` (and a
+backslash doubled), and control, bidirectional and invisible characters
+(the soft hyphen, Hangul fillers, tag characters and other format
+characters included) as escapes such as `‮` or `\u{e0041}`. The
 arguments are kept in memory only, never in the journal. After a restart
 the gateway no longer has them: the page says the agent must retry the call,
 and offers no Approve for it (the server refuses one too) until it does.

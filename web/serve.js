@@ -19,37 +19,65 @@
     return String(id || '').slice(0, 12);
   }
 
+  // The arguments of a held call that the matched rule's `when` names:
+  // who the call reaches. Shown first, by their real values.
+  function constrainedArguments(call) {
+    return ((call && call.arguments) || []).filter(function (a) { return a.constrained; });
+  }
+
+  // One argument as one row: `name: value`, the value made visible.
+  function argumentRow(a) {
+    return neutralise(a.name) + ': ' + argumentValue(a.value) +
+      (a.more ? ' [… truncated — ' + a.more + ' more characters]' : '');
+  }
+
   // Exactly what an approval grants, repeated in the confirmation step. A
-  // call the gateway holds names its tool and the hash of its arguments:
-  // the approval releases that one call, once.
+  // call the gateway holds names its tool, the values of the arguments its
+  // rule matched (who it reaches) and the hash of its arguments: the
+  // approval releases that one call, once.
   function approvalSummary(p) {
     var call = p.gateway && p.gateway.held ? p.gateway : null;
+    var where = call ? constrainedArguments(call).map(argumentRow) : [];
     return 'Approve: ' + p.agent + ' may ' + p.action + ' to ' + list(p.recipients) +
       ', from ' + list(p.sources) +
-      (call ? ', as one call of ' + neutralise(call.tool) + ' with arguments ' + shortId(call.sha256) + '…' : '') +
+      (call ? ', as one call of ' + neutralise(call.tool) +
+        (where.length ? ' where ' + where.join(', ') : '') +
+        ' with arguments ' + shortId(call.sha256) + '…' : '') +
       ' (decision ' + shortId(p.decision) + '…).';
   }
 
   // Agent-supplied text, made safe to read: control characters, bidi
-  // overrides and invisible characters are shown as escapes (\x1b,
-  // \u202e), so nothing can reorder, hide or restyle what the operator
-  // reads. The page only ever sets it as textContent.
+  // overrides and invisible characters (format characters, the soft
+  // hyphen, Hangul fillers, tag characters) are shown as escapes (\x1b,
+  // \u202e, \u{e0041}), so nothing can reorder, hide or restyle what the
+  // operator reads. The page only ever sets it as textContent.
+  var INVISIBLE = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u00ad\u0600-\u0605\u061c\u06dd\u070f\u115f-\u1160\u180e\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufeff\uffa0\ufff9-\ufffb\u{e0000}-\u{e007f}]/gu;
+
   function neutralise(text) {
-    return String(text === undefined || text === null ? '' : text).replace(
-      /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g,
-      function (c) {
-        var code = c.charCodeAt(0);
-        var hex = code.toString(16);
-        return code < 0x100
-          ? '\\x' + (hex.length < 2 ? '0' : '') + hex
-          : '\\u' + ('0000' + hex).slice(-4);
-      }
-    );
+    return String(text === undefined || text === null ? '' : text).replace(INVISIBLE, function (c) {
+      var code = c.codePointAt(0);
+      var hex = code.toString(16);
+      if (code < 0x100) return '\\x' + (hex.length < 2 ? '0' : '') + hex;
+      if (code > 0xffff) return '\\u{' + hex + '}';
+      return '\\u' + ('0000' + hex).slice(-4);
+    });
+  }
+
+  // An argument value on one row: a backslash is doubled, so every escape
+  // shown is one the page made; newline, carriage return and tab show as
+  // \n, \r and \t; everything else as neutralise shows it.
+  function argumentValue(text) {
+    return neutralise(String(text === undefined || text === null ? '' : text)
+      .replace(/\\/g, '\\\\')
+      .replace(/\n/g, '\\n')
+      .replace(/\r/g, '\\r')
+      .replace(/\t/g, '\\t'));
   }
 
   // The lines that show a call the gateway holds: its tool and action,
-  // where it goes, every forwarded argument (each cut at 2,000 characters
-  // with a marker) and the SHA-256 of the full arguments.
+  // where it goes, then the arguments its rule matched (the real recipient
+  // values), then every other forwarded argument, one per row (each cut at
+  // 2,000 characters with a marker), and the SHA-256 of the full arguments.
   function callLines(p) {
     var call = p.gateway;
     if (!call) return [];
@@ -58,14 +86,14 @@
       lines.push({ text: 'The gateway no longer has this call (it restarted). The agent must retry it before it can be approved.', cls: 'warn' });
       return lines;
     }
-    lines.push({ text: 'forwarded arguments, exactly:', cls: 'muted' });
-    (call.arguments || []).forEach(function (a) {
-      lines.push({ text: neutralise(a.name) + ':', cls: 'muted' });
-      lines.push({
-        text: neutralise(a.value) + (a.more ? '\n… truncated — ' + a.more + ' more characters' : ''),
-        cls: 'value'
-      });
-    });
+    var matched = constrainedArguments(call);
+    if (matched.length) {
+      lines.push({ text: 'matched by the rule, so who it reaches:', cls: 'muted' });
+      matched.forEach(function (a) { lines.push({ text: argumentRow(a), cls: 'value' }); });
+    }
+    var rest = (call.arguments || []).filter(function (a) { return !a.constrained; });
+    lines.push({ text: matched.length ? 'every other forwarded argument, exactly:' : 'forwarded arguments, exactly:', cls: 'muted' });
+    rest.forEach(function (a) { lines.push({ text: argumentRow(a), cls: 'value' }); });
     lines.push({ text: 'SHA-256 of the full arguments: ' + call.sha256, cls: 'muted' });
     return lines;
   }
@@ -186,6 +214,7 @@
     GONE: GONE,
     CONTEXT_NOTE: CONTEXT_NOTE,
     approvalSummary: approvalSummary,
+    argumentValue: argumentValue,
     callLines: callLines,
     capNotice: capNotice,
     blockedEntries: blockedEntries,

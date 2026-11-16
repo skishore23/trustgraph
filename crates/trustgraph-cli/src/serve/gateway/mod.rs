@@ -160,6 +160,8 @@ struct HeldCall {
     content: Option<String>,
     arguments: JsonObject,
     sha256: String,
+    /// The arguments the matched rule's `when` names: who the call reaches.
+    constrained: BTreeSet<String>,
 }
 
 /// Held calls by decision id, each with the generation it was held at.
@@ -366,6 +368,26 @@ fn shown_argument(name: &str, value: &Value) -> Value {
     json!({"name": name, "value": shown, "more": total.saturating_sub(SHOWN_CHARS)})
 }
 
+/// A held call's arguments as the operator sees them: those the matched
+/// rule's `when` constrains (who the call reaches) first, marked
+/// `constrained`, then the rest; each group sorted by name.
+fn shown_arguments(call: &HeldCall) -> Vec<Value> {
+    let canonical = canonical_map(&call.arguments);
+    let (first, rest): (Vec<_>, Vec<_>) = canonical
+        .iter()
+        .partition(|(name, _)| call.constrained.contains(name.as_str()));
+    first
+        .into_iter()
+        .map(|entry| (entry, true))
+        .chain(rest.into_iter().map(|entry| (entry, false)))
+        .map(|((name, value), constrained)| {
+            let mut shown = shown_argument(name, value);
+            shown["constrained"] = Value::Bool(constrained);
+            shown
+        })
+        .collect()
+}
+
 impl GatewayView for Shared {
     fn mode(&self) -> &'static str {
         self.config.session.as_str()
@@ -460,10 +482,7 @@ impl GatewayView for Shared {
     fn held_call(&self, decision: &str) -> Option<Value> {
         let held = lock(&self.held);
         let (_, call) = held.calls.get(decision)?;
-        let arguments: Vec<Value> = canonical_map(&call.arguments)
-            .iter()
-            .map(|(name, value)| shown_argument(name, value))
-            .collect();
+        let arguments = shown_arguments(call);
         Some(json!({
             "tool": call.tool,
             "action": call.action,
@@ -1066,6 +1085,7 @@ impl<J: ServeJournal> Gateway<J> {
                     content: rule.content.clone(),
                     sha256: sha256_hex(&canonical_arguments(&arguments)),
                     arguments: arguments.clone(),
+                    constrained: rule.when.iter().map(|m| m.argument.clone()).collect(),
                 };
                 let allow_without_reads = *allow_without_reads;
                 let tool2 = tool.clone();
@@ -1890,6 +1910,7 @@ mod tests {
             content: None,
             arguments: json!({"text": text}).as_object().cloned().unwrap(),
             sha256: "00".into(),
+            constrained: BTreeSet::new(),
         }
     }
 
@@ -1914,6 +1935,31 @@ mod tests {
         // A release of a decision never held, or already gone, is a no-op.
         held.release("d2", u64::MAX);
         assert!(held.calls.is_empty());
+    }
+
+    #[test]
+    fn the_operator_sees_the_constrained_arguments_first() {
+        let mut held = call("x");
+        held.arguments = json!({"body": "b", "subject": "s", "to": "sam@corp.com", "cc": "c"})
+            .as_object()
+            .cloned()
+            .unwrap();
+        held.constrained = ["to".to_string(), "cc".to_string()].into();
+        let shown = shown_arguments(&held);
+        let order: Vec<(&str, bool)> = shown
+            .iter()
+            .map(|a| (a["name"].as_str().unwrap(), a["constrained"] == true))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                ("cc", true),
+                ("to", true),
+                ("body", false),
+                ("subject", false)
+            ]
+        );
+        assert_eq!(shown[1]["value"], "sam@corp.com");
     }
 
     #[test]
