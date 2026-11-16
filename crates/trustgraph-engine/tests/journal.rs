@@ -116,6 +116,58 @@ fn reopen_reaches_the_same_state() {
 }
 
 #[test]
+fn output_steps_are_indexed_and_rebuilt_on_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = Runtime::open(file_journal(dir.path()), SPEC, 0).unwrap();
+    let only = ten_events(&mut rt);
+    let roadmap = artifact(
+        rt.handle(
+            50,
+            Event::RegisterSource {
+                source: "roadmap".into(),
+                sha256: sha(2),
+            },
+        )
+        .unwrap(),
+    );
+    let mut outputs = vec![(only.clone(), "summarize".to_string())];
+    for i in 0..200u32 {
+        let step = format!("gateway:tool{}", i % 7);
+        let id = artifact(
+            rt.handle(
+                51,
+                Event::RecordOutput {
+                    agent: "planner".into(),
+                    step: step.clone(),
+                    inputs: vec![roadmap.clone()],
+                    sha256: sha(1000 + i),
+                },
+            )
+            .unwrap(),
+        );
+        outputs.push((id, step));
+    }
+    let engine = rt.engine();
+    for (id, step) in &outputs {
+        assert_eq!(engine.output_step(id), Some(step.as_str()), "{id}");
+    }
+    assert_eq!(
+        engine.output_step(&roadmap),
+        None,
+        "a source is not an output"
+    );
+    assert_eq!(engine.output_step("nope"), None);
+    let digest = engine.state_digest();
+    drop(rt);
+
+    let rt = Runtime::open(file_journal(dir.path()), SPEC, 100).unwrap();
+    assert_eq!(rt.engine().state_digest(), digest);
+    for (id, step) in &outputs {
+        assert_eq!(rt.engine().output_step(id), Some(step.as_str()), "{id}");
+    }
+}
+
+#[test]
 fn a_changed_policy_file_is_only_proposed() {
     let dir = tempfile::tempdir().unwrap();
     let mut rt = Runtime::open(file_journal(dir.path()), SPEC, 0).unwrap();

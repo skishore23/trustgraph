@@ -177,6 +177,10 @@ pub struct Engine {
     /// `(source name, sha256)` -> artifact id.
     source_ids: BTreeMap<(String, String), String>,
     outputs: BTreeMap<OutputKey, String>,
+    /// Output artifact id -> the step that recorded it: an index over
+    /// `outputs`, filled where it is (so replay rebuilds it) and never part
+    /// of `state_digest`.
+    output_steps: BTreeMap<String, String>,
     /// Every action name ever given a Graph rule.
     rule_names: BTreeSet<String>,
     decisions: BTreeMap<String, Remembered>,
@@ -283,12 +287,9 @@ impl Engine {
     }
 
     /// The step that recorded the output artifact `id`, when it is one.
-    /// Read-only; a linear scan.
+    /// Read-only; O(log n).
     pub fn output_step(&self, id: &str) -> Option<&str> {
-        self.outputs
-            .iter()
-            .find(|(_, artifact)| artifact.as_str() == id)
-            .map(|((_, step, _, _), _)| step.as_str())
+        self.output_steps.get(id).map(String::as_str)
     }
 
     /// True when a proposal with this id (policy digest) is stored.
@@ -697,6 +698,10 @@ impl Engine {
             .ok_or_else(|| reject("engine_mismatch", "the graph returned no output"))?
             .0
             .clone();
+        // Each execution makes a new artifact id; keep the first step anyway.
+        self.output_steps
+            .entry(id.clone())
+            .or_insert_with(|| step.to_string());
         self.outputs.insert(key, id.clone());
         Ok(Reply::Artifact { id })
     }
