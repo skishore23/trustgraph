@@ -4,6 +4,7 @@
 pub mod errors;
 pub mod framework;
 pub mod mcp;
+pub mod policy;
 pub mod simulation;
 
 use axum::{
@@ -92,6 +93,7 @@ pub fn router() -> Router {
         .route("/api/demo", post(demo))
         .route("/api/framework", post(framework::demo))
         .route("/api/simulation", post(simulation::demo))
+        .route("/api/policy", post(policy::demo))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(axum::middleware::map_response(errors::json_errors))
 }

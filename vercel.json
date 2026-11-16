@@ -7,6 +7,7 @@
     "api/demo.rs": { "maxDuration": 15 },
     "api/framework.rs": { "maxDuration": 15 },
     "api/simulation.rs": { "maxDuration": 15 },
+    "api/policy.rs": { "maxDuration": 15 },
     "api/mcp.rs": { "maxDuration": 15 }
   },
   "rewrites": [{ "source": "/mcp", "destination": "/api/mcp" }],

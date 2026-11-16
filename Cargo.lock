@@ -2049,6 +2049,7 @@ dependencies = [
  "tokio",
  "tower",
  "trustgraph-framework",
+ "trustgraph-policy",
  "trustgraph-runtime",
  "trustgraph-sim",
  "vercel_runtime",
