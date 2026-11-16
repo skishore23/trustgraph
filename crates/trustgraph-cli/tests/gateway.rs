@@ -1813,9 +1813,15 @@ async fn c1_recipient_globs_do_not_cross_separators_and_arrays_must_all_match() 
                 json!({"to": to, "body": "Q3"}),
             )
             .await;
-        assert_eq!(error_code(&sent), "blocked", "{to}: {sent}");
+        // The upstream declares `to` a string: a list or an object is
+        // refused before matching; a string that does not match is blocked.
+        let expected = if to.is_string() {
+            "blocked"
+        } else {
+            "invalid_arguments"
+        };
+        assert_eq!(error_code(&sent), expected, "{to}: {sent}");
     }
-    assert!(slack_calls(&h).is_empty(), "{:?}", slack_calls(&h));
     let sent = h
         .call(
             &planner,
@@ -1823,7 +1829,106 @@ async fn c1_recipient_globs_do_not_cross_separators_and_arrays_must_all_match() 
             json!({"to": ["a@corp.com", "b@corp.com"], "body": "Q3"}),
         )
         .await;
-    assert_eq!(ok(&sent), "sent");
+    assert_eq!(error_code(&sent), "invalid_arguments", "{sent}");
+    assert!(
+        text(&sent)
+            .contains("`to` is of JSON type array, but the upstream tool declares it string"),
+        "{sent}"
+    );
+    assert!(slack_calls(&h).is_empty(), "{:?}", slack_calls(&h));
+}
+
+#[tokio::test]
+async fn m6_values_whose_json_type_contradicts_the_upstream_schema_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = memory(dir.path(), "connection").await;
+    let planner = h.connect("planner").await;
+    ok(&h.read(&planner, "Product/roadmap.md").await);
+    for text_value in [
+        json!({"channel": "#all-company"}),
+        json!(["#all-company"]),
+        json!(1),
+        json!(1.5),
+        json!(true),
+        json!(null),
+    ] {
+        let sent = h
+            .call(
+                &planner,
+                "slack__post_message",
+                json!({"channel": "#engineering", "text": text_value}),
+            )
+            .await;
+        assert_eq!(
+            error_code(&sent),
+            "invalid_arguments",
+            "{text_value}: {sent}"
+        );
+        assert!(text(&sent).contains("`text` is of JSON type"), "{sent}");
+    }
+    let read = h
+        .call(
+            &planner,
+            "drive__read_file",
+            json!({"path": ["Product/roadmap.md"]}),
+        )
+        .await;
+    assert_eq!(error_code(&read), "invalid_arguments", "{read}");
+    assert!(slack_calls(&h).is_empty(), "{:?}", slack_calls(&h));
+    assert_eq!(calls(&h.drive.log, "read_file").len(), 1);
+    ok(&h.post(&planner, "#engineering", "roadmap only").await);
+}
+
+#[test]
+fn m6_the_schema_type_check_is_small_and_strict() {
+    let tool = |properties: Value| {
+        rmcp::model::Tool::new(
+            "t",
+            "t",
+            json!({"type": "object", "properties": properties})
+                .as_object()
+                .cloned()
+                .unwrap(),
+        )
+    };
+    let args = |v: Value| v.as_object().cloned().unwrap();
+    let t = tool(json!({
+        "s": {"type": "string"},
+        "i": {"type": "integer"},
+        "n": {"type": "number"},
+        "b": {"type": "boolean"},
+        "o": {"type": ["string", "null"]},
+        "a": {"type": "array", "items": {"type": "string"}},
+        "free": {"description": "no type: not checked"},
+    }));
+    for good in [
+        json!({"s": "x", "i": 3, "n": 3, "b": false}),
+        json!({"n": 2.5, "o": null, "a": ["x", "y"], "free": {"any": 1}}),
+        json!({"o": "x", "a": [], "undeclared": 1}),
+    ] {
+        assert!(
+            gateway::check_schema_types(&t, &args(good.clone())).is_ok(),
+            "{good}"
+        );
+    }
+    for bad in [
+        json!({"s": {"channel": "#all-company"}}),
+        json!({"s": ["x"]}),
+        json!({"s": 1}),
+        json!({"i": "3"}),
+        json!({"i": 3.5}),
+        json!({"n": "3"}),
+        json!({"b": "true"}),
+        json!({"o": 1}),
+        json!({"a": "x"}),
+        json!({"a": ["x", 1]}),
+        json!({"a": [["x"]]}),
+    ] {
+        assert!(
+            gateway::check_schema_types(&t, &args(bad.clone())).is_err(),
+            "{bad}"
+        );
+    }
 }
 
 /// Recipient values a mail parser may read as an address outside the
@@ -1863,19 +1968,12 @@ async fn i1_spoofed_recipients_are_refused_under_type_email() {
         let sent = email_to(&h, &planner, json!(to)).await;
         assert_eq!(error_code(&sent), "blocked", "{to:?}: {sent}");
     }
-    let sent = email_to(&h, &planner, json!(["sam@corp.com", "x@evil.com@corp.com"])).await;
-    assert_eq!(error_code(&sent), "blocked", "{sent}");
     assert!(slack_calls(&h).is_empty(), "{:?}", slack_calls(&h));
-    for to in [
-        json!("sam@corp.com"),
-        json!("x+y@CORP.com"),
-        json!("first.last-1@corp.com"),
-        json!(["a@corp.com", "b_c@corp.com"]),
-    ] {
-        let sent = email_to(&h, &planner, to.clone()).await;
+    for to in ["sam@corp.com", "x+y@CORP.com", "first.last-1@corp.com"] {
+        let sent = email_to(&h, &planner, json!(to)).await;
         assert_eq!(ok(&sent), "sent", "{to}");
     }
-    assert_eq!(slack_calls(&h).len(), 4);
+    assert_eq!(slack_calls(&h).len(), 3);
 }
 
 #[tokio::test]
@@ -1908,12 +2006,8 @@ async fn i1_acts_rules_match_exactly_by_default() {
         let sent = email_to(&h, &planner, json!(to)).await;
         assert_eq!(error_code(&sent), "blocked", "{to:?}: {sent}");
     }
-    let sent = email_to(&h, &planner, json!(["sam@corp.com", "x@corp.com"])).await;
-    assert_eq!(error_code(&sent), "blocked", "{sent}");
     assert!(slack_calls(&h).is_empty(), "{:?}", slack_calls(&h));
     let sent = email_to(&h, &planner, json!("sam@corp.com")).await;
-    assert_eq!(ok(&sent), "sent");
-    let sent = email_to(&h, &planner, json!(["sam@corp.com", "sam@corp.com"])).await;
     assert_eq!(ok(&sent), "sent");
 }
 
@@ -1946,7 +2040,38 @@ fn i1_matcher_types_and_their_config_errors() {
         &email("sam@corp.com"),
         &json!("Sam@corp.com")
     ));
+    // A list matches only when every element does.
     assert!(!config::value_matches(&email("*@corp.com"), &json!([])));
+    assert!(config::value_matches(
+        &email("*@corp.com"),
+        &json!(["a@corp.com", "b_c@corp.com"])
+    ));
+    assert!(!config::value_matches(
+        &email("*@corp.com"),
+        &json!(["sam@corp.com", "x@evil.com@corp.com"])
+    ));
+    assert!(!config::value_matches(
+        &email("*@corp.com"),
+        &json!(["a@corp.com", 1])
+    ));
+    let exact = config::Matcher {
+        argument: "to".into(),
+        pattern: "sam@corp.com".into(),
+        kind: config::MatchType::Exact,
+    };
+    assert!(config::value_matches(
+        &exact,
+        &json!(["sam@corp.com", "sam@corp.com"])
+    ));
+    assert!(!config::value_matches(
+        &exact,
+        &json!(["sam@corp.com", "x@corp.com"])
+    ));
+    assert!(!config::value_matches(&exact, &json!("SAM@corp.com")));
+    assert!(!config::value_matches(
+        &exact,
+        &json!({"to": "sam@corp.com"})
+    ));
     // Invisible characters never match, whatever the type.
     for kind in [
         config::MatchType::Exact,

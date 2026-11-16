@@ -188,13 +188,14 @@ tools:
   `PATH` (the program's own directory, `/usr/bin` and `/bin`) and a private,
   empty `HOME` directory, `$TMPDIR/trustgraph-upstream-*` (mode 0700). It is
   removed when the connection ends, and when the gateway exits on SIGINT or
-  SIGTERM, which stops every stdio upstream first. Each one holds a lock
-  file the gateway keeps locked; one that a killed gateway left behind
-  (owned by your user, lock not held) is removed when a gateway next
-  starts, and one whose lock is held by a running gateway is never touched.
-  The child never gets the gateway's `HOME` or the rest of its environment. That is
-  not isolation: see [Threat model](#threat-model). Its stderr is printed
-  with every secret value replaced by `[redacted]`.
+  SIGTERM, which stops every stdio upstream first. Beside each one is a lock
+  file (`….lock`) the gateway keeps locked while it uses the directory. One
+  that a killed gateway left behind (owned by your user, lock file present
+  and not locked) is removed when a gateway next starts; one whose lock a
+  running gateway holds, or one with no lock file, is never touched. The
+  child never gets the gateway's `HOME` or the rest of its environment.
+  That is not isolation: see [Threat model](#threat-model). Its stderr is
+  printed with every secret value replaced by `[redacted]`.
 - **Tools.** Only the tools listed under `tools:` exist for agents. They are
   named `upstream.tool` in the config, and agents see them as
   `upstream__tool`. Every other tool on an upstream is invisible and
@@ -209,7 +210,14 @@ tools:
   one the upstream tool takes (`inputSchema.properties`) when the upstream
   publishes a schema; the gateway checks this at start, on every call and
   in `gateway check`, which also prints the upstream arguments that are not
-  forwardable.
+  forwardable. When the schema declares a `type` for an argument (`string`,
+  `number`, `integer`, `boolean`, `array`, `object` or `null`, or a list of
+  them, and an `array`'s `items.type`), a call whose value has another JSON
+  type is refused with `invalid_arguments`: an object or a list where the
+  upstream takes a string (`text: {"channel": "#all-company"}`) never
+  reaches it. This is a small, strict check of the top-level arguments, not
+  a JSON Schema validator; an argument with no declared `type` is not
+  checked.
 - **reads.** The tool's results are a policy source. The first rule whose
   `when` matches gives the source; otherwise `otherwise` does. `otherwise`
   must be at least as restrictive as every rule's source: the people who may

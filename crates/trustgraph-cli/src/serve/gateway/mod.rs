@@ -556,6 +556,86 @@ pub fn schema_report(
     (problems, unforwarded)
 }
 
+/// The JSON type name of a value, as a schema names it.
+fn json_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(n) if n.is_i64() || n.is_u64() => "integer",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// True when `value` is of the schema type `declared`. An integer is also
+/// a number; nothing else converts.
+fn of_type(declared: &str, value: &Value) -> bool {
+    let actual = json_type(value);
+    actual == declared || (declared == "number" && actual == "integer")
+}
+
+/// A small, strict check of a call's top-level arguments against the
+/// `type` each property of the upstream's input schema declares: a value
+/// whose JSON type contradicts it is refused, so the upstream never gets,
+/// say, an object where it takes a string (and maybe reads a recipient out
+/// of it). `type` may be one name or a list of names; for an `array`, an
+/// `items.type` is checked on every element. A property with no `type` is
+/// not checked: this is not a JSON Schema validator.
+pub fn check_schema_types(
+    published: &rmcp::model::Tool,
+    arguments: &JsonObject,
+) -> Result<(), String> {
+    let Some(properties) = published
+        .input_schema
+        .get("properties")
+        .and_then(Value::as_object)
+    else {
+        return Ok(());
+    };
+    let declared = |schema: &Value| -> Option<Vec<String>> {
+        match schema.get("type")? {
+            Value::String(t) => Some(vec![t.clone()]),
+            Value::Array(ts) => Some(
+                ts.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect(),
+            ),
+            _ => Some(Vec::new()),
+        }
+    };
+    for (name, value) in arguments {
+        let Some(schema) = properties.get(name) else {
+            continue;
+        };
+        let Some(types) = declared(schema) else {
+            continue;
+        };
+        if !types.iter().any(|t| of_type(t, value)) {
+            return Err(format!(
+                "`{name}` is of JSON type {}, but the upstream tool declares it {}",
+                json_type(value),
+                types.join(" or ")
+            ));
+        }
+        if let (Value::Array(items), Some(item_types)) =
+            (value, schema.get("items").and_then(|items| declared(items)))
+            && let Some(bad) = items
+                .iter()
+                .find(|item| !item_types.iter().any(|t| of_type(t, item)))
+        {
+            return Err(format!(
+                "an element of `{name}` is {}, but the upstream tool declares its elements {}",
+                json_type(bad),
+                item_types.join(" or ")
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Build the gateway over a server: check the config against the active
 /// policy, resolve secrets with `lookup`, open the hand-off key, end
 /// sessions that do not survive a restart, and hook into the operator page.
@@ -855,7 +935,13 @@ impl<J: ServeJournal> Gateway<J> {
                             format!("{why}; the call was not forwarded"),
                         )
                     })?;
-                    self.published_ok(&tool).await?;
+                    let published = self.published_ok(&tool).await?;
+                    check_schema_types(&published, &arguments).map_err(|why| {
+                        ToolFail::new(
+                            "invalid_arguments",
+                            format!("{why}; the call was not forwarded"),
+                        )
+                    })?;
                     self.call_tool(agent, session, tool, arguments).await
                 }
             }
@@ -865,8 +951,8 @@ impl<J: ServeJournal> Gateway<J> {
     }
 
     /// The upstream still publishes `tool`, with a schema under the cap that
-    /// takes every argument the config forwards.
-    async fn published_ok(&self, tool: &Tool) -> Result<(), ToolFail> {
+    /// takes every argument the config forwards; what it publishes.
+    async fn published_ok(&self, tool: &Tool) -> Result<rmcp::model::Tool, ToolFail> {
         let upstream = self
             .upstreams
             .get(&tool.upstream)
@@ -875,18 +961,17 @@ impl<J: ServeJournal> Gateway<J> {
             .tools()
             .await
             .map_err(|e| ToolFail::upstream(e, &tool.upstream))?;
-        let found = published.iter().find(|t| t.name == tool.name);
-        if found.is_none() {
+        let Some(found) = published.into_iter().find(|t| t.name == tool.name) else {
             return Err(ToolFail::not_available());
-        }
-        let (problems, _) = schema_report(tool, found);
+        };
+        let (problems, _) = schema_report(tool, Some(&found));
         if !problems.is_empty() {
             for p in &problems {
                 eprintln!("trustgraph gateway: {p}; the tool is closed");
             }
             return Err(ToolFail::misconfigured(tool));
         }
-        Ok(())
+        Ok(found)
     }
 
     async fn call_tool(
