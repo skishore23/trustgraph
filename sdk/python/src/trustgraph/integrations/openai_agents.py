@@ -65,20 +65,40 @@ def _resumed(input: Any, kwargs: Mapping[str, Any]) -> bool:
     return False
 
 
+def _history_results(items: Any, sources: Mapping[str, str]) -> set[str]:
+    """The call ids of mapped source results in conversation items."""
+    names: dict[str, str] = {}
+    outputs: list[str] = []
+    for item in items if isinstance(items, list) else ():
+        get = item.get if isinstance(item, Mapping) else (lambda k, d=None, i=item: getattr(i, k, d))
+        if get("type") == "function_call":
+            names[str(get("call_id"))] = str(get("name"))
+        elif get("type") == "function_call_output":
+            outputs.append(str(get("call_id")))
+    return {c for c in outputs if names.get(c, "") in sources or c not in names}
+
+
 class _Run:
     """The sessions of one run, one per agent name.
 
-    With a dict run context, the run's hand-off token (everything any of its
-    sessions has seen) is kept in ``context["trustgraph"]`` and every session
-    starts carrying it, so a later run given the same context (or a
-    ``RunState``, which serialises a dict context) restores it.
+    Every session of the run starts carrying what the run's other sessions
+    have seen, so restrictions follow a hand-off even without the run hooks.
+    With a dict run context, the run's token is also kept in
+    ``context["trustgraph"]`` and every session starts carrying it, so a later
+    run given the same context (or a ``RunState``, which serialises a dict
+    context) restores it.
     """
 
-    def __init__(self, clients: Mapping[str, Client], resumed: bool = False) -> None:
+    def __init__(
+        self, clients: Mapping[str, Client], resumed: bool = False, history: set[str] | None = None,
+        context: Any = None,
+    ) -> None:
         self.clients = dict(clients)
         self.sessions: dict[str, Session] = {}
         self.lock = threading.Lock()
         self.resumed = resumed
+        self.history = set(history or ())  # call ids of mapped source results already in the conversation
+        self.context = context if isinstance(context, MutableMapping) else None
 
     def session(self, agent: str, context: Any = None) -> Session:
         with self.lock:
@@ -87,6 +107,7 @@ class _Run:
             if agent not in self.clients:
                 raise TrustGraphError("no_session", f"no TrustGraph client for agent `{agent}`")
             client = self.clients[agent]
+            others = list(self.sessions.values())
         s = client.session()
         stored = context.get(CONTEXT_KEY) if isinstance(context, Mapping) else None
         if stored:
@@ -98,15 +119,29 @@ class _Run:
                 pass
         elif self.resumed:
             s.mark_broken(_RESUMED)
+        if others:
+            try:  # what the run's other agents saw, in memory, whatever the context
+                s.receive(merge_tokens(None, None, *(o.persist() for o in others)))
+            except TrustGraphError:
+                pass
+        unknown = self.history - set(s.results)
+        if len(unknown) > s.unlisted:
+            s.mark_broken(
+                "the conversation holds results of mapped source tools that the carried token does not record "
+                f"(it was replaced or lost); {_RESUMED}"
+            )
         with self.lock:
             s = self.sessions.setdefault(agent, s)
         self.save(context)
         return s
 
-    def save(self, context: Any) -> None:
+    def save(self, context: Any = None) -> None:
+        if not isinstance(context, MutableMapping):
+            context = self.context
         if not isinstance(context, MutableMapping):
             return
         with self.lock:
+            self.context = context
             sessions = list(self.sessions.values())
             stored = context.get(CONTEXT_KEY)
             context[CONTEXT_KEY] = merge_tokens(
@@ -150,16 +185,21 @@ async def _check(spec: Action, data: ToolInputGuardrailData) -> ToolGuardrailFun
 
 
 async def _register(source: str, data: ToolOutputGuardrailData) -> ToolGuardrailFunctionOutput:
+    s: Session | None = None
+    run: _Run | None = None
     try:
         s, run = await _session(data.agent, data.context)
         await asyncio.to_thread(s.read, source, data.output)
-        if run is not None:
-            run.save(getattr(data.context, "context", None))
     except TrustGraphError as e:
         return ToolGuardrailFunctionOutput.reject_content(not_registered_message(source, e), output_info=e.code)
     except Exception as e:
         err = TrustGraphError("internal_error", repr(e))
         return ToolGuardrailFunctionOutput.reject_content(not_registered_message(source, err))
+    finally:
+        if s is not None:  # handled, even when withheld: a later run must not take it for unrecorded
+            s.record_result(str(getattr(data.context, "tool_call_id", "")))
+        if run is not None:
+            run.save(getattr(data.context, "context", None))
     return ToolGuardrailFunctionOutput.allow()
 
 
@@ -243,10 +283,12 @@ class _Hooks(RunHooks[Any]):
             # What the previous agent saw now travels with the work. If the
             # receiving agent is not cleared for it, this raises and the run stops.
             user = getattr(context, "context", None)
-            sender = await asyncio.to_thread(run.session, from_agent.name, user)
-            receiver = await asyncio.to_thread(run.session, to_agent.name, user)
-            await asyncio.to_thread(receiver.receive, sender.handoff())
-            run.save(user)
+            try:
+                sender = await asyncio.to_thread(run.session, from_agent.name, user)
+                receiver = await asyncio.to_thread(run.session, to_agent.name, user)
+                await asyncio.to_thread(receiver.receive, sender.handoff())
+            finally:
+                run.save(user)  # with the broken marker, when the receive failed
         if self._inner is not None:
             await self._inner.on_handoff(context, from_agent, to_agent)
 
@@ -342,29 +384,42 @@ class Guard:
         return _Hooks(inner)
 
     @contextlib.contextmanager
-    def scope(self, input: Any = None, *, _resumed_memory: bool | None = None, **run_kwargs: Any) -> Iterator[None]:
-        """One run's sessions, for calling ``Runner`` yourself with ``hooks=guard.hooks()``.
+    def scope(
+        self, input: Any = None, *, _history: tuple[bool, set[str]] | None = None, **run_kwargs: Any
+    ) -> Iterator[None]:
+        """One run's sessions, for calling ``Runner`` yourself (pass ``hooks=guard.hooks()``
+        for a clear error at a hand-off to an agent that is not cleared).
 
         Pass the run's ``input`` and keyword arguments so a resumed conversation
         is recognised. A ``session=`` must be checked before the run starts, so
-        use ``run`` / ``run_sync`` / ``run_streamed`` for that.
+        use ``run`` / ``run_streamed`` for that. On exit the run's token is
+        merged back into the dict context once more.
         """
-        if run_kwargs.get("session") is not None and _resumed_memory is None:
-            raise ValueError("with session=, use guard.run, guard.run_sync or guard.run_streamed")
-        token = _run.set(_Run(self.clients, bool(_resumed_memory) or _resumed(input, run_kwargs)))
+        if run_kwargs.get("session") is not None and _history is None:
+            raise ValueError("with session=, use guard.run or guard.run_streamed")
+        memory_resumed, memory_results = _history or (False, set())
+        history = memory_results | (_history_results(input, self.sources) if isinstance(input, list) else set())
+        context = run_kwargs.get("context")
+        if isinstance(input, RunState):
+            context = getattr(getattr(input, "_context", None), "context", context)
+        run = _Run(self.clients, memory_resumed or _resumed(input, run_kwargs), history, context)
+        token = _run.set(run)
         try:
             yield
         finally:
             _run.reset(token)
+            run.save()  # a tool may have replaced the token after the last save
 
-    @staticmethod
-    async def _has_history(kwargs: Mapping[str, Any]) -> bool:
+    async def _history(self, kwargs: Mapping[str, Any]) -> tuple[bool, set[str]]:
         memory = kwargs.get("session")
-        return memory is not None and bool(await memory.get_items(limit=1))
+        if memory is None:
+            return False, set()
+        items = await memory.get_items()
+        return bool(items), _history_results(items, self.sources)
 
     async def run(self, starting_agent: Agent[Any], input: Any, **kwargs: Any) -> Any:
         """``Runner.run`` with fresh sessions for this run."""
-        with self.scope(input, _resumed_memory=await self._has_history(kwargs), **kwargs):
+        with self.scope(input, _history=await self._history(kwargs), **kwargs):
             return await Runner.run(starting_agent, input, hooks=self.hooks(kwargs.pop("hooks", None)), **kwargs)
 
     def run_sync(self, starting_agent: Agent[Any], input: Any, **kwargs: Any) -> Any:
@@ -373,11 +428,24 @@ class Guard:
             # Reading the session's history first would need a second event loop, which can
             # bind the session's locks to the wrong loop.
             raise ValueError("guard.run_sync does not take session=; use `await guard.run(...)`")
-        with self.scope(input, _resumed_memory=False, **kwargs):
+        with self.scope(input, _history=(False, set()), **kwargs):
             return Runner.run_sync(starting_agent, input, hooks=self.hooks(kwargs.pop("hooks", None)), **kwargs)
 
     async def run_streamed(self, starting_agent: Agent[Any], input: Any, **kwargs: Any) -> Any:
         """``Runner.run_streamed`` with fresh sessions for this run: ``result = await guard.run_streamed(...)``."""
-        with self.scope(input, _resumed_memory=await self._has_history(kwargs), **kwargs):
+        with self.scope(input, _history=await self._history(kwargs), **kwargs):
             # The run's task copies this context when it is created, so the scope follows it.
-            return Runner.run_streamed(starting_agent, input, hooks=self.hooks(kwargs.pop("hooks", None)), **kwargs)
+            run = _run.get()
+            result = Runner.run_streamed(starting_agent, input, hooks=self.hooks(kwargs.pop("hooks", None)), **kwargs)
+        events = result.stream_events
+
+        async def stream_events() -> Any:
+            try:
+                async for event in events():
+                    yield event
+            finally:
+                if run is not None:
+                    run.save()  # the streamed run has finished: merge its token back once more
+
+        result.stream_events = stream_events
+        return result

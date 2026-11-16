@@ -10,7 +10,7 @@ import pytest
 
 pytest.importorskip("agents")
 
-from agents import Agent, Runner, function_tool, set_tracing_disabled  # noqa: E402
+from agents import Agent, RunContextWrapper, Runner, function_tool, set_tracing_disabled  # noqa: E402
 from agents.items import ToolCallOutputItem  # noqa: E402
 from agents.testing import ScriptedModel, assistant_message, function_call  # noqa: E402
 
@@ -240,12 +240,12 @@ def test_resumed_memory_session_without_the_token_is_refused(server: Server) -> 
     assert context["trustgraph"].startswith("tg1.")
 
     guard, agent = memory_agents(server, [call("read_roadmap"), call("post_message", {"text": "x"}, 1)])
-    out = outputs(asyncio.run(guard.run(agent, "post", session=memory)))  # history, but a fresh context
-    assert "continues an earlier conversation" in out["post_message"] and posted == []
-
-    guard, agent = memory_agents(server, [call("read_roadmap"), call("post_message", {"text": "x"}, 1)])
     out = outputs(asyncio.run(guard.run(agent, "post", session=memory, context=context)))  # restored from it
     assert "`salaries`" in out["post_message"] and "denied" in out["post_message"] and posted == []
+
+    guard, agent = memory_agents(server, [call("read_roadmap", n=2), call("post_message", {"text": "x"}, 3)])
+    out = outputs(asyncio.run(guard.run(agent, "post", session=memory)))  # history, but a fresh context
+    assert "continues an earlier conversation" in out["post_message"] and posted == []
     with pytest.raises(ValueError, match="await guard.run"):
         guard.run_sync(agent, "post", session=memory)
 
@@ -355,3 +355,56 @@ def test_runstate_resume_restores_or_refuses(server: Server) -> None:
             assert "denied" in out["publish"] and "`salaries`" in out["publish"]
         else:
             assert "continues an earlier conversation" in out["publish"]
+
+
+# -- tokens replaced by tools, hand-offs without the hooks -------------------
+
+
+def test_a_token_replaced_by_a_tool_is_merged_back_or_refused(server: Server) -> None:
+    """The third review's o2.py: a tool writes context["trustgraph"] after the run's last save."""
+    from agents import SQLiteSession
+
+    from trustgraph._session import _token
+
+    @function_tool
+    def remember(ctx: RunContextWrapper[dict], key: str, value: str) -> str:
+        """Store a preference."""
+        ctx.context[key] = value
+        return "ok"
+
+    def agent(*steps: list) -> tuple[Guard, Agent]:
+        guard = Guard(clients={"planner": server.client("planner")},
+                      sources={"read_salaries": "salaries", "read_roadmap": "roadmap"},
+                      actions={"post_message": "post_to_slack"})
+        a = Agent(name="planner", tools=[read_salaries, read_roadmap, remember, post_message], model=script(*steps))
+        guard.protect(a)
+        return guard, a
+
+    memory, ctx = SQLiteSession("conversation"), {}
+    guard, a = agent(call("read_salaries"), call("remember", {"key": "trustgraph", "value": _token([])}))
+    asyncio.run(guard.run(a, "read", session=memory, context=ctx))
+    guard, a = agent(call("read_roadmap", n=1), call("post_message", {"text": "salary summary"}, 1))
+    out = outputs(asyncio.run(guard.run(a, "post", session=memory, context=ctx)))
+    assert "`salaries`" in out["post_message"] and "denied" in out["post_message"] and posted == []
+
+    ctx["trustgraph"] = _token([])  # replaced between runs: the history still holds the salaries result
+    guard, a = agent(call("read_roadmap", n=2), call("post_message", {"text": "salary summary"}, 2))
+    out = outputs(asyncio.run(guard.run(a, "post", session=memory, context=ctx)))
+    assert "does not record" in out["post_message"] and posted == []
+
+
+@pytest.mark.parametrize("context", [None, "dict"])
+@pytest.mark.parametrize("with_hooks", [False, True])
+def test_scope_carries_a_handoff_without_the_hooks(handoff_server: Server, context: Any, with_hooks: bool) -> None:
+    """The third review's o3.py: guard.scope() and Runner.run, hooks optional."""
+    guard, researcher = handoff_agents(handoff_server, "researcher", "read_salaries", "planner", [
+        call("read_roadmap"), call("post_message", {"text": "Q3 summary"})])
+    ctx = {} if context == "dict" else None
+    extra = {"hooks": guard.hooks()} if with_hooks else {}
+
+    async def run() -> Any:
+        with guard.scope("go", context=ctx):
+            return await Runner.run(researcher, "go", context=ctx, **extra)
+
+    out = outputs(asyncio.run(run()))
+    assert "`salaries` is readable by hr only" in out["post_message"] and posted == []
