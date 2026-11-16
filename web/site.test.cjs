@@ -93,29 +93,27 @@ async function main() {
   assert.equal(p.run('coverageLabel("constructor")'), 'constructor');
 
   // Status line and the interesting default run.
-  assert.equal(p.run(`checkStatus(${JSON.stringify(CHECK_OK)}).text`), '✓ valid · 1 test pass');
-  assert.equal(p.run('checkStatus({ok:false,diagnostics:[{severity:"error"},{severity:"error"},{severity:"warning"}]}).text'), '✗ 2 errors · 1 warning');
+  assert.equal(p.run(`checkStatus(${JSON.stringify(CHECK_OK)}).text`), 'valid · 1 test pass');
+  assert.equal(p.run('checkStatus({ok:false,diagnostics:[{severity:"error"},{severity:"error"},{severity:"warning"}]}).text'), '2 errors · 1 warning');
   assert.deepEqual(JSON.parse(p.run(`JSON.stringify(defaultRun(${JSON.stringify(SUMMARY)}))`)), { agent: 'planner', action: 'post_to_slack', sources: ['salaries', 'roadmap'], recipients: null });
   assert.deepEqual(JSON.parse(p.run('JSON.stringify(locatePath("sources:\\n  salaries:\\n    readers: [hrr]\\n", "sources.salaries.readers[0]"))')), [21, 39]);
 
   // Rendering allow, needs-approval and deny outcomes.
   const decision = (outcome, ctx) => { p.context.__o = outcome; p.context.__c = ctx; const el = new FakeNode('div'); el.replaceChildren(...p.run('renderDecision(__o, __c)')); return el; };
   const deny = decision(DENY, { sources: ['salaries', 'roadmap'], people: ['ravi', 'sam'], approval: null });
-  assert.equal(byClass(deny, 'verdict-deny').length, 1);
+  assert.equal(byClass(deny, 'v-deny').length, 1);
   assert.match(text(deny), /DENIED/);
   assert.match(text(deny), /Denied: salaries is readable by hr only/);
-  assert.match(text(deny), /Held back by/);
-  assert.deepEqual(byClass(deny, 'out').map(text), ['ravi', 'sam']);
-  assert.equal(byClass(deny, 'blocking').filter(n => n.tagName === 'G').length, 1, 'the blocking source is marked in the lineage');
-  assert.equal(byClass(deny, 'l-x').length, 2, 'each refused recipient edge is crossed out');
-  assert.equal(byClass(deny, 'verdict-icon').length, 1, 'verdict has an icon as well as colour');
+  assert.match(text(deny), /Held back by: salaries \(hr only\) — leaves out ravi, sam/);
+  assert.match(text(deny), /May read this output: nina/);
   const allow = decision({ verdict: 'allow', code: 'allowed', reason: 'allowed', blocking: [], readers: ['nina', 'ravi', 'sam'] }, { sources: ['roadmap'], people: ['ravi', 'sam'], approval: null });
   assert.match(text(allow), /ALLOWED/);
   assert.doesNotMatch(text(allow), /Held back/);
-  assert.equal(byClass(allow, 'l-x').length, 0);
+  assert.equal(byClass(allow, 'v-allow').length, 1);
+  assert.match(text(allow), /May read this output: nina, ravi, sam/);
   const wait = decision({ verdict: 'needs_approval', code: 'needs_approval', reason: 'needs approval from sales', blocking: [], readers: ['acme', 'leo'] }, { sources: ['price_sheet'], people: ['acme'], approval: SUMMARY.actions.email_customer.approval });
   assert.match(text(wait), /NEEDS APPROVAL/);
-  assert.match(text(wait), /A reviewer from sales \(leo\) must approve this exact output\. The approval lasts 30 minutes\./);
+  assert.match(text(wait), /Approval: one of sales \(leo\) approves this exact output, valid 30 minutes\./);
 
   // Diagnostics with a suggestion; clicking one focuses the editor at its line.
   const pageA = page();
@@ -124,11 +122,9 @@ async function main() {
   pageA.queue.push(res({ ok: false, diagnostics: [{ severity: 'error', path: 'sources.salaries.readers[0]', code: 'unknown_name', message: '`hrr` is not a group or person in this policy', suggestion: 'did you mean `hr`?' }], tests: null, explain: null, summary: null }));
   policy.value = 'version: 1\nsources:\n  salaries:\n    readers: [hrr]\n';
   await pageA.run('boot()');
-  assert.equal(text(pageA.$('check-status')), '✗ 1 error');
+  assert.equal(text(pageA.$('check-status')), '1 error');
   const diag = pageA.$('diagnostics');
-  assert.match(text(diag), /sources\.salaries\.readers\[0\]/);
-  assert.match(text(diag), /hrr is not a group or person/);
-  assert.match(text(diag), /Did you mean hr\?/);
+  assert.match(text(diag), /sources\.salaries\.readers\[0\] — hrr is not a group or person in this policy \(did you mean hr\?\)/);
   await byClass(diag, 'diag')[0].fire('click');
   assert.equal(policy.focused, true);
   assert.equal(policy.value.slice(policy.selectionStart, policy.selectionEnd), '    readers: [hrr]');
@@ -148,7 +144,7 @@ async function main() {
   assert.equal(pageB.$('policy').value, POLICY);
   assert.deepEqual(pageB.calls[2].body.query, { output_from: ['salaries', 'roadmap'], agent: 'planner', action: 'post_to_slack', recipients: null });
   assert.match(text(pageB.$('decision')), /DENIED/);
-  assert.equal(text(pageB.$('check-status')), '✓ valid · 1 test pass');
+  assert.equal(text(pageB.$('check-status')), 'valid · 1 test pass');
   assert.match(text(pageB.$('diff')), /No changes yet/);
   assert.match(text(pageB.$('explain')), /salaries: output can reach hr/);
 
@@ -172,12 +168,12 @@ async function main() {
   await new Promise(r => setImmediate(r));
   releaseOld();
   await older;
-  assert.equal(text(pageB.$('check-status')), '✓ valid · 1 test pass', 'stale check answer ignored');
+  assert.equal(text(pageB.$('check-status')), 'valid · 1 test pass', 'stale check answer ignored');
   assert.equal(text(pageB.$('diagnostics')), '');
   const diffCall = pageB.calls.find(c => c.body.op === 'diff');
   assert.deepEqual(diffCall.body, { op: 'diff', old: POLICY, new: 'edited twice' });
   assert.match(text(pageB.$('diff')), /WIDENS/);
-  assert.match(text(pageB.$('diff')), /A human should approve every WIDENS line/);
+  assert.match(text(pageB.$('diff')), /A person should approve each WIDENS line/);
 
   // Non-JSON error body: a calm message, never a parse error.
   pageB.queue.push(res('<html>Bad gateway</html>', 502));
@@ -205,15 +201,15 @@ async function main() {
   await pageB.run('runSimulation()');
   assert.deepEqual(pageB.calls.at(-1).body, { op: 'simulate', policy: 'edited twice', seed: 3, count: 8, steps: 120 });
   const sim = text(pageB.$('sim-result'));
-  assert.match(sim, /1,234/);
+  assert.match(sim, /4 runs, 1,234 events: 10 allow, 20 deny, 3 needs_approval — 0 violations/);
   assert.match(sim, /Crash with a torn journal write/);
-  assert.match(sim, /Denied exactly at approval expiry \(not exercised\)/);
+  assert.match(sim, /Denied exactly at approval expiry ×0 \(not exercised\)/);
   assert.match(sim, /future_key/);
   assert.match(sim, /Paths exercised: 2 of 3/);
   assert.equal(pageB.$('sim-run').disabled, false);
   pageB.queue.push(res({ ok: false, diagnostics: [], first_seed: 3, count: 4, steps: 80, events: 9, decisions: { allow: 1, deny: 0, needs_approval: 0 }, violations: [{ seed: 4, invariant: 'no_leak', step: 12, detail: 'allow named sam' }], coverage: {}, digest: 'x' }));
   await pageB.run('runSimulation()');
-  assert.match(text(pageB.$('sim-result')), /1 safety invariant violation found/);
+  assert.match(text(pageB.$('sim-result')), /1 safety invariant violation\. This is a bug/);
   assert.match(text(pageB.$('sim-result')), /An allow reached someone outside the readers.*seed 4, step 12/);
   pageB.queue.push(res({ ok: false, diagnostics: [{ severity: 'error', path: 'tests', code: 'test_failed', message: 'test `x` expects deny but the policy says allow', suggestion: null }] }));
   await pageB.run('runSimulation()');
@@ -222,7 +218,7 @@ async function main() {
   await pageB.run('runSimulation()');
   assert.match(text(pageB.$('sim-result')), /The simulator could not run: The server returned 503/);
   assert.equal(pageB.$('sim-run').disabled, false, 'the run button is never left disabled');
-  assert.equal(text(pageB.$('sim-run')), 'Run simulator');
+  assert.equal(text(pageB.$('sim-run')), 'Run');
 
   // Examples failing still checks the static textarea content.
   const pageC = page();

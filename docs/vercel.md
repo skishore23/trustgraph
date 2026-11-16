@@ -4,7 +4,7 @@
 
 The root page is the **policy playground**: an editable `trustgraph.policy.yaml`
 (starting from the six bundled examples), an agent run to decide, and the
-verdict with its reason, blocking sources and lineage. It also shows the
+verdict with its reason, the blocking sources and who may read the output. It also shows the
 policy's inline test results, the plain-English explanation, the diff against
 the example as loaded (with every widening flagged) and a seeded simulator run.
 Everything is computed by `trustgraph-policy` and the policy runtime through

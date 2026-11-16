@@ -12,7 +12,6 @@ const SIM_COUNT = 8;
 const SIM_STEPS = 120;
 const SEED_MAX = 65535;
 const DEFAULT_EXAMPLE = 'starter';
-const SVG_NS = 'http://www.w3.org/2000/svg';
 
 const VERDICTS = {
   allow: { label: 'ALLOWED', word: 'allow', cls: 'allow' },
@@ -118,12 +117,12 @@ function countDiagnostics(diagnostics) {
 function checkStatus(result) {
   const { errors, warnings } = countDiagnostics(result && result.diagnostics);
   const warn = warnings ? ` · ${plural(warnings, 'warning')}` : '';
-  if (errors) return { cls: 'bad', text: `✗ ${plural(errors, 'error')}${warn}` };
+  if (errors) return { cls: 'bad', text: `${plural(errors, 'error')}${warn}` };
   const tests = Array.isArray(result && result.tests) ? result.tests : [];
   const failed = tests.filter(t => !t.pass).length;
-  if (failed) return { cls: 'bad', text: `✗ valid · ${failed} of ${plural(tests.length, 'test')} fail${warn}` };
-  if (!tests.length) return { cls: 'warn', text: `✓ valid · no tests${warn}` };
-  return { cls: warnings ? 'warn' : 'ok', text: `✓ valid · ${plural(tests.length, 'test')} pass${warn}` };
+  if (failed) return { cls: 'bad', text: `valid · ${failed} of ${plural(tests.length, 'test')} fail${warn}` };
+  if (!tests.length) return { cls: 'warn', text: `valid · no tests${warn}` };
+  return { cls: warnings ? 'warn' : 'ok', text: `valid · ${plural(tests.length, 'test')} pass${warn}` };
 }
 
 // Pick a first run that shows something interesting: an agent that may use one
@@ -247,19 +246,15 @@ function lane() {
   };
 }
 
-/* ---------- DOM building ---------- */
+/* ---------- DOM building: plain text, no graphics ---------- */
 
 function h(tag, props, ...children) {
   const el = document.createElement(tag);
   applyProps(el, props);
-  appendAll(el, children);
-  return el;
-}
-
-function svg(tag, attrs, ...children) {
-  const el = document.createElementNS(SVG_NS, tag);
-  for (const [key, value] of Object.entries(attrs || {})) if (value != null) el.setAttribute(key, String(value));
-  appendAll(el, children);
+  for (const child of children.flat(Infinity)) {
+    if (child == null || child === false) continue;
+    el.append(typeof child === 'object' ? child : String(child));
+  }
   return el;
 }
 
@@ -275,196 +270,117 @@ function applyProps(el, props) {
   }
 }
 
-function appendAll(el, children) {
-  for (const child of children.flat(Infinity)) {
-    if (child == null || child === false) continue;
-    el.append(typeof child === 'object' ? child : String(child));
-  }
-}
-
-// Turn `backticked` names in engine text into styled spans.
+// Turn `backticked` names in engine text into <code>.
 function richText(text) {
-  return String(text ?? '').split('`').map((part, i) => (i % 2 ? h('span', { class: 'name', text: part }) : part)).filter(p => p !== '');
-}
-
-function peopleChips(people, cls) {
-  if (!people.length) return h('span', { class: 'muted', text: 'no one' });
-  return h('span', { class: 'people-list' }, people.map(p => h('span', { class: cls ? `person ${cls}` : 'person', text: p })));
-}
-
-function verdictIcon(verdict) {
-  const shapes = {
-    allow: svg('path', { d: 'M10 17.5 15 22.5 24.5 12' }),
-    needs_approval: svg('path', { d: 'M17 10v7.5l4.5 3' }),
-    deny: svg('path', { d: 'M12 12 22 22M22 12 12 22' }),
-  };
-  return svg('svg', { class: 'verdict-icon', viewBox: '0 0 34 34', 'aria-hidden': 'true' }, svg('circle', { cx: 17, cy: 17, r: 17 }), shapes[verdict]);
-}
-
-function renderDiagnostics(diagnostics, onPick) {
-  return (Array.isArray(diagnostics) ? diagnostics : []).map(d => {
-    const severity = d.severity === 'warning' ? 'warning' : 'error';
-    const button = h('button', { class: `diag ${severity}`, type: 'button', on: { click: () => onPick && onPick(d) } },
-      h('span', { class: 'diag-head' }, h('span', { class: 'diag-sev', text: severity }), d.path ? h('span', { class: 'diag-path', text: d.path }) : null),
-      h('span', { class: 'diag-msg' }, richText(d.message)),
-      d.suggestion ? h('span', { class: 'diag-suggest' }, richText(capitalise(d.suggestion))) : null);
-    return h('li', null, button);
-  });
+  return String(text ?? '').split('`').map((part, i) => (i % 2 ? h('code', { text: part }) : part)).filter(p => p !== '');
 }
 
 const capitalise = text => String(text).charAt(0).toUpperCase() + String(text).slice(1);
+const names = values => list(values).join(', ') || 'no one';
+
+// "path — message (did you mean `x`?)"; clicking one moves the editor to that line.
+function renderDiagnostics(diagnostics, onPick) {
+  return (Array.isArray(diagnostics) ? diagnostics : []).map(d => {
+    const severity = d.severity === 'warning' ? 'warning' : 'error';
+    return h('li', null, h('button', { class: `diag ${severity}`, type: 'button', on: { click: () => onPick && onPick(d) } },
+      severity === 'warning' ? 'warning: ' : '',
+      d.path ? `${d.path} — ` : '',
+      richText(d.message),
+      d.suggestion ? [' (', richText(d.suggestion), ')'] : null));
+  });
+}
 
 function renderTests(tests) {
   if (!Array.isArray(tests)) return [h('li', { class: 'muted', text: 'Fix the errors above to run the tests.' })];
-  if (!tests.length) return [h('li', { class: 'muted', text: 'This policy has no tests. Add some under tests:.' })];
+  if (!tests.length) return [h('li', { class: 'muted', text: 'This policy has no tests.' })];
   return tests.map(t => {
     const pass = Boolean(t.pass);
     const got = t.outcome && VERDICTS[t.outcome.verdict];
     const expected = VERDICTS[t.expect];
-    const why = pass ? null : h('span', { class: 'test-why' },
-      `Expected ${expected ? expected.word : t.expect}, got ${got ? got.word : 'no decision'}`,
-      t.outcome && t.outcome.reason ? [' — ', richText(t.outcome.reason)] : null);
-    return h('li', { class: `test ${pass ? 'pass' : 'fail'}` }, h('span', { class: 'test-tag', text: pass ? 'PASS' : 'FAIL' }), h('span', { text: t.name }), why);
+    return h('li', { class: pass ? 'pass' : 'fail' }, h('span', { class: 'tag', text: pass ? 'PASS' : 'FAIL' }), ' ', t.name,
+      pass ? null : h('span', { class: 'why', text: ` — expected ${expected ? expected.word : t.expect}, got ${got ? got.word : 'no decision'}` }));
   });
 }
 
 function renderExplain(text) {
   const lines = String(text || '').split('\n').map(l => l.trim()).filter(Boolean);
   if (!lines.length) return [h('li', { class: 'muted', text: 'Appears once the policy is valid.' })];
-  return lines.map(line => {
-    const colon = line.indexOf(':');
-    if (colon <= 0) return h('li', null, richText(line));
-    return h('li', null, h('span', { class: 'name', text: line.slice(0, colon) }), richText(line.slice(colon)));
-  });
+  return lines.map(line => h('li', null, richText(line)));
 }
 
 const DIFF_TAGS = { widens: 'WIDENS', narrows: 'NARROWS', neutral: 'CHANGE' };
 
 function renderDiff(result) {
-  if (!result) return [h('li', { class: 'empty-state' }, 'No changes yet — try adding ', h('code', { text: 'engineering' }), " to the salary source's readers.")];
+  if (!result) return [h('li', { class: 'muted', text: 'No changes yet. Try adding engineering to the salaries readers.' })];
   if (!result.ok && result.file) {
-    return [h('li', { class: 'empty-state', text: result.file === 'old' ? 'The original policy could not be read.' : 'Fix the errors in the policy to compare it with the original.' })];
+    return [h('li', { class: 'muted', text: result.file === 'old' ? 'The original policy could not be read.' : 'Fix the errors in the policy to compare it with the original.' })];
   }
   const changes = Array.isArray(result.changes) ? result.changes : [];
-  if (!changes.length) return [h('li', { class: 'empty-state', text: 'No change in who can read or receive anything.' })];
+  if (!changes.length) return [h('li', { class: 'muted', text: 'No change in who can read or receive anything.' })];
   const items = changes.map(c => {
     const kind = hasOwn(DIFF_TAGS, c.kind) ? c.kind : 'neutral';
-    return h('li', { class: kind }, h('span', { class: 'diff-tag', text: DIFF_TAGS[kind] }), h('span', null, h('span', { class: 'name', text: c.subject }), `: ${c.summary}`));
+    return h('li', { class: kind }, h('span', { class: 'tag', text: DIFF_TAGS[kind] }), ' ', `${c.subject}: ${c.summary}`);
   });
-  if (result.widens) items.unshift(h('li', null, h('span', { class: 'diff-alert', text: 'This version gives more people access. A human should approve every WIDENS line.' })));
+  if (result.widens) items.push(h('li', { class: 'alert', text: 'This gives more people access. A person should approve each WIDENS line.' }));
   return items;
 }
 
-// Sources → output → recipients. Blocking sources and refused recipients are marked.
-function lineageDiagram(outcome, context) {
-  const sources = context.sources.length ? context.sources : ['(nothing)'];
-  const people = context.people;
-  const readers = new Set(list(outcome.readers));
-  const blocking = new Set((outcome.blocking || []).map(b => b.source));
-  const verdict = outcome.verdict;
-  const rows = Math.max(sources.length, people.length, 1);
-  const rowH = 34;
-  const top = 26;
-  const height = top + rows * rowH + 4;
-  const width = 360;
-  const mid = top + (rows * rowH) / 2 - 2;
-  const short = (text, n) => (text.length > n ? `${text.slice(0, n - 1)}…` : text);
-  const y = (i, n) => top + ((rows - n) * rowH) / 2 + i * rowH;
-  const nodes = [];
-  const edges = [];
-  sources.forEach((name, i) => {
-    const ny = y(i, sources.length);
-    const cls = blocking.has(name) ? 'l-node blocking' : 'l-node';
-    nodes.push(svg('g', { class: cls }, svg('title', null, name), svg('rect', { x: 0, y: ny, width: 112, height: 26, rx: 6 }), svg('text', { x: 9, y: ny + 17 }, short(name, 13))));
-    edges.push(svg('path', { class: blocking.has(name) ? 'l-edge blocking' : 'l-edge', d: `M112 ${ny + 13} C136 ${ny + 13} 132 ${mid + 13} 150 ${mid + 13}` }));
-  });
-  nodes.push(svg('g', { class: 'l-node l-out' }, svg('rect', { x: 150, y: mid, width: 66, height: 26, rx: 13 }), svg('text', { x: 162, y: mid + 17 }, 'output')));
-  const edgeCls = verdict === 'allow' ? 'l-edge ok' : verdict === 'needs_approval' ? 'l-edge wait' : 'l-edge blocked';
-  people.forEach((person, i) => {
-    const ny = y(i, people.length);
-    const inReaders = readers.has(person);
-    const nodeCls = !inReaders ? 'l-node left-out' : verdict === 'allow' ? 'l-node ok' : verdict === 'needs_approval' ? 'l-node wait' : 'l-node';
-    edges.push(svg('path', { class: edgeCls, d: `M216 ${mid + 13} C236 ${mid + 13} 232 ${ny + 13} 256 ${ny + 13}` }));
-    if (verdict === 'deny') edges.push(svg('g', { class: 'l-x', transform: `translate(246 ${ny + 13})` }, svg('circle', { r: 6.5 }), svg('path', { d: 'M-2.6-2.6 2.6 2.6M2.6-2.6-2.6 2.6' })));
-    nodes.push(svg('g', { class: nodeCls }, svg('title', null, person), svg('rect', { x: 256, y: ny, width: 104, height: 26, rx: 6 }), svg('text', { x: 265, y: ny + 17 }, short(person, 12))));
-  });
-  const label = `${sources.join(', ')} flow into the output; ${verdict === 'deny' ? 'blocked from' : verdict === 'needs_approval' ? 'waiting for approval to reach' : 'sent to'} ${people.join(', ') || 'no one'}.`;
-  return svg('svg', { class: 'lineage', viewBox: `0 0 ${width} ${height}`, role: 'img', 'aria-label': label },
-    svg('text', { class: 'l-caption', x: 0, y: 12 }, 'READ'),
-    svg('text', { class: 'l-caption', x: 150, y: 12 }, 'OUTPUT'),
-    svg('text', { class: 'l-caption', x: 256, y: 12 }, 'SENT TO'),
-    edges, nodes);
-}
-
-// The whole decision panel for one outcome.
+// The decision as text: verdict word, reason, what held it back, who may read it.
 function renderDecision(outcome, context) {
   const info = VERDICTS[outcome && outcome.verdict];
-  if (!info) return [h('div', { class: 'verdict verdict-error' }, h('span', { class: 'verdict-text', text: 'No decision' })), h('p', { class: 'muted', text: 'The engine did not return a verdict.' })];
-  const blocking = Array.isArray(outcome.blocking) ? outcome.blocking : [];
-  const facts = [];
-  if (blocking.length) {
-    facts.push(h('div', null, h('dt', { text: 'Held back by' }), h('dd', null, blocking.map(b => h('span', { class: 'blocker' },
-      h('span', { class: 'name', text: b.source }), ` is for ${list(b.readers).join(', ') || 'no one'} — leaves out `, peopleChips(list(b.excluded), 'out'))))));
+  if (!info) return [h('p', { class: 'muted', text: 'The engine did not return a verdict.' })];
+  const out = [
+    h('p', { class: `verdict v-${info.cls}`, text: info.label }),
+    h('p', null, richText(capitalise(outcome.reason || ''))),
+  ];
+  for (const b of Array.isArray(outcome.blocking) ? outcome.blocking : []) {
+    out.push(h('p', null, 'Held back by: ', h('code', { text: b.source }), ` (${names(b.readers)} only) — leaves out ${names(b.excluded)}`));
   }
-  facts.push(h('div', null, h('dt', { text: 'Who may read this output' }), h('dd', null, peopleChips(list(outcome.readers), 'in'))));
-  const approval = context.approval;
+  out.push(h('p', null, `May read this output: ${names(outcome.readers)}`));
+  const approval = context && context.approval;
   if (outcome.verdict === 'needs_approval' && approval) {
     const lasts = humanDuration(approval.valid_for_seconds);
-    facts.push(h('div', null, h('dt', { text: 'Approval' }), h('dd', null,
-      `A reviewer from ${list(approval.reviewers).join(', ')} (${list(approval.people).join(', ')}) must approve this exact output`,
-      lasts ? `. The approval lasts ${lasts}.` : '.')));
+    out.push(h('p', null, `Approval: one of ${names(approval.reviewers)} (${names(approval.people)}) approves this exact output${lasts ? `, valid ${lasts}` : ''}.`));
   }
-  return [
-    h('div', { class: `verdict verdict-${info.cls}` }, verdictIcon(outcome.verdict), h('span', { class: 'verdict-text', text: info.label })),
-    h('p', { class: 'reason' }, richText(capitalise(outcome.reason || ''))),
-    h('dl', null, facts),
-    lineageDiagram(outcome, context),
-  ];
+  return out;
+}
+
+const num = n => Number(n || 0).toLocaleString('en-US');
+
+// The CLI's own summary line: "8 runs, 972 events: 111 allow, 420 deny, 36 needs_approval — 0 violations".
+function simulationLine(result) {
+  const d = result.decisions || {};
+  const v = Array.isArray(result.violations) ? result.violations.length : 0;
+  return `${num(result.count)} ${Number(result.count) === 1 ? 'run' : 'runs'}, ${num(result.events)} events: ${num(d.allow)} allow, ${num(d.deny)} deny, ${num(d.needs_approval)} needs_approval — ${plural(v, 'violation')}`;
 }
 
 function renderSimulation(result) {
-  if (!result.ok && Array.isArray(result.diagnostics) && countDiagnostics(result.diagnostics).errors) {
-    const errors = result.diagnostics.filter(d => d && d.severity === 'error');
+  const errors = (Array.isArray(result.diagnostics) ? result.diagnostics : []).filter(d => d && d.severity === 'error');
+  if (!result.ok && errors.length) {
     return [
-      h('p', { class: 'inline-error', text: 'The simulator only runs a policy that is valid and passes its own tests. Fix this first:' }),
-      h('ul', { class: 'sim-errors' }, errors.map(d => h('li', null, richText(d.message)))),
+      h('p', { class: 'alert', text: 'The simulator only runs a policy that is valid and passes its own tests:' }),
+      h('ul', null, errors.map(d => h('li', null, richText(d.message)))),
     ];
   }
-  const d = result.decisions || {};
   const violations = Array.isArray(result.violations) ? result.violations : [];
-  const stat = (cls, label, value) => h('div', { class: `stat ${cls}` }, h('dt', { text: label }), h('dd', { text: Number(value || 0).toLocaleString('en-US') }));
-  const out = [h('dl', { class: 'stats' },
-    stat('', 'Runs', result.count),
-    stat('', 'Events', result.events),
-    stat('allow', 'Allowed', d.allow),
-    stat('needs_approval', 'Needs approval', d.needs_approval),
-    stat('deny', 'Denied', d.deny),
-    stat(`violations ${violations.length ? 'some' : 'none'}`, 'Violations', violations.length))];
+  const out = [h('pre', { text: simulationLine(result) })];
   if (violations.length) {
-    out.push(h('div', { class: 'violations-list', role: 'alert' },
-      h('h3', { text: `${plural(violations.length, 'safety invariant violation')} found` }),
-      h('ul', null, violations.map(v => h('li', null,
-        h('b', { text: invariantLabel(v.invariant) }), ` (seed ${v.seed}, step ${v.step}): ${v.detail}`))),
-      h('p', { class: 'hint', text: 'This is a bug in TrustGraph, not in your policy. Please report it with the seed.' })));
+    out.push(h('div', { role: 'alert' },
+      h('p', { class: 'alert', text: `${plural(violations.length, 'safety invariant violation')}. This is a bug in TrustGraph; please report it with the seed.` }),
+      h('ul', null, violations.map(v => h('li', null, `${invariantLabel(v.invariant)} (seed ${v.seed}, step ${v.step}): ${v.detail}`)))));
   }
   const coverage = result.coverage && typeof result.coverage === 'object' ? result.coverage : {};
-  const known = Object.keys(COVERAGE_LABELS).filter(k => hasOwn(coverage, k));
-  const extra = Object.keys(coverage).filter(k => !hasOwn(COVERAGE_LABELS, k)).sort();
-  const keys = [...known, ...extra];
+  const keys = [...Object.keys(COVERAGE_LABELS).filter(k => hasOwn(coverage, k)), ...Object.keys(coverage).filter(k => !hasOwn(COVERAGE_LABELS, k)).sort()];
   if (keys.length) {
     const hit = keys.filter(k => Number(coverage[k]) > 0).length;
-    out.push(h('div', { class: 'coverage' },
-      h('h3', { text: `Paths exercised: ${hit} of ${keys.length}` }),
-      h('p', { class: 'hint', text: '○ means this seed did not reach that path. Try another seed.' }),
-      h('ul', null, keys.map(k => {
+    out.push(h('details', null,
+      h('summary', { text: `Paths exercised: ${hit} of ${keys.length}` }),
+      h('ul', { class: 'lines' }, keys.map(k => {
         const n = Number(coverage[k]) || 0;
-        return h('li', { class: `cov ${n ? 'hit' : 'miss'}` },
-          h('span', { class: 'cov-mark', 'aria-hidden': 'true', text: n ? '✓' : '○' }),
-          h('span', null, coverageLabel(k), h('span', { class: 'sr-only', text: n ? ' (exercised)' : ' (not exercised)' })),
-          h('span', { class: 'cov-n', text: `×${n}` }));
+        return h('li', { class: n ? 'hit' : 'miss' }, h('span', { class: 'mark', 'aria-hidden': 'true', text: n ? '✓ ' : '· ' }),
+          coverageLabel(k), ` ×${n}`, h('span', { class: 'sr-only', text: n ? ' (exercised)' : ' (not exercised)' }));
       }))));
   }
-  if (result.digest) out.push(h('p', { class: 'digest' }, `First seed ${result.first_seed ?? ''} · ${result.steps ?? ''} steps per run · digest ${String(result.digest).slice(0, 16)}… The same seed gives the same digest.`));
   return out;
 }
 
@@ -486,14 +402,12 @@ const lanes = { examples: lane(), check: lane(), decide: lane(), diff: lane(), s
 function $(id) { return document.getElementById(id); }
 
 function setStatus(cls, text) {
-  ui.status.setAttribute('class', `check-status ${cls}`);
+  ui.status.setAttribute('class', `status ${cls}`);
   ui.status.textContent = text;
 }
 
-function showDecisionMessage(title, detail, cls = 'pending') {
-  ui.decision.replaceChildren(
-    h('div', { class: `verdict verdict-${cls}` }, h('span', { class: 'verdict-text', text: title })),
-    detail ? h('p', { class: 'muted', text: detail }) : null);
+function showDecisionMessage(title, detail) {
+  ui.decision.replaceChildren(h('p', { class: 'verdict', text: title }), detail ? h('p', { class: 'muted', text: detail }) : null);
 }
 
 function fillSelect(select, values, selected) {
@@ -530,7 +444,7 @@ async function loadExample(id) {
   state.original = example.policy;
   state.run = null;
   lanes.simulate.cancel();
-  ui.simResult.replaceChildren(h('p', { class: 'muted', text: 'Runs use the policy currently in the playground editor.' }));
+  ui.simResult.replaceChildren(h('p', { class: 'muted', text: 'Uses the policy in the editor above. Seeds are 0 to 65535.' }));
   ui.simRun.disabled = false;
   await runCheck();
 }
@@ -550,7 +464,7 @@ async function runCheck() {
     state.valid = false;
     setStatus('offline', `Couldn't check: ${res.error.message}`);
     lanes.decide.cancel();
-    showDecisionMessage('Engine unavailable', 'The decision will appear when the policy engine answers. Edit the policy to try again.', 'error');
+    showDecisionMessage('Engine unavailable', 'The decision will appear when the policy engine answers. Edit the policy to try again.');
     return;
   }
   const result = res.value;
@@ -567,7 +481,7 @@ async function runCheck() {
     runDecide();
   } else {
     lanes.decide.cancel();
-    showDecisionMessage('Policy has errors', 'Fix the errors in the policy to see a decision.', 'error');
+    showDecisionMessage('Policy has errors', 'Fix the errors in the policy to see a decision.');
   }
   runDiff(policy, Boolean(result.ok));
 }
@@ -584,8 +498,8 @@ async function runDecide() {
   const res = await lanes.decide.run(buildRequest('decide', { policy: ui.policy.value, output_from: run.sources, agent: run.agent, action: run.action, recipients: run.recipients }));
   if (!res.fresh) return;
   ui.decision.setAttribute('aria-busy', 'false');
-  if (res.error) { showDecisionMessage('Engine unavailable', res.error.message, 'error'); return; }
-  if (!res.value.outcome) { showDecisionMessage('Policy has errors', 'Fix the errors in the policy to see a decision.', 'error'); return; }
+  if (res.error) { showDecisionMessage('Engine unavailable', res.error.message); return; }
+  if (!res.value.outcome) { showDecisionMessage('Policy has errors', 'Fix the errors in the policy to see a decision.'); return; }
   const action = state.summary.actions[run.action] || {};
   ui.decision.replaceChildren(...renderDecision(res.value.outcome, {
     sources: run.sources,
@@ -616,23 +530,16 @@ function renderRunControls() {
   const run = state.run;
   fillSelect(ui.agent, list(summary.agents), run.agent);
   fillSelect(ui.action, Object.keys(summary.actions || {}), run.action);
-
-  const sources = Object.entries(summary.sources || {});
-  ui.sources.replaceChildren(...sources.map(([name, s]) => {
-    const usable = list(s.agents).includes(run.agent);
-    return h('label', { class: 'check' },
-      h('input', { type: 'checkbox', value: name, checked: run.sources.includes(name), on: { change: event => toggleSource(name, event.target.checked) } }),
-      h('span', { class: 'check-name', text: name }),
-      h('span', { class: 'check-meta', text: usable ? `for ${list(s.readers).join(', ')}` : `${run.agent} may not use` }));
-  }));
-
+  const box = (value, checked, onChange, note) => h('label', null,
+    h('input', { type: 'checkbox', value, checked, on: { change: event => onChange(value, event.target.checked) } }),
+    value, note ? h('span', { class: 'muted', text: ` (${note})` }) : null);
+  ui.sources.replaceChildren(...Object.entries(summary.sources || {}).map(([name, s]) =>
+    box(name, run.sources.includes(name), toggleSource, list(s.agents).includes(run.agent) ? null : `${run.agent} may not use`)));
   const action = summary.actions[run.action] || {};
   const approval = action.approval;
-  ui.actionHelp.textContent = `Audience: ${list(action.audience).join(', ')} (${list(action.people).join(', ')})${approval ? ` · approval by ${list(approval.reviewers).join(', ')}` : ''}`;
+  ui.actionHelp.textContent = approval ? `needs approval by ${names(approval.reviewers)}` : '';
   const chosen = expandRecipients(run, summary);
-  ui.recipients.replaceChildren(...list(action.people).map(person => h('label', { class: 'check' },
-    h('input', { type: 'checkbox', value: person, checked: chosen.includes(person), on: { change: event => toggleRecipient(person, event.target.checked) } }),
-    h('span', { class: 'check-name', text: person }))));
+  ui.recipients.replaceChildren(...list(action.people).map(person => box(person, chosen.includes(person), toggleRecipient)));
 }
 
 function toggleSource(name, on) {
@@ -694,7 +601,7 @@ async function runSimulation(event) {
     else ui.simResult.replaceChildren(...renderSimulation(res.value));
   } finally {
     ui.simRun.disabled = false;
-    ui.simRun.textContent = 'Run simulator';
+    ui.simRun.textContent = 'Run';
     ui.simResult.setAttribute('aria-busy', 'false');
   }
 }
