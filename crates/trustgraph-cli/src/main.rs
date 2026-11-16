@@ -44,10 +44,10 @@ enum Command {
         /// Journal size, in bytes, past which agent writes are refused.
         #[arg(long, default_value_t = trustgraph_cli::serve::DEFAULT_MAX_JOURNAL_BYTES)]
         max_journal_bytes: u64,
-        /// Journal bytes each agent may cause while the server runs.
+        /// Journal bytes each agent may cause for the life of the state directory.
         #[arg(long, default_value_t = trustgraph_cli::serve::DEFAULT_AGENT_JOURNAL_BYTES)]
         agent_journal_bytes: u64,
-        /// Artifacts each agent may create while the server runs.
+        /// Artifacts each agent may create for the life of the state directory.
         #[arg(long, default_value_t = trustgraph_cli::serve::DEFAULT_AGENT_ARTIFACTS)]
         agent_artifacts: u64,
     },
