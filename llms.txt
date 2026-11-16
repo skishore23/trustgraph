@@ -15,3 +15,4 @@
 
 - Print the JSON Schema of the policy file: `trustgraph policy schema`
 - Validate, test, explain and compare: `trustgraph policy check FILE`, `trustgraph policy test FILE`, `trustgraph policy explain FILE`, `trustgraph policy diff OLD NEW` (add `--json` for machine output)
+- Stress a policy on the real runtime with seeded random scenarios (agents, policy changes, crashes, approval expiry) and check the safety invariants: `trustgraph policy simulate FILE [--seed 0] [--count 64] [--steps 200] [--json]`

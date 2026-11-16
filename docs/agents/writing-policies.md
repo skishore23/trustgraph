@@ -7,7 +7,7 @@ Read this before you write or change a `trustgraph.policy.yaml`. Every command b
 A policy says where an AI agent's output may go, based on what the agent read. For each attempt it answers `allow`, `needs_approval` or `deny`. Two rules do all the work:
 
 1. **Output readers are the intersection of every input's readers.** If an agent read two sources, only people who may read both may receive the output.
-2. **Approval only adds a requirement; it never widens access.** Anything the policy does not name is denied. A reviewer must be allowed to read the output and cannot be the agent that asked.
+2. **Approval only adds a requirement; it never widens access.** Anything the policy does not name is denied. Reviewers are people named in the policy, and a reviewer must be allowed to read the output; agents are never reviewers.
 
 ## 2. One annotated example
 
@@ -38,7 +38,7 @@ actions:                         # places an agent may send output
   post_all_hands:
     agents: [digest_bot]         # who may attempt it
     audience: [everyone]         # who receives the output
-    approval: { reviewers: [hr], valid_for: 1h }   # optional; 30m, 2h, 1d
+    approval: { reviewers: [hr], valid_for: 1h }   # optional; <integer><s|m|h|d>, 1s to 30d
   post_eng_channel:
     agents: [digest_bot]
     audience: [engineering]
@@ -56,15 +56,17 @@ tests:                           # examples of what you expect
     expect: deny
 ```
 
-An action is allowed only when its audience is inside the output's readers, the agent is listed on the action, and the agent is listed on every source it read. Names must match `^[a-z0-9][a-z0-9_.@-]{0,63}$`. Unknown fields are errors. The optional `recipients` field on a test narrows an action's audience to a subset.
+An action is allowed only when its audience is inside the output's readers, the agent is listed on the action, and the agent is listed on every source it read. Names must match `^[a-z0-9][a-z0-9_.@-]{0,63}$`. A group lists people only; groups cannot contain groups. Unknown fields are errors. The optional `recipients` field on a test narrows an action's audience to a subset.
 
 ## 3. The loop
 
 Work in this order. Do not skip steps.
 
+Every `policy` command exits 0 when all is well; 1 for diagnostics with errors, failing tests or simulator violations; 2 for a usage or I/O error.
+
 1. **init** (new policy only): `trustgraph policy init --path trustgraph.policy.yaml`. It prints `Wrote <path>`. Use `--force` to overwrite. Pass `--json` for a JSON result.
 2. **Edit** the file. Start from the starter or from a file in `examples/policies/` that matches your scenario.
-3. **check**: `trustgraph policy check --json FILE`. Exit code 0 when `ok` is true, 1 otherwise. Fix every error, then read the warnings.
+3. **check**: `trustgraph policy check --json FILE`. Exit code 0 when `ok` is true, 1 when the file has errors, 2 on a usage or I/O error. Fix every error, then read the warnings. `check` does not run the inline tests: run `policy test` too. A policy with failing tests is refused when someone tries to activate it.
 
    ```json
    {
@@ -173,7 +175,7 @@ Work in this order. Do not skip steps.
 | `duplicate_key` | A key appears twice in one mapping (the later one would silently win). | Delete or rename one; merge the lists. |
 | `too_large` | The file is over 262,144 bytes. | Split the policy by scenario or remove unused entries. |
 | `too_many_errors` | More than 100 errors; the rest are hidden. | Fix the first ones and re-run. |
-| `unsupported_version` | `version` is not 1. | Set `version: 1`. |
+| `unsupported_version` | `version` is not the number 1 (a quoted `"1"` is refused too). | Set `version: 1`, unquoted. |
 | `missing_field` | A required field is absent. | Add it at the reported `path`. |
 | `unknown_field` | A key the format does not have. | Remove it or fix the spelling (see `suggestion`). |
 | `wrong_type` | A value has the wrong shape, such as a string where a list belongs. | Use the type the schema shows. |
@@ -183,7 +185,7 @@ Work in this order. Do not skip steps.
 | `nested_group` | A group lists another group (or itself) as a member. Groups cannot contain groups. | List that group's people instead (see `suggestion`). |
 | `empty_set` | A list that must have entries is empty. | Fill it. An empty `readers` or `audience` is never silently "nobody". |
 | `unknown_name` | A reader, audience, reviewer, agent or source is not defined. | Define it, or use the name in `suggestion`. |
-| `invalid_duration` | `valid_for` is not like `30m`, `2h` or `1d`, or is longer than 30 days. | Write a number and `m`, `h` or `d`. |
+| `invalid_duration` | `valid_for` is not `<integer><s\|m\|h\|d>` (like `90s`, `30m`, `2h`, `1d`), or is under 1 second or over 30 days. | Write a whole number and `s`, `m`, `h` or `d`, from 1 second to 30 days. |
 | `duplicate_test` | Two tests share a `name`. | Give each test a unique name. |
 | `no_tests` (warning) | The policy has no tests. | Add tests (section 5). |
 | `source_unusable` (warning) | No agent may use the source. | Add an agent to `agents`, or delete the source. |
@@ -207,7 +209,7 @@ Tests are how a human checks that you understood the request. Include:
 
 ## 6. Rules of the road
 
-- **Agents propose; humans activate.** You write and test a policy file. A person reads it and turns it on. Never treat your own edit as live.
+- **Agents propose; humans activate.** You write and test a policy file. A person reads it and turns it on. Never treat your own edit as live. Every activation voids all existing approvals, even when the policy did not change.
 - **Never widen access to make a test pass.** If a test fails, first assume the policy is right and the test or your edit is wrong. Change a test's `expect` to a wider result only when the human asked for that wider access.
 - **Flag every `WIDENS` line.** Quote it to the human with the people it adds and ask for a yes.
 - **Protect the policy file with code review.** Put it behind CODEOWNERS and branch protection so a change needs a human owner's approval before merge.
@@ -215,6 +217,6 @@ Tests are how a human checks that you understood the request. Include:
 
 ## 7. Known limits
 
-- TrustGraph only knows the inputs the host reports. If an agent reads something and the host does not say so in `output_from`, the policy cannot account for it.
+- **Trust boundary.** TrustGraph only knows the inputs the host reports; if an agent reads something and the host does not say so, the policy cannot account for it. The host must ask for a decision immediately before it acts and act only on `allow`. A policy change between the check and the act is not covered.
 - The host must act on the decision. TrustGraph answers `allow`, `needs_approval` or `deny`; it does not send, block or approve anything itself.
 - Group members are people by name. Make sure the names match the identities your host uses.

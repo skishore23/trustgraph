@@ -104,8 +104,10 @@ tests:                        # run by `policy test`; must pass to activate
     expect: allow
 ```
 
-Semantics (unchanged from the existing SDK; the reader-set kernels it calls in
-`trustgraph-core` are the part covered by the Kani proofs):
+Semantics (unchanged from the existing SDK; the part covered by Kani proofs is
+the kernels in `trustgraph-core` it calls: the existing reader-set kernels plus
+`trustgraph_core::decision::{gate, approval_live}`, see "Decisions made during
+the build"):
 
 - `readers(output) = intersection of readers(every input)`.
 - An action is allowed only if its audience ⊆ readers(output), the agent is
@@ -119,15 +121,18 @@ Decisions made during the design review (my calls, open to correction):
 
 - **Groups expand to people.** All subset checks run on expanded members, so
   someone in both `hr` and `engineering` may receive hr-only output. Reasons
-  name both the group and the people left out. An empty group is an error.
-- **Reviewers must be allowed to see what they approve.** A reviewer has to be
-  a reader of the output and cannot be the agent that asked. `policy check`
+  name both the group and the people left out. An empty group is an error,
+  and groups cannot contain groups (`nested_group`): a group lists people.
+- **Reviewers must be allowed to see what they approve.** Reviewers are people
+  named in the policy and must be readers of the output; agents are never
+  reviewers. `policy check`
   rejects an approval rule whose reviewers can never read any output the
   action could carry.
 - **Readers always come from the active policy, by source name.** Narrowing a
   source takes effect at once on everything already derived from it. A source
-  removed from the policy makes its outputs deny. An approval is tied to the
-  sources and action rule it was given under; changing any of them voids it.
+  removed from the policy makes its outputs deny. An approval covers one
+  resolved request (agent, artifact, action and recipient people), and every
+  policy activation voids all approvals, even when nothing relevant changed.
 
 Internally a source's reader set is `readers ∪ agents`, which is how the
 existing SDK already treats an executor ("the model receiving an input is
@@ -166,7 +171,8 @@ Design rules for the format and tools:
 **Activation is human-only.** `policy_propose` stores a candidate and returns
 its diff and explanation; it does not change the active policy. Activation
 happens through the operator session (see below) or by the human restarting
-`serve` with a new file. Documented limit: if an agent shares the operator's
+`serve` with a changed file. A restart with an unchanged file keeps an in-band
+operator activation. Documented limit: if an agent shares the operator's
 shell and can edit the file and restart the service, the control is code
 review of the policy file (branch protection / CODEOWNERS), which the guide
 recommends.
@@ -207,7 +213,9 @@ Plus read-only `explain_artifact` (lineage and current readers) and
   and explanation, each with Approve / Activate. No other UI.
 - **After approval the host calls `check` again** and gets `allow`; it does
   not handle approval ids.
-- **State:** an append-only journal in the state directory, replayed on start.
+- **State:** an append-only journal in the state directory, replayed on start
+  (torn writes and corruption are described under "Decisions made during the
+  build").
   The state directory must be outside agent workspaces (same check as `start`).
 - **The host must call `check` immediately before acting** and act only on
   `allow`. TrustGraph does not perform the action. This limit is stated in the
@@ -231,7 +239,8 @@ Owner requirement: the simulator must run the runtime itself, not a model of it.
 - **Invariants checked on every simulated step:**
   1. No `allow` ever names a recipient outside the readers of every source in
      the output's lineage under the policy active at that moment.
-  2. No approval survives a change to its sources or its action rule.
+  2. No approval survives a policy activation, and an approval covers only the
+     resolved request it was given for.
   3. Crash + replay reaches the same state and the same next decisions.
   4. Narrowing a source applies to everything already derived from it.
   5. Nothing an agent token can call changes the active policy.
@@ -321,6 +330,32 @@ The existing story and simulator pages stay reachable by link.
    example.
 5. Hosted endpoint + demo page (with Simulator panel).
 6. README and docs rewrite, written last so it only describes what exists.
+
+## Decisions made during the build
+
+These rulings were made while building part 1 and override any earlier text
+that disagrees.
+
+1. **Restart.** `serve` / `Runtime::open` re-applies the policy file only if
+   the file changed since the last start (its policy differs from the last
+   `Genesis` in the journal). An in-band operator activation survives a
+   restart with an unchanged file; a changed file still wins.
+2. **Journal.** Only an unterminated final line is a torn write and is
+   dropped. Any complete line that fails to parse or verify is corruption and
+   startup fails. Removal of trailing records is not detectable (there is no
+   external head anchor); protect the file with filesystem permissions.
+3. **Approval scope.** An approval covers one resolved request: agent,
+   artifact, action and recipient people.
+4. **Activation voids approvals.** Every activation, even of an identical
+   policy, voids all approvals and pending decisions.
+5. **Names and durations.** Names are lowercase
+   `^[a-z0-9][a-z0-9_.@-]{0,63}$`. Groups cannot contain groups. Approval
+   lifetimes are `<integer><s|m|h|d>`, from 1 second to 30 days.
+6. **Bounds.** Remembered pending decisions are capped at 1,024 and stored
+   proposals at 32 per origin (agent-proposed, operator-proposed).
+7. **Proofs.** The Kani-checked kernels are
+   `trustgraph_core::decision::{gate, approval_live}` plus the existing
+   reader-set kernels. Results are pending the first CI run.
 
 ## Left to the builder
 

@@ -1,5 +1,5 @@
 # Scenario: three agents work on market research: one searches public papers, one analyses private data, one writes summaries.
-# Each agent may read only its own sources, and a summary for partners is approved by the research team first.
+# Each agent may read only the sources it needs (some are shared), and a summary for partners is approved by the research team first.
 version: 1
 
 groups:
