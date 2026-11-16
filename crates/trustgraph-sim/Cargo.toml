@@ -1,5 +1,6 @@
 [package]
 name = "trustgraph-sim"
+description = "The seeded TrustGraph policy simulator, which drives the real runtime and checks five safety invariants."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

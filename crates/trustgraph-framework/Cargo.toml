@@ -1,5 +1,6 @@
 [package]
 name = "trustgraph-framework"
+description = "The lineage graph the TrustGraph engine is built on."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

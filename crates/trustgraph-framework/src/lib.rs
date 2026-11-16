@@ -1,4 +1,5 @@
-//! Permission-preserving typed dataflow for trusted application hosts.
+//! The lineage graph the TrustGraph engine is built on: permission-preserving
+//! typed dataflow for a trusted host.
 //!
 //! Functions execute outside this library. The host registers their contracts,
 //! records the supplied inputs and commits their outputs. Every output inherits

@@ -11,6 +11,7 @@
 ## Examples
 
 - [examples/policies/](examples/policies/): five complete, tested policies (slack-digest, customer-email, pull-request-bot, support-replies, multi-agent-research).
+- [examples/python_client.py](examples/python_client.py): a dependency-free client for `trustgraph serve`.
 
 ## Commands
 

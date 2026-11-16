@@ -1,5 +1,6 @@
 [package]
 name = "trustgraph-core"
+description = "The proof-friendly kernels TrustGraph decides with: digests, reader-set rules and the decision gate."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

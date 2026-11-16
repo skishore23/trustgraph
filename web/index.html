@@ -223,7 +223,7 @@ allowed         = everyone the action reaches ⊆ readers(output)</pre>
 
 <section id="install" aria-labelledby="use-title">
 <h2 id="use-title">Use it</h2>
-<p>TrustGraph ships today as a Rust library and a CLI.</p>
+<p>TrustGraph ships as a CLI and Rust crates.</p>
 <pre>cargo install --locked --git https://github.com/skishore23/trustgraph trustgraph-cli
 
 trustgraph policy init --path trustgraph.policy.yaml
@@ -232,7 +232,7 @@ trustgraph policy test trustgraph.policy.yaml
 trustgraph policy simulate trustgraph.policy.yaml --seed 0
 trustgraph policy explain trustgraph.policy.yaml
 trustgraph policy diff old.policy.yaml trustgraph.policy.yaml</pre>
-<p>Next: <code>trustgraph serve</code>, a local HTTP and MCP service. It is not built yet.</p>
+<p>To let agents ask before they act, run <code>trustgraph serve --policy trustgraph.policy.yaml --operator leo</code>: a local HTTP and MCP service. <a href="https://github.com/skishore23/trustgraph/blob/main/docs/serve.md">Serve guide</a></p>
 </section>
 
 <section aria-labelledby="limits-title">

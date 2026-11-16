@@ -18,13 +18,13 @@
 //! yet. Artifacts, Graph operations and lineage also grow with every agent
 //! call (remembered pending decisions are capped at 1,024 and stored
 //! proposals at 32 per origin). A server that exposes this runtime to agents
-//! must add per-agent quotas; they are planned for part 2.
+//! must add per-agent quotas, as `trustgraph serve` does.
 //!
 //! Errors: when [`Runtime::handle`] or [`Journal::append`] returns `Err`, the
 //! outcome is unknown. Drop the `Runtime` and [`Runtime::open`] it again.
 //!
-//! Journal compatibility: until a journal format version is introduced
-//! (part 2), a journal is only guaranteed to replay on the engine version
+//! Journal compatibility: until a journal format version is introduced, a
+//! journal is only guaranteed to replay on the engine version
 //! that wrote it.
 
 mod engine;

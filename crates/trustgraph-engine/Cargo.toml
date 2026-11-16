@@ -1,5 +1,6 @@
 [package]
 name = "trustgraph-engine"
+description = "The deterministic, journaled TrustGraph runtime that trustgraph serve and the simulator run."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

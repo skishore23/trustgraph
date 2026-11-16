@@ -1,5 +1,6 @@
 [package]
 name = "trustgraph-demo"
+description = "The public TrustGraph site's policy playground endpoint, POST /api/policy."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

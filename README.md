@@ -123,33 +123,42 @@ Every command takes `--json`. There are five worked policies in
 
 ## Let your agent write the policy
 
-TrustGraph assumes an agent drafts the policy and a person approves it.
-
-- **Errors an agent can act on.** Every problem is reported at once, with its
-  path, a code and a suggestion:
-
-  ```json
-  {
-    "code": "unknown_name",
-    "message": "`enginering` is not a group or person in this policy",
-    "path": "sources.salaries.readers[1]",
-    "severity": "error",
-    "suggestion": "did you mean `engineering`?"
-  }
-  ```
-
-- **A loop it can run alone:** `init` → `check` → `test` → `simulate` →
-  `explain` → `diff`.
-- **A review a person can do in a minute:** the plain-English explanation and
-  a diff in which every widening of access is marked.
+TrustGraph assumes an agent drafts the policy and a person approves it. Every
+problem is reported at once with a path, a stable code and a suggestion, so an
+agent can run the loop `init` → `check` → `test` → `simulate` → `explain` →
+`diff` on its own. A person then reviews the plain-English explanation and a
+diff in which every widening of access is marked.
 
 Point your agent at [docs/agents/writing-policies.md](docs/agents/writing-policies.md)
-or [llms.txt](llms.txt). Agents propose; people approve. Protect the policy
-file with code review.
+or [llms.txt](llms.txt). Protect the policy file with code review.
 
 ## Use it in your system
 
-Today TrustGraph ships as Rust crates and the CLI.
+### `trustgraph serve`
+
+A local service over HTTP and MCP, so any agent stack can register what it
+read, record what it wrote and ask before it acts. Each agent gets its own
+token; a person, the operator, approves requests on a local page.
+
+```sh
+trustgraph serve --policy trustgraph.policy.yaml --operator leo
+```
+
+Ask right before acting:
+
+```sh
+curl -s localhost:8787/v1/check \
+  -H "Authorization: Bearer $(cat ~/.trustgraph/serve/tokens/mailer.token)" \
+  -H "Content-Type: application/json" \
+  -d '{"artifact": "<artifact id>", "action": "email_customer"}'
+```
+
+The API, the MCP endpoint, tokens, the operator page, limits and the threat
+model are in [docs/serve.md](docs/serve.md).
+[examples/python_client.py](examples/python_client.py) is a client with no
+dependencies.
+
+### Rust crates
 
 ```rust
 use trustgraph_policy::{decide, parse, Query, Verdict};
@@ -172,29 +181,7 @@ cargo run -p trustgraph-policy --example decide
 | Crate | Use it for |
 | --- | --- |
 | [`trustgraph-policy`](crates/trustgraph-policy) | Parse, validate, test, explain and diff policies. `decide` is a pure function. |
-| [`trustgraph-engine`](crates/trustgraph-engine) | A journaled runtime that records sources and outputs, tracks approvals and survives restarts. |
-
-### `trustgraph serve`
-
-A local service over HTTP and MCP, so any agent stack can register what it
-read, record what it wrote and ask before it acts:
-
-```sh
-trustgraph serve --policy trustgraph.policy.yaml --operator leo
-```
-
-Each agent gets its own token file. Ask right before acting:
-
-```sh
-curl -s localhost:8787/v1/check \
-  -H "Authorization: Bearer $(cat ~/.trustgraph/serve/tokens/mailer.token)" \
-  -H "Content-Type: application/json" \
-  -d '{"artifact": "<artifact id>", "action": "email_customer"}'
-```
-
-MCP clients connect to `http://127.0.0.1:8787/mcp` with the same token. The
-operator approves requests and activates proposed policies on a plain page
-opened from a single-use launch file. See [docs/serve.md](docs/serve.md).
+| [`trustgraph-engine`](crates/trustgraph-engine) | The journaled runtime `trustgraph serve` runs: it records sources and outputs, tracks approvals and survives restarts. |
 
 ## How we know it works
 
@@ -235,25 +222,15 @@ read. TrustGraph decides where what it wrote may go. Use both.
 
 | Path | What it is |
 | --- | --- |
-| `crates/trustgraph-policy` | The policy file: parsing, decisions, tests, explain, diff |
+| `crates/trustgraph-policy` | The policy file: parsing, decisions, tests, explain, diff, schema, starter |
 | `crates/trustgraph-engine` | Deterministic runtime core, journal and replay |
 | `crates/trustgraph-core` | Proof-friendly kernels and their Kani harnesses |
-| `crates/trustgraph-sim` | The seeded simulator and its safety checks |
-| `crates/trustgraph-cli` | The `trustgraph` command, including `trustgraph serve` |
+| `crates/trustgraph-framework` | The lineage graph the engine is built on |
+| `crates/trustgraph-sim` | The seeded policy simulator and its safety checks |
+| `crates/trustgraph-cli` | The `trustgraph` command: `policy` and `serve` |
 | `examples/policies` | Five worked policies |
 | `docs/agents` | The policy-writing guide for agents |
-
-### Reference applications
-
-Earlier work that TrustGraph grew out of. They use their own policy formats.
-
-- **Typed dataflow SDK** — `crates/trustgraph-framework`, the lineage graph the
-  runtime is built on. [Guide](docs/framework.md)
-- **Live coding gateway** — a fresh Codex run, isolated Rust checks, human
-  approval and a GitHub draft pull request. [Architecture](docs/architecture.md) ·
-  [setup](docs/development.md)
-- **Composio integration** — an agent proposes a GitHub issue; a person
-  approves it. [Example](examples/integrations/composio-github-issues)
+| `web`, `api`, `hosted` | The public site and its playground endpoint |
 
 ## Development
 
@@ -263,5 +240,4 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-See [development checks](docs/development.md#local-checks) and
-[public demo deployment](docs/vercel.md).
+See [development](docs/development.md) and [the public site](docs/vercel.md).

@@ -1,5 +1,6 @@
 [package]
 name = "trustgraph-policy"
+description = "The trustgraph.policy.yaml format: parse, decide, test, lint, explain and diff a policy."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
