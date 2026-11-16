@@ -705,7 +705,9 @@ fn replay_is_deterministic() {
 #[test]
 fn garbage_never_panics() {
     let long = "x".repeat(10_000);
-    for g in ["", long.as_str(), "€"] {
+    // 128 two-byte characters: passes the 256-byte field limit, so it is echoed.
+    let wide = "ж".repeat(128);
+    for g in ["", long.as_str(), "€", wide.as_str()] {
         let mut engine = genesis(SPEC);
         register(&mut engine, 1, "roadmap", 2);
         let s = || g.to_string();
@@ -739,6 +741,10 @@ fn garbage_never_panics() {
                 agent: Some(s()),
                 policy: s(),
             },
+            Event::ProposePolicy {
+                agent: None,
+                policy: s(),
+            },
             Event::ActivatePolicy {
                 proposal: s(),
                 operator: s(),
@@ -747,11 +753,9 @@ fn garbage_never_panics() {
         for event in &events {
             match engine.apply(2, event) {
                 Reply::Rejected { message, .. } => {
-                    assert!(
-                        message.len() < 400,
-                        "message echoes input: {}",
-                        message.len()
-                    )
+                    assert!(message.len() <= 200, "{message}");
+                    assert!(!message.contains(&"x".repeat(65)), "{message}");
+                    assert!(message.matches('ж').count() <= 64, "{message}");
                 }
                 other => panic!("{g:?} {event:?} gave {other:?}"),
             }
@@ -921,4 +925,283 @@ fn engine_is_default_and_events_round_trip() {
     assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), event);
     let extra = json.replace("{", "{\"bogus\":1,");
     assert!(serde_json::from_str::<Event>(&extra).is_err());
+}
+
+#[test]
+fn rejection_messages_echo_at_most_64_characters_in_total() {
+    let agent = "q".repeat(60);
+    let source = "z".repeat(60);
+    let policy = format!(
+        "version: 1\ngroups:\n  g: [p]\nagents: [{agent}, b]\nsources:\n  {source}:\n    readers: [g]\n    agents: [b]\nactions:\n  act:\n    agents: [b]\n    audience: [g]\n"
+    );
+    let mut engine = genesis(&policy);
+    let input = register(&mut engine, 1, &source, 1);
+    let reply = engine.apply(
+        2,
+        &Event::RecordOutput {
+            agent: agent.clone(),
+            step: "s".into(),
+            inputs: vec![input],
+            sha256: sha(2),
+        },
+    );
+    let Reply::Rejected { code, message } = reply else {
+        panic!("{reply:?}")
+    };
+    assert_eq!(code, "agent_cannot_use_source");
+    let echoed = message.matches(['q', 'z']).count();
+    assert!(echoed <= 64, "{echoed} echoed characters in {message}");
+}
+
+#[test]
+fn remembered_decisions_are_capped() {
+    let mut engine = genesis(SPEC);
+    let sheet = register(&mut engine, 1, "price_sheet", 3);
+    let mut outputs = Vec::new();
+    let mut ids = Vec::new();
+    for i in 0..1100u32 {
+        let out = record(&mut engine, 3, "mailer", &[&sheet], 100 + i);
+        let reply = check(&mut engine, 3, "mailer", &out, "email_customer");
+        assert_eq!(verdict(&reply), Verdict::NeedsApproval);
+        ids.push(decision_id(&reply));
+        outputs.push(out);
+        if i == 0 {
+            // A live approval protects the oldest decision from eviction.
+            assert!(matches!(
+                approve(&mut engine, 3, &ids[0], "leo"),
+                Reply::Approved { .. }
+            ));
+        }
+    }
+    assert_eq!(
+        verdict(&check(
+            &mut engine,
+            4,
+            "mailer",
+            &outputs[0],
+            "email_customer"
+        )),
+        Verdict::Allow
+    );
+    let mut unknown = 0;
+    let mut approved = 0;
+    for id in &ids[1..] {
+        match approve(&mut engine, 5, id, "leo") {
+            Reply::Approved { .. } => approved += 1,
+            Reply::Rejected { code, .. } if code == "unknown_decision" => unknown += 1,
+            other => panic!("{other:?}"),
+        }
+    }
+    // 1,024 remembered: the approved oldest plus the 1,023 newest.
+    assert_eq!(approved, 1023);
+    assert_eq!(unknown, 76);
+    for id in &ids[1..77] {
+        assert_eq!(
+            rejected_code(&approve(&mut engine, 6, id, "leo")),
+            "unknown_decision"
+        );
+    }
+    // A re-check re-creates an evicted decision with the same id.
+    let again = check(&mut engine, 7, "mailer", &outputs[1], "email_customer");
+    assert_eq!(decision_id(&again), ids[1]);
+    assert_eq!(verdict(&again), Verdict::NeedsApproval);
+}
+
+#[test]
+fn agent_proposals_cannot_evict_operator_proposals() {
+    let operator_id = match propose(&mut genesis(SPEC), 1, &narrowed()) {
+        Reply::Proposed { id, .. } => id,
+        other => panic!("{other:?}"),
+    };
+    let mut engine = genesis(SPEC);
+    assert!(matches!(
+        propose(&mut engine, 1, &narrowed()),
+        Reply::Proposed { .. }
+    ));
+    let mut agent_ids = Vec::new();
+    for i in 0..100 {
+        let text = SPEC.replace("valid_for: 30m", &format!("valid_for: {}s", 100 + i));
+        match engine.apply(
+            2,
+            &Event::ProposePolicy {
+                agent: Some("planner".into()),
+                policy: text,
+            },
+        ) {
+            Reply::Proposed { id, .. } => agent_ids.push(id),
+            other => panic!("{other:?}"),
+        }
+    }
+    let activate = |engine: &mut Engine, id: &str| {
+        engine.apply(
+            3,
+            &Event::ActivatePolicy {
+                proposal: id.into(),
+                operator: "leo".into(),
+            },
+        )
+    };
+    assert_eq!(
+        rejected_code(&activate(&mut engine, &agent_ids[67])),
+        "unknown_proposal"
+    );
+    assert!(matches!(
+        activate(&mut engine, &agent_ids[68]),
+        Reply::Activated { .. }
+    ));
+    assert!(matches!(
+        activate(&mut engine, &operator_id),
+        Reply::Activated { .. }
+    ));
+}
+
+#[test]
+fn same_digest_from_both_classes_is_stored_once_as_operator() {
+    let mut engine = genesis(SPEC);
+    let shared = match engine.apply(
+        1,
+        &Event::ProposePolicy {
+            agent: Some("planner".into()),
+            policy: narrowed(),
+        },
+    ) {
+        Reply::Proposed { id, .. } => id,
+        other => panic!("{other:?}"),
+    };
+    propose(&mut engine, 1, &narrowed());
+    for i in 0..40 {
+        let text = SPEC.replace("valid_for: 30m", &format!("valid_for: {}s", 100 + i));
+        engine.apply(
+            2,
+            &Event::ProposePolicy {
+                agent: Some("planner".into()),
+                policy: text,
+            },
+        );
+    }
+    let reply = engine.apply(
+        3,
+        &Event::ActivatePolicy {
+            proposal: shared,
+            operator: "leo".into(),
+        },
+    );
+    assert!(matches!(reply, Reply::Activated { .. }), "{reply:?}");
+}
+
+#[test]
+fn too_deep_lineage_is_lineage_limit() {
+    let mut engine = genesis(SPEC);
+    let mut last = register(&mut engine, 1, "roadmap", 2);
+    let mut depth = 0;
+    let code = loop {
+        match engine.apply(
+            2,
+            &Event::RecordOutput {
+                agent: "planner".into(),
+                step: "s".into(),
+                inputs: vec![last.clone()],
+                sha256: sha(1000 + depth),
+            },
+        ) {
+            Reply::Artifact { id } => last = id,
+            Reply::Rejected { code, .. } => break code,
+            other => panic!("{other:?}"),
+        }
+        depth += 1;
+        assert!(depth <= 100, "no depth limit");
+    };
+    assert_eq!(code, "lineage_limit");
+    assert_eq!(depth, 64);
+    // The deepest accepted output is still checkable.
+    assert_eq!(
+        verdict(&check(&mut engine, 3, "planner", &last, "post_to_slack")),
+        Verdict::Allow
+    );
+}
+
+/// The spec example with a second customer and a second mailer agent.
+fn scope_policy() -> String {
+    SPEC.replace("customers: [acme]", "customers: [acme, globex]")
+        .replace(
+            "agents: [planner, mailer]",
+            "agents: [planner, mailer, mailer2]",
+        )
+        .replace("agents: [mailer]", "agents: [mailer, mailer2]")
+}
+
+/// Genesis on `policy`, one approved mailer output; returns (engine, sheet, output, decision).
+fn approved_email(policy: &str) -> (Engine, String, String, String) {
+    let mut engine = genesis(policy);
+    let sheet = register(&mut engine, 1, "price_sheet", 3);
+    let out = record(&mut engine, 2, "mailer", &[&sheet], 10);
+    let decision = decision_id(&check(&mut engine, 3, "mailer", &out, "email_customer"));
+    assert!(matches!(
+        approve(&mut engine, 4, &decision, "leo"),
+        Reply::Approved { .. }
+    ));
+    assert_eq!(
+        verdict(&check(&mut engine, 5, "mailer", &out, "email_customer")),
+        Verdict::Allow
+    );
+    (engine, sheet, out, decision)
+}
+
+#[test]
+fn approval_does_not_cover_a_subset_of_recipients() {
+    let (mut engine, _, out, decision) = approved_email(&scope_policy());
+    let reply = engine.apply(
+        6,
+        &Event::Check {
+            agent: "mailer".into(),
+            artifact: out,
+            action: "email_customer".into(),
+            recipients: Some(set(&["acme"])),
+        },
+    );
+    assert_eq!(verdict(&reply), Verdict::NeedsApproval);
+    assert_ne!(decision_id(&reply), decision);
+}
+
+#[test]
+fn approval_does_not_cover_another_output_from_the_same_source() {
+    let (mut engine, sheet, _, decision) = approved_email(&scope_policy());
+    let other = record(&mut engine, 6, "mailer", &[&sheet], 11);
+    let reply = check(&mut engine, 7, "mailer", &other, "email_customer");
+    assert_eq!(verdict(&reply), Verdict::NeedsApproval);
+    assert_ne!(decision_id(&reply), decision);
+}
+
+#[test]
+fn approval_does_not_cover_another_agent() {
+    let (mut engine, _, out, decision) = approved_email(&scope_policy());
+    let reply = check(&mut engine, 6, "mailer2", &out, "email_customer");
+    assert_eq!(verdict(&reply), Verdict::NeedsApproval);
+    assert_ne!(decision_id(&reply), decision);
+}
+
+#[test]
+fn changing_only_the_reviewers_voids_the_approval() {
+    let (mut engine, _, out, _) = approved_email(&scope_policy());
+    let changed = scope_policy().replace("reviewers: [sales]", "reviewers: [sales, acme]");
+    assert_ne!(changed, scope_policy());
+    propose_and_activate(&mut engine, 6, &changed);
+    assert_eq!(
+        verdict(&check(&mut engine, 7, "mailer", &out, "email_customer")),
+        Verdict::NeedsApproval
+    );
+}
+
+#[test]
+fn revoke_without_approval_is_no_approval() {
+    let mut engine = genesis(SPEC);
+    let (_, decision) = pending_email(&mut engine);
+    let reply = engine.apply(
+        5,
+        &Event::Revoke {
+            decision,
+            reviewer: "leo".into(),
+        },
+    );
+    assert_eq!(rejected_code(&reply), "no_approval");
 }
