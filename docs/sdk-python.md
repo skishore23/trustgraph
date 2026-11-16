@@ -91,18 +91,39 @@ was resumed without it:
 | LangGraph `agent_node` | graph state, `state["trustgraph"]` (saved with the thread by a checkpointer) | the key is not declared `Annotated[str, merge_tokens]`, or is empty on any node but the `first=True` one, or empty on a thread that already holds model or tool messages (the node raises before its agent runs) |
 | LangChain / LangGraph `Guard` | graph state, `state["trustgraph"]`, for its per-thread sessions (`client=`) | per-thread: the key is not declared `Annotated[str, merge_tokens]`; always: the conversation holds a mapped source's result that the session did not record and the session carries no token (mapped tools are refused) |
 | OpenAI Agents `Guard.run` | a dict run context, `context["trustgraph"]` (a `RunState` serialises it) | the run continues a conversation (`RunState`, a non-empty `session=`, `previous_response_id`, `conversation_id`, or earlier model or tool items in the input) and the context holds no token |
-| Claude Agent SDK `Guard` | a file per SDK session id under `Guard(store=DIR)` (off by default) | at every mapped action and subagent start: the transcript holds a mapped source's result the guard never recorded, or cannot be read and the guard has not seen the session from its start |
+| Claude Agent SDK `Guard` | a file per SDK session id under `Guard(store=DIR)` (off by default) | at every mapped action and subagent start: the transcript holds a mapped source's result the guard never recorded, or there is no transcript path, or it cannot be read, or it does not exist yet and the guard did not see the session from its first prompt |
 | `as_source` / `as_action` (LangChain, OpenAI Agents), `@source` / `@action`, and `Runner` called inside your own `with client.session():` | nowhere: the session is yours | never: there is no resume detection, so the session must live as long as the conversation |
 
 Each detection sees only what the framework shows it: history that was
-trimmed or summarised away is not detected.
+trimmed or summarised away is not detected, and a host that feeds earlier
+tool output back to the model as plain user input defeats the OpenAI
+Agents detection, which looks for tool items.
 
-**A kept token never shrinks.** It is written with `s.persist(stored)`: the
-union of what was stored and everything the session saw, never less. A
-broken session writes a broken marker into it instead of an empty token,
-so every session later restored from it (`receive`) is refused too.
+**Saving never shrinks the token.** The integrations write it with
+`s.persist(stored)`: the union of what was stored and everything the session
+saw. A broken session writes a broken marker into it instead of an empty
+token, so every session later restored from it (`receive`) is refused too.
 `trustgraph.merge_tokens(a, b)` is the same union, and is the reducer
-LangGraph state uses for the key.
+LangGraph state uses for the key. The token also lists the tool-call ids of
+the source results it recorded (the latest 256, and a count of the rest), so
+an integration that finds in the conversation a mapped source result the
+token does not record refuses: that is how a token replaced by something
+other than these writes is caught.
+
+**Keep the token out of the model's reach.** It is not signed, so whatever
+can write it can drop restrictions; each detection above is a second line,
+not a guarantee. It lives in:
+
+- OpenAI Agents: the dict run context, which every tool that takes a
+  `RunContextWrapper` receives and can change.
+- LangGraph: graph state, which a tool returning `Command`, an `Overwrite`
+  value and host APIs such as `update_state` and time travel can write.
+- Claude Agent SDK: the store directory and the SDK's transcript files. The
+  guard refuses a store inside the agent's working directory, a
+  `writable_dirs` entry or the transcript's directory, and one not owned by
+  you with mode 0700, but an unsandboxed `Bash` tool runs as you and can
+  reach everything on the account: then run the agent's tools sandboxed, or
+  do not rely on resume.
 
 ## Hand-offs
 

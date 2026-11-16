@@ -69,14 +69,14 @@ with client.session():
   marker) back there after every mapped call. The key must be declared
   `trustgraph: Annotated[str, merge_tokens]` (from
   `trustgraph.integrations.langchain`): the reducer merges the writes of
-  parallel tool calls in one step and keeps the token from being replaced by
-  a smaller or empty one. `guard.middleware()` declares it for `create_agent`;
+  parallel tool calls in one step, and ordinary writes of a smaller or empty
+  token merge instead of replacing it. `guard.middleware()` declares it for `create_agent`;
   a `ToolNode` graph must declare it, and until it does every mapped call is
   refused (`state_key_undeclared`, `state_key_without_reducer`).
   Either way, a mapped call is refused (`unrecorded_history`) when the
-  conversation holds a mapped source's result that the session did not record
-  and the session carries no token: a checkpointed thread resumed with a new
-  session, or a thread evicted from memory.
+  conversation holds a mapped source's result that neither the session nor
+  the token it carries recorded: a checkpointed thread resumed with a new
+  session, a thread evicted from memory, or a replaced token.
 - **Hand-offs.** `agent_node(client, agent)` makes a graph node that runs a
   sub-agent in a new session of that client's agent, starting from the
   hand-off token in `state["trustgraph"]` and writing its own token back.
@@ -88,7 +88,7 @@ with client.session():
   messages (`resumed_without_session`). Every other node requires a valid
   token. If the receiving agent is not cleared for what the token carries,
   the node raises and the run stops. On a checkpointed thread the token is
-  kept; an empty or smaller `"trustgraph"` in a later input does not reset
+  kept, and an empty or smaller `"trustgraph"` in a later input merges into
   it. Example:
   [examples/integrations/langgraph](../examples/integrations/langgraph).
 
@@ -97,9 +97,11 @@ withheld); tool calls a graph makes outside `ToolNode` or `create_agent` are
 not seen by the guard. A
 `Guard`-mapped tool runs to completion before the guard registers or
 withholds its result, so callback handlers, `astream_events` and tracing
-integrations (such as LangSmith) receive the raw result first. Resumed
-conversations are detected only from the mapped source results still in the
-state's messages.
+integrations (such as LangSmith) receive the raw result first. Ordinary
+writes to `state["trustgraph"]` merge, but `Overwrite`, `update_state` and
+time travel are host-level APIs that replace it; the guard then relies on
+the history check, which sees only the mapped source results still in the
+state's messages, and `agent_node` has no history check of its own.
 
 ## OpenAI Agents SDK
 
@@ -151,13 +153,19 @@ result = guard.run_sync(planner, "Post the Q3 plan")
   that context, or resumed from a `RunState`, starts carrying it. A run that
   continues a conversation without it is refused, and leaves a broken marker
   in that context, so a retry with it is refused too. `session=` takes the
-  async `guard.run` or `guard.run_streamed`; `run_sync` refuses it. Without `Guard.run`, the
-  guardrails use the current session (`with client.session():`) as it is.
-  To call `Runner` yourself, wrap it in `with guard.scope(input, **kwargs):`
-  and pass `hooks=guard.hooks()`.
-- **Hand-offs.** On every hand-off the receiving agent's session receives what
-  the previous agent's session saw (`RunHooks.on_handoff`). If the receiving
-  agent is not cleared for it, the run stops with `TrustGraphError`.
+  async `guard.run` or `guard.run_streamed`; `run_sync` refuses it. The token
+  is merged back into the context once more when the run (or a streamed
+  run's events) ends, the call ids of source results are recorded in it, and
+  a run whose history holds mapped source results the stored token does not
+  record is refused. Without `Guard.run`, the guardrails use the current
+  session (`with client.session():`) as it is. To call `Runner` yourself,
+  wrap it in `with guard.scope(input, **kwargs):` and pass
+  `hooks=guard.hooks()`.
+- **Hand-offs.** Every agent's session starts carrying what the run's other
+  agents' sessions have seen, with or without a dict context. With the run
+  hooks (`Guard.run` passes them), a hand-off to an agent that is not cleared
+  for it also stops the run with `TrustGraphError` (`RunHooks.on_handoff`);
+  without them that agent's mapped tools are refused.
   Example: [examples/integrations/openai-agents](../examples/integrations/openai-agents).
 
 Not covered: hosted tools (web search, file search, hosted MCP, code
@@ -214,14 +222,20 @@ async with ClaudeSDKClient(ClaudeAgentOptions(hooks=guard.hooks(), mcp_servers=s
   `Guard(store=DIR)` keeps each SDK session's token (with a broken marker
   once broken) and the tool results it recorded in a file under `DIR` (mode
   0600, merged, never shrunk), so an SDK session resumed in a new process
-  (`resume=`) starts from it. At every mapped action and subagent start the
+  (`resume=`) starts from it. `DIR` must be yours with mode 0700 and outside
+  every directory the agent's tools can write: the working directory, the
+  hook input's `cwd`, the transcript's directory, and the directories you
+  pass as `Guard(writable_dirs=...)` (give it the SDK options' `add_dirs`);
+  otherwise the guard refuses (`unsafe_store`). See
+  [Sessions](sdk-python.md#sessions) for what an unsandboxed `Bash` means here. At every mapped action and subagent start the
   guard reads the transcript (`transcript_path`): a result of a mapped source
   tool, or of a tool it cannot name, that it never recorded breaks the SDK
   session: a resume without the store, a `fork_session` (a new id), a
-  session evicted from memory, or history that appears later. A transcript
-  that cannot be read refuses the call (`history_unverifiable`) unless the
-  guard has seen the session from its start, that is, first saw it at a
-  prompt with no transcript yet or one without tool results. A hook input
+  session evicted from memory, or history that appears later. No transcript
+  path, or a transcript that cannot be read, refuses the call
+  (`history_unverifiable`); so does a transcript that does not exist yet,
+  unless the guard first saw the session at a prompt (with no transcript
+  yet, or one without tool results). A hook input
   missing a field the guard reads refuses the call (`unsupported_framework`,
   naming the version). `guard.session(session_id).handoff()` hands a
   session to another process.
