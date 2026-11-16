@@ -1,6 +1,6 @@
 [package]
 name = "trustgraph-cli"
-description = "The trustgraph command: write, check and test a policy, and serve it to agents over HTTP and MCP."
+description = "The trustgraph command: write, check and test a policy, serve it to agents over HTTP and MCP, and gate their MCP servers."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
