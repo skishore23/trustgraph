@@ -10,16 +10,20 @@ Decide where your agent's output can go, based on what it read.
 ## The problem
 
 Permission systems decide what an agent may **read**. They lose track the
-moment the agent **writes** something new, and again each time another agent
-builds on it.
+moment the agent **writes** something new.
 
-A research agent reads the HR salary file and writes "planning notes". A second
-agent, which never opened the salary file, combines those notes with the
-roadmap and posts a summary to the engineering channel. The summary is two
-steps from the secret and never mentions salaries. Nothing along the way
-looked wrong, so nothing stopped it.
+In May 2025, Invariant Labs
+[showed](https://invariantlabs.ai/blog/mcp-github-vulnerability) a coding
+agent reading a user's private repositories and publishing what it found in a
+pull request on a public one, after it read a crafted issue. Every step was
+something the agent was allowed to do. Reading private code was fine. Opening
+a public pull request was fine. Nothing checked that the second came from the
+first.
 
-The restriction should have followed the data through both steps.
+Taking away access does not fix this: the agent needs the private code to do
+its job. What is missing is a rule about where things derived from it may go.
+The same gap opens each time one agent hands its work to another: the
+restriction should follow the data through every step.
 
 ## What TrustGraph does
 
