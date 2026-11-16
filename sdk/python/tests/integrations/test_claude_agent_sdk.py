@@ -75,7 +75,8 @@ class FakeCLI(Transport):
         self.waiting[request_id] = future
         await self.inbox.put({"type": "control_request", "request_id": request_id, "request": {
             "subtype": "hook_callback", "callback_id": self.callbacks[event],
-            "input": {"hook_event_name": event, "session_id": "s1", "cwd": "/", "transcript_path": "/t", **data},
+            "input": {k: v for k, v in {"hook_event_name": event, "session_id": "s1", "cwd": "/",
+                                        "transcript_path": "/t", **data}.items() if k not in data.get("_drop", ())},
             "tool_use_id": data.get("tool_use_id")}})
         answer = await asyncio.wait_for(future, 30)
         assert answer["subtype"] == "success", answer
@@ -98,6 +99,7 @@ async def drive(guard: Guard, script: Any) -> Any:
     cli = FakeCLI()
     async with ClaudeSDKClient(ClaudeAgentOptions(hooks=guard.hooks()), transport=cli):
         assert all(m[0]["onFailure"] == "block" for m in cli.matchers.values())
+        await cli.hook("UserPromptSubmit", {"prompt": "go"})  # a new SDK session, seen from its start
         return await script(cli)
 
 
@@ -176,7 +178,7 @@ def test_subagent_not_cleared_for_parent_is_refused(handoff_server: Server) -> N
         cli.waiting[request_id] = future
         await cli.inbox.put({"type": "control_request", "request_id": request_id, "request": {
             "subtype": "hook_callback", "callback_id": cli.callbacks["SubagentStart"],
-            "input": {"hook_event_name": "SubagentStart", "session_id": "s1", **sub}}})
+            "input": {"hook_event_name": "SubagentStart", "session_id": "s1", "transcript_path": "/t", **sub}}})
         assert (await future)["subtype"] == "error"  # with on_failure="block" the subagent does not start
         reason = denied(await cli.hook("PreToolUse", tool("mcp__slack__post", {"text": "x"}, **sub)))
         assert reason and "session_broken" in reason
@@ -252,12 +254,15 @@ class ClaudeHooks:
 # -- SDK sessions that outlive the guard's memory ---------------------------
 
 
-def transcript(tmp_path: Any, with_result: bool) -> str:
+def transcript(tmp_path: Any, with_result: bool, tool_use_id: str = "t", name: str = "mcp__drive__salaries") -> str:
+    """A transcript in the Claude Code shape: assistant tool_use, then a user tool_result."""
     path = tmp_path / "transcript.jsonl"
     lines = [{"type": "user", "message": {"role": "user", "content": "read the salaries"}}]
     if with_result:
+        lines.append({"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": tool_use_id, "name": name, "input": {}}]}})
         lines.append({"type": "user", "message": {"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "nina: 120k"}]}})
+            {"type": "tool_result", "tool_use_id": tool_use_id, "content": "nina: 120k"}]}})
     path.write_text("\n".join(json.dumps(line) for line in lines))
     return str(path)
 
@@ -289,14 +294,14 @@ def test_store_keeps_a_broken_session_broken(server: Server, tmp_path: Any) -> N
 @pytest.mark.parametrize("with_result", [True, False])
 def test_resumed_transcript_without_a_stored_session_is_refused(server: Server, tmp_path: Any,
                                                                  with_result: bool) -> None:
-    path = transcript(tmp_path, with_result)
+    path = transcript(tmp_path, with_result, tool_use_id="toolu_old")
     with ClaudeHooks(planner_guard(server)) as cli:
         cli.run(cli.hook("UserPromptSubmit", {"prompt": "post it", "transcript_path": path}))
         cli.run(cli.hook("PostToolUse", tool("mcp__drive__roadmap", response=ROADMAP, transcript_path=path)))
         answer = cli.run(cli.hook("PreToolUse", tool("mcp__slack__post", {"text": "Q3"}, transcript_path=path)))
     if with_result:
         reason = denied(answer)
-        assert reason and "already holds tool results" in reason
+        assert reason and "never recorded" in reason
     else:
         assert answer == {}
 
@@ -307,7 +312,7 @@ def test_evicted_sdk_session_is_refused(server: Server, tmp_path: Any) -> None:
         cli.run(cli.hook("PostToolUse", tool("mcp__drive__salaries", response=SALARIES)))
         cli.run(cli.hook("PostToolUse", tool("mcp__drive__roadmap", response=ROADMAP, session_id="s2")))
         reason = denied(cli.run(cli.hook("PreToolUse", tool("mcp__slack__post", {"text": "Q3"}, transcript_path=path))))
-    assert reason and "already holds tool results" in reason
+    assert reason and "never recorded" in reason
 
 
 # -- nested subagents -------------------------------------------------------
@@ -330,3 +335,40 @@ def test_nested_subagent_inherits_its_spawner(handoff_server: Server, parent: st
         assert reason and "`salaries` is readable by hr only" in reason
 
     asyncio.run(drive(guard, script))
+
+
+# -- history that appears later, transcripts that cannot be read, drift ------
+
+
+def test_history_appearing_after_the_first_hook_is_refused(server: Server, tmp_path: Any) -> None:
+    """A fork or resume whose earlier results show up in the transcript after the guard first saw it."""
+    path = tmp_path / "transcript.jsonl"
+    with ClaudeHooks(planner_guard(server)) as cli:
+        cli.run(cli.hook("UserPromptSubmit", {"prompt": "go", "transcript_path": str(path)}))  # no file yet
+        cli.run(cli.hook("PostToolUse", tool("mcp__drive__roadmap", response=ROADMAP, tool_use_id="r1",
+                                             transcript_path=str(path))))
+        assert cli.run(cli.hook("PreToolUse", tool("mcp__slack__post", {"text": "Q3"}, transcript_path=str(path)))) == {}
+        transcript(tmp_path, with_result=True, tool_use_id="toolu_old")  # the earlier salaries read appears
+        reason = denied(cli.run(cli.hook("PreToolUse", tool("mcp__slack__post", {"text": "Q3"},
+                                                            transcript_path=str(path)))))
+        assert reason and "never recorded" in reason and "mcp__drive__salaries" in reason
+        reason = denied(cli.run(cli.hook("PreToolUse", tool("mcp__slack__post", {"text": "Q3"}))))  # stays refused
+        assert reason and "never recorded" in reason
+
+
+def test_unknown_session_without_a_transcript_is_refused(server: Server) -> None:
+    with ClaudeHooks(planner_guard(server)) as cli:  # first seen at a tool call, "/t" does not exist
+        cli.run(cli.hook("PostToolUse", tool("mcp__drive__roadmap", response=ROADMAP)))
+        reason = denied(cli.run(cli.hook("PreToolUse", tool("mcp__slack__post", {"text": "Q3"}))))
+    assert reason and "history_unverifiable" in reason
+
+
+def test_missing_hook_fields_fail_closed(server: Server) -> None:
+    async def script(cli: FakeCLI) -> None:
+        await cli.hook("PostToolUse", tool("mcp__drive__roadmap", response=ROADMAP))
+        reason = denied(await cli.hook("PreToolUse", tool("mcp__slack__post", {"text": "Q3"}, _drop=["transcript_path"])))
+        assert reason and "unsupported_framework" in reason and "claude-agent-sdk" in reason
+        answer = await cli.hook("PostToolUse", tool("mcp__drive__salaries"))  # no tool_response at all
+        assert answer["continue"] is False and "unsupported_framework" in answer["hookSpecificOutput"]["updatedToolOutput"]
+
+    asyncio.run(drive(planner_guard(server), script))

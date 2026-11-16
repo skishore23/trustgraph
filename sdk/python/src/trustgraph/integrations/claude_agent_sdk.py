@@ -36,22 +36,48 @@ from claude_agent_sdk import HookMatcher
 
 from .._client import Client
 from .._errors import TrustGraphError
-from .._session import Session, _token
+from .._session import Session, _token, merge_tokens
 from ._common import Action, as_spec, blocked_message, check_action, not_registered_message
 
 __all__ = ["Action", "Guard"]
 
 _RESUMED = (
-    "this SDK session already holds tool results from before this guard saw it (a resumed or forked "
-    "conversation, a new process, or a session evicted from memory) and no stored TrustGraph session for it; "
-    "pass Guard(store=...) to keep sessions across processes"
+    "the conversation already holds a result of `{tool}` that this guard never recorded (a resumed or forked "
+    "conversation, a new process, or a session evicted from memory); pass Guard(store=...) to keep sessions "
+    "across processes"
+)
+_UNVERIFIABLE = (
+    "the transcript ({path}) cannot be read, and this guard has not seen this SDK session from its start, so "
+    "it cannot tell whether the conversation holds results it never recorded"
 )
 
 
-def _transcript_has_tool_results(path: Any) -> bool:
-    """Whether the SDK's transcript already holds a tool result. Unreadable counts as yes."""
+def _version() -> str:
+    try:
+        from importlib.metadata import version
+
+        return f"claude-agent-sdk {version('claude-agent-sdk')}"
+    except Exception:
+        return "claude-agent-sdk (version unknown)"
+
+
+def _require(data: Mapping[str, Any], *fields: str) -> None:
+    """Fail closed when the hook input lacks a field the guard reads."""
+    missing = [f for f in fields if f not in data]
+    if missing:
+        raise TrustGraphError(
+            "unsupported_framework",
+            f"{_version()}: the hook input has no {', '.join(missing)}, so the guard cannot check this call",
+        )
+
+
+def _tool_results(path: Any) -> list[tuple[str, str | None]] | None:
+    """The ``(tool_use_id, tool name)`` of every tool result in the transcript, or ``None``
+    when it cannot be read. A result whose ``tool_use`` is not found has no name."""
     if not path:
-        return False
+        return None
+    names: dict[str, str] = {}
+    results: list[str] = []
     try:
         with open(path, encoding="utf-8") as f:
             for line in f:
@@ -61,25 +87,28 @@ def _transcript_has_tool_results(path: Any) -> bool:
                     continue
                 message = entry.get("message") if isinstance(entry, dict) else None
                 content = message.get("content") if isinstance(message, dict) else None
-                if isinstance(content, list) and any(
-                    isinstance(c, dict) and c.get("type") == "tool_result" for c in content
-                ):
-                    return True
-    except FileNotFoundError:
-        return False
+                for block in content if isinstance(content, list) else ():
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "tool_use" and isinstance(block.get("id"), str):
+                        names[block["id"]] = str(block.get("name"))
+                    elif block.get("type") == "tool_result":
+                        results.append(str(block.get("tool_use_id")))
     except OSError:
-        return True
-    return False
+        return None
+    return [(r, names.get(r)) for r in results]
 
 
 class _Conversation:
     """One SDK session: its main session, its subagents, and whether it is refused."""
 
-    def __init__(self, main: Session) -> None:
+    def __init__(self, main: Session, recorded: set[str] | None = None, complete: bool = False) -> None:
         self.main = main
         self.subagents: dict[str, Session] = {}
         self.active: list[str] = []  # started, not yet stopped
         self.broken: str | None = main.broken
+        self.recorded: set[str] = set(recorded or ())  # tool_use_ids of mapped source results the guard handled
+        self.complete = complete  # the guard has seen this SDK session from its start
 
     def sessions(self) -> list[Session]:
         return [self.main, *self.subagents.values()]
@@ -143,22 +172,35 @@ class Guard:
             return {"broken": "the stored TrustGraph session for this SDK session could not be read"}
 
     def _save(self, session_id: str, c: _Conversation) -> None:
+        """Merge the SDK session's record into the store: never fewer artifacts or recorded
+        results than were stored, and a broken marker once broken."""
         if self.store is None:
             return
         os.makedirs(self.store, mode=0o700, exist_ok=True)
-        body = json.dumps({"token": _token(c.seen()), "broken": c.broken})
-        fd, tmp = tempfile.mkstemp(dir=self.store, prefix=".tmp-")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(body)
-            os.replace(tmp, self._path(session_id))
-        except BaseException:
-            os.unlink(tmp)
-            raise
+        with self._lock:
+            old = self._load(session_id) or {}
+            stored = old.get("token") if isinstance(old.get("token"), str) else None
+            was_broken = old.get("broken")
+            token = merge_tokens(
+                stored,
+                _token([], str(was_broken)) if was_broken else None,
+                *(s.persist() for s in c.sessions()),
+                _token(c.seen(), c.broken),
+            )
+            recorded = sorted(set(old.get("recorded") or ()) | c.recorded)
+            body = json.dumps({"token": token, "recorded": recorded})
+            fd, tmp = tempfile.mkstemp(dir=self.store, prefix=".tmp-")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(body)
+                os.replace(tmp, self._path(session_id))
+            except BaseException:
+                os.unlink(tmp)
+                raise
 
     # -- sessions --------------------------------------------------------
 
-    def _conversation(self, session_id: str, transcript_path: Any = None) -> _Conversation:
+    def _conversation(self, session_id: str, transcript_path: Any = None, *, prompt: bool = False) -> _Conversation:
         with self._lock:
             c = self._conversations.get(session_id)
             if c is not None:
@@ -167,18 +209,21 @@ class Guard:
         main = self.client.session()
         stored = self._load(session_id)
         if stored is not None:
+            fresh = _Conversation(main, set(stored.get("recorded") or ()))
             if stored.get("broken"):
                 main.mark_broken(str(stored["broken"]))
             elif stored.get("token"):
                 try:
-                    main.receive(str(stored["token"]))  # a failure breaks `main`
+                    main.receive(str(stored["token"]))  # a failure, or a broken marker, breaks `main`
                 except TrustGraphError:
                     pass
             else:
                 main.mark_broken("the stored TrustGraph session for this SDK session is empty")
-        elif _transcript_has_tool_results(transcript_path):
-            main.mark_broken(_RESUMED)
-        fresh = _Conversation(main)
+            fresh.broken = main.broken
+        else:
+            results = _tool_results(transcript_path)
+            # First seen at a prompt with no transcript yet: a new SDK session, seen from its start.
+            fresh = _Conversation(main, complete=results == [] or (results is None and prompt))
         with self._lock:
             c = self._conversations.setdefault(session_id, fresh)
             self._conversations.move_to_end(session_id)
@@ -187,6 +232,20 @@ class Guard:
         if c is fresh:
             self._save(session_id, c)
         return c
+
+    def _verify(self, session_id: str, c: _Conversation, transcript_path: Any) -> None:
+        """Refuse when the transcript holds a mapped source's result the guard never recorded,
+        or cannot be read and the guard has not seen the SDK session from its start."""
+        results = _tool_results(transcript_path)
+        if results is None:
+            if not c.complete:
+                raise TrustGraphError("history_unverifiable", _UNVERIFIABLE.format(path=transcript_path))
+            return
+        for tool_use_id, name in results:
+            if (name is None or name in self.sources) and tool_use_id not in c.recorded:
+                reason = _RESUMED.format(tool=name or "an unknown tool")
+                self._break(session_id, c, reason)
+                raise TrustGraphError("session_broken", reason)
 
     def _break(self, session_id: str, c: _Conversation, reason: str) -> None:
         with self._lock:
@@ -213,17 +272,22 @@ class Guard:
         with self._lock:
             self._conversations.pop(session_id, None)
 
-    def _for(self, data: Mapping[str, Any]) -> tuple[_Conversation, Session]:
-        c = self._conversation(data["session_id"], data.get("transcript_path"))
+    def _for(self, data: Mapping[str, Any], *, verify: bool = False) -> tuple[_Conversation, Session]:
+        _require(data, "session_id", "transcript_path")
+        c = self._conversation(data["session_id"], data["transcript_path"])
         if c.broken is not None:
             raise TrustGraphError("session_broken", c.broken)
+        if verify:
+            self._verify(data["session_id"], c, data["transcript_path"])
         return c, self.session(data["session_id"], data.get("agent_id"))
 
     # -- hook callbacks --------------------------------------------------
 
     async def user_prompt_submit(self, data: Any, tool_use_id: str | None, context: Any) -> dict[str, Any]:
         try:
-            await asyncio.to_thread(self._conversation, data["session_id"], data.get("transcript_path"))
+            await asyncio.to_thread(
+                self._conversation, data["session_id"], data.get("transcript_path"), prompt=True
+            )
         except Exception:
             pass  # noted again, and refused if need be, at the first mapped tool
         return {}
@@ -237,8 +301,9 @@ class Guard:
                 pass
             return {}
         try:
-            _, s = await asyncio.to_thread(self._for, data)
-            await asyncio.to_thread(check_action, s, spec, data.get("tool_input") or {})
+            _require(data, "tool_use_id", "tool_input")
+            _, s = await asyncio.to_thread(lambda: self._for(data, verify=True))
+            await asyncio.to_thread(check_action, s, spec, data["tool_input"] or {})
         except TrustGraphError as e:
             reason = blocked_message(e, spec.name)
         except Exception as e:  # fail closed
@@ -259,13 +324,18 @@ class Guard:
         if source is None:
             return {}
         try:
+            _require(data, "tool_use_id", "tool_response")
             c, s = await asyncio.to_thread(self._for, data)
-            await asyncio.to_thread(s.read, source, data.get("tool_response"))
+            await asyncio.to_thread(s.read, source, data["tool_response"])
+            with self._lock:
+                c.recorded.add(str(data["tool_use_id"]))
             await asyncio.to_thread(self._save, data["session_id"], c)
         except Exception as e:
             err = e if isinstance(e, TrustGraphError) else TrustGraphError("internal_error", repr(e))
             try:
                 c = await asyncio.to_thread(self._conversation, data["session_id"])
+                with self._lock:
+                    c.recorded.add(str(data.get("tool_use_id")))  # handled: it is what broke the session
                 reason = (
                     f"a read could not be recorded ({err.code}): the result of `{tool}` may still be in the "
                     "conversation, so this session refuses every mapped action and hand-off from now on"
@@ -282,8 +352,9 @@ class Guard:
         return {}
 
     def _start(self, data: Mapping[str, Any]) -> None:
+        _require(data, "session_id", "agent_id", "transcript_path")
         sid, agent_id = data["session_id"], data["agent_id"]
-        c = self._conversation(sid, data.get("transcript_path"))
+        c = self._conversation(sid, data["transcript_path"])
         client = self.subagents.get(data.get("agent_type") or "", self.client)
         child = client.session()
         with self._lock:
@@ -299,6 +370,7 @@ class Guard:
         try:
             if c.broken is not None:
                 raise TrustGraphError("session_broken", c.broken)
+            self._verify(sid, c, data["transcript_path"])  # a subagent start is a hand-off
             for parent in parents:
                 if parent is None:
                     raise TrustGraphError("unknown_subagent", f"parent subagent `{parent_id}` is not known")
@@ -310,6 +382,7 @@ class Guard:
             self._save(sid, c)
 
     def _stop(self, data: Mapping[str, Any]) -> None:
+        _require(data, "session_id", "agent_id")
         sid, agent_id = data["session_id"], data["agent_id"]
         c = self._conversation(sid, data.get("transcript_path"))
         with self._lock:

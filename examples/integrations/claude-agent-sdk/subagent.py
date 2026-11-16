@@ -48,9 +48,11 @@ class ScriptedCLI(Transport):
     async def hook(self, event, **data):
         rid = f"r{next(self.ids)}"
         self.waiting[rid] = asyncio.get_running_loop().create_future()
+        # A new session: its transcript does not exist yet, so the guard sees it from its start.
+        data = {"hook_event_name": event, "session_id": "demo", "transcript_path": "/nonexistent/demo.jsonl",
+                "tool_use_id": rid, **data}
         await self.inbox.put({"type": "control_request", "request_id": rid, "request": {
-            "subtype": "hook_callback", "callback_id": self.callbacks[event],
-            "input": {"hook_event_name": event, "session_id": "demo", **data}, "tool_use_id": "t"}})
+            "subtype": "hook_callback", "callback_id": self.callbacks[event], "input": data, "tool_use_id": rid}})
         return (await self.waiting[rid]).get("response", {})
 
 
@@ -66,6 +68,7 @@ async def main(args):
 
     cli = ScriptedCLI()
     async with ClaudeSDKClient(options, transport=cli):
+        await cli.hook("UserPromptSubmit", prompt="Plan Q3 and tell engineering.")
         sub = {"agent_id": "r1", "agent_type": "researcher"}
         await cli.hook("SubagentStart", **sub)
         await cli.hook("PostToolUse", tool_name="mcp__drive__salaries", tool_response="nina: 120k", **sub)
