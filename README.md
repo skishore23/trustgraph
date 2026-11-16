@@ -10,19 +10,21 @@ Decide where your agent's output can go, based on what it read.
 ## The problem
 
 Permission systems decide what an agent may **read**. They lose track the
-moment the agent **writes** something new.
+moment the agent **writes** something new, and again each time another agent
+builds on it.
 
-An agent reads the HR salary file and the product roadmap. It writes a "Q3
-headcount plan" and posts it to the engineering channel. The plan is new text.
-It has no owner and no access list, so nothing stops it. The salary data just
-left HR.
+A research agent reads the HR salary file and writes "planning notes". A second
+agent, which never opened the salary file, combines those notes with the
+roadmap and posts a summary to the engineering channel. The summary is two
+steps from the secret and never mentions salaries. Nothing along the way
+looked wrong, so nothing stopped it.
 
-The restriction should have followed the data.
+The restriction should have followed the data through both steps.
 
 ## What TrustGraph does
 
 You write one small policy file. It says who may read anything derived from
-each source, and where each action sends output:
+each source, which agents may use it, and where each action sends output:
 
 ```yaml
 version: 1
@@ -30,34 +32,36 @@ version: 1
 groups:
   hr: [nina]
   engineering: [sam, ravi]
-  sales: [leo]
-  customers: [acme]
+  leadership: [maya]
 
-agents: [planner, mailer]
+agents: [researcher, planner]
 
 sources:
-  salaries:    { readers: [hr],                 agents: [planner] }
-  roadmap:     { readers: [hr, engineering],    agents: [planner] }
-  price_sheet: { readers: [sales, customers],   agents: [mailer] }
+  salaries:   { readers: [hr],                          agents: [researcher, planner] }
+  roadmap:    { readers: [hr, engineering, leadership], agents: [planner] }
+  benchmarks: { readers: [hr, engineering, leadership], agents: [researcher, planner] }
 
 actions:
-  post_to_slack:
+  post_to_engineering: { agents: [planner], audience: [engineering] }
+  brief_hr:            { agents: [planner], audience: [hr] }
+  brief_leadership:
     agents: [planner]
-    audience: [engineering]
-  email_customer:
-    agents: [mailer]
-    audience: [customers]
-    approval: { reviewers: [sales], valid_for: 30m }
+    audience: [leadership]
+    approval: { reviewers: [hr], valid_for: 1h }
 ```
 
-For every output, TrustGraph answers **allow**, **needs approval** or **deny**,
-and says why:
+TrustGraph records what each output was built from, through every step, and
+answers **allow**, **needs approval** or **deny** with the reason:
 
-| The agent read | It wants to | Answer |
+| What the output carries | It wants to | Answer |
 | --- | --- | --- |
-| `salaries` + `roadmap` | `post_to_slack` | **Deny.** `salaries` is readable by hr only; engineering (ravi, sam) is not included |
-| `roadmap` | `post_to_slack` | **Allow** |
-| `price_sheet` | `email_customer` | **Needs approval** from sales, valid for 30 minutes |
+| planning notes (from `salaries`) + `roadmap` | `post_to_engineering` | **Deny.** `salaries` is readable by hr only; engineering (ravi, sam) is not included |
+| the same summary | `brief_hr` | **Allow** |
+| `roadmap` only | `post_to_engineering` | **Allow** |
+| `roadmap` + `benchmarks` | `brief_leadership` | **Needs approval.** action `brief_leadership` requires a reviewer to approve it |
+
+The full file, with its tests, is
+[examples/policies/handoff.policy.yaml](examples/policies/handoff.policy.yaml).
 
 The rule is small:
 
@@ -118,7 +122,7 @@ trustgraph policy simulate trustgraph.policy.yaml
 64 runs, 12,936 events: 994 allow, 5,082 deny, 392 needs_approval — 0 violations
 ```
 
-Every command takes `--json`. There are five worked policies in
+Every command takes `--json`. There are six worked policies in
 [examples/policies](examples/policies).
 
 ## Let your agent write the policy
@@ -228,7 +232,7 @@ read. TrustGraph decides where what it wrote may go. Use both.
 | `crates/trustgraph-framework` | The lineage graph the engine is built on |
 | `crates/trustgraph-sim` | The seeded policy simulator and its safety checks |
 | `crates/trustgraph-cli` | The `trustgraph` command: `policy` and `serve` |
-| `examples/policies` | Five worked policies |
+| `examples/policies` | Six worked policies |
 | `docs/agents` | The policy-writing guide for agents |
 | `web`, `api`, `hosted` | The public site and its playground endpoint |
 
