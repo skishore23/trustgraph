@@ -1,11 +1,5 @@
-//! Deterministic governance. No clocks, network clients or persistence live here.
-pub mod bundle;
+//! The proof-friendly kernels the policy crate and the engine share: content
+//! digests, reader-set rules and the decision gate, with their Kani harnesses.
 pub mod decision;
 pub mod digest;
-pub mod domain;
-pub mod lineage;
 pub mod permissions;
-pub mod plan;
-pub mod verifier;
-pub use domain::*;
-pub use verifier::verify;

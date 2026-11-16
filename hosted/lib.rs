@@ -1,7 +1,6 @@
-//! The hosted site's API: the stateless policy playground endpoint and the
-//! read-only MCP server. No credentials, durable state or external writes.
+//! The hosted site's API: the stateless policy playground endpoint. No
+//! credentials, durable state or external writes.
 pub mod errors;
-pub mod mcp;
 pub mod policy;
 
 use axum::{Router, extract::DefaultBodyLimit, routing::post};

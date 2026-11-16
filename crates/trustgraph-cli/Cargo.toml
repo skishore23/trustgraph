@@ -1,5 +1,6 @@
 [package]
 name = "trustgraph-cli"
+description = "The trustgraph command: write, check and test a policy, and serve it to agents over HTTP and MCP."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,10 +11,6 @@ workspace = true
 name = "trustgraph"
 path = "src/main.rs"
 [dependencies]
-reqwest = { workspace = true, features = ["blocking"] }
-trustgraph-live = { path = "../trustgraph-live" }
-trustgraph-core = { path = "../trustgraph-core" }
-trustgraph-runtime = { path = "../trustgraph-runtime" }
 trustgraph-sim = { path = "../trustgraph-sim" }
 trustgraph-policy = { path = "../trustgraph-policy" }
 # No features: the shipped CLI never links the engine's fault injection.
@@ -26,10 +23,8 @@ serde_json.workspace = true
 clap.workspace = true
 tokio.workspace = true
 axum.workspace = true
-rmcp = { version = "=3.10.0", default-features = false, features = ["server", "client", "transport-io", "transport-child-process", "transport-streamable-http-server"] }
-mcp-http = { package = "reqwest", version = "0.13", default-features = false, features = ["json", "stream"] }
+rmcp = { version = "=3.10.0", default-features = false, features = ["server", "transport-streamable-http-server"] }
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
-reqwest.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 tempfile.workspace = true
-tokio-stream = "0.1"

@@ -1,6 +1,6 @@
 //! Every hosted error response is a small JSON envelope, including extractor
 //! rejections (malformed JSON, unknown fields, wrong content type, oversize
-//! bodies), unknown routes and transport-level refusals from the MCP service.
+//! bodies) and unknown routes.
 use axum::{
     Json,
     body::to_bytes,
@@ -9,7 +9,7 @@ use axum::{
 };
 use serde_json::json;
 
-/// Error bodies produced by Axum and rmcp are short plain-text strings.
+/// Error bodies produced by Axum are short plain-text strings.
 const MAX_ERROR_BODY: usize = 4_096;
 const MAX_MESSAGE: usize = 300;
 

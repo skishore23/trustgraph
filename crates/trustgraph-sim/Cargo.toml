@@ -12,7 +12,6 @@ workspace = true
 fault-injection = ["trustgraph-engine/fault-injection"]
 [dependencies]
 trustgraph-core = { path = "../trustgraph-core" }
-trustgraph-runtime = { path = "../trustgraph-runtime" }
 trustgraph-policy = { path = "../trustgraph-policy" }
 trustgraph-engine = { path = "../trustgraph-engine" }
 serde.workspace = true
