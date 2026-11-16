@@ -25,10 +25,14 @@ use crate::rules::{
     validate_policy,
 };
 
-/// Stored proposals per class (agent-proposed, operator-proposed).
+/// Stored proposals per class (agent-proposed; operator- or file-proposed).
 const MAX_PROPOSALS_PER_CLASS: usize = 32;
+/// Stored proposals per proposing agent, within the agent class.
+const MAX_PROPOSALS_PER_AGENT: usize = 8;
 /// Remembered `NeedsApproval` decisions; `Check` is agent-callable.
 const MAX_DECISIONS: usize = 1024;
+/// Remembered `NeedsApproval` decisions per agent, within `MAX_DECISIONS`.
+const MAX_DECISIONS_PER_AGENT: usize = 64;
 /// The engine never sees content, so every port carries the same nominal type.
 const SCHEMA: &str = "any";
 const OUTPUT_PORT: &str = "out";
@@ -52,14 +56,30 @@ struct Remembered {
     reason: String,
 }
 
+/// Who stored a proposal. `Operator` and `File` share the operator class;
+/// agents never push those out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalOrigin {
+    /// `ProposePolicy` with `agent: None`.
+    Operator,
+    /// `ProposeFromFile`: the policy file differed from the active policy at start.
+    File,
+    /// `ProposePolicy` from this agent.
+    Agent(String),
+}
+
+impl ProposalOrigin {
+    fn operator_class(&self) -> bool {
+        !matches!(self, ProposalOrigin::Agent(_))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Proposal {
     id: String,
     policy: Policy,
-    /// Proposed with `agent: None` (the operator path), at least once.
-    operator: bool,
-    /// The agent that last proposed it; for the operator's view only.
-    agent: Option<String>,
+    origin: ProposalOrigin,
 }
 
 /// A remembered `NeedsApproval` decision with no live approval: what the
@@ -93,8 +113,7 @@ pub struct LiveApproval {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StoredProposal {
     pub proposal: String,
-    /// The proposing agent, or `None` when the operator proposed it.
-    pub agent: Option<String>,
+    pub origin: ProposalOrigin,
     pub widens: bool,
     pub changes: Vec<trustgraph_policy::Change>,
     pub explanation: String,
@@ -193,6 +212,7 @@ impl Engine {
             Event::ActivatePolicy { proposal, operator } => {
                 self.activate_proposal(at, proposal, operator)
             }
+            Event::ProposeFromFile { policy } => self.propose_from_file(policy),
         };
         handled.unwrap_or_else(|rejected| rejected)
     }
@@ -212,6 +232,30 @@ impl Engine {
         self.activation
             .as_ref()
             .is_some_and(|a| a.operator.is_none())
+    }
+
+    /// The artifact id of an already registered `(source, sha256)`.
+    pub fn source_artifact(&self, source: &str, sha256: &str) -> Option<&str> {
+        self.source_ids
+            .get(&(source.to_string(), sha256.to_string()))
+            .map(String::as_str)
+    }
+
+    /// The artifact id of an already recorded output with exactly this key.
+    pub fn output_artifact(
+        &self,
+        agent: &str,
+        step: &str,
+        inputs: &[String],
+        sha256: &str,
+    ) -> Option<&str> {
+        let key: OutputKey = (agent.into(), step.into(), inputs.to_vec(), sha256.into());
+        self.outputs.get(&key).map(String::as_str)
+    }
+
+    /// True when a proposal with this id (policy digest) is stored.
+    pub fn has_proposal(&self, id: &str) -> bool {
+        self.proposals.iter().any(|p| p.id == id)
     }
 
     /// Number of artifacts (sources and outputs) the engine holds.
@@ -278,7 +322,7 @@ impl Engine {
                 let changes = diff(active, &p.policy);
                 StoredProposal {
                     proposal: p.id.clone(),
-                    agent: if p.operator { None } else { p.agent.clone() },
+                    origin: p.origin.clone(),
                     widens: changes.widens(),
                     changes: changes.changes,
                     explanation: explain(&p.policy),
@@ -313,7 +357,7 @@ impl Engine {
             decisions: &'a BTreeMap<String, Remembered>,
             next_seq: u64,
             approvals: &'a BTreeMap<String, Granted>,
-            proposals: Vec<(&'a String, bool)>,
+            proposals: Vec<(&'a String, &'a ProposalOrigin)>,
         }
         let permissions = self
             .sources
@@ -346,9 +390,9 @@ impl Engine {
             decisions: &self.decisions,
             next_seq: self.next_seq,
             approvals: &self.approvals,
-            proposals: self.proposals.iter().map(|p| (&p.id, p.operator)).collect(),
+            proposals: self.proposals.iter().map(|p| (&p.id, &p.origin)).collect(),
         };
-        digest::structured("engine-state-v1", &state).0
+        digest::structured("engine-state-v2", &state).0
     }
 
     /// Source names an artifact derives from, or `None` for an unknown id.
@@ -857,7 +901,27 @@ impl Engine {
                 format!("`{}` is not an agent in the active policy", clip(agent)),
             ));
         }
+        let origin = match agent {
+            Some(agent) => ProposalOrigin::Agent(agent.to_string()),
+            None => ProposalOrigin::Operator,
+        };
         let proposed = validate_policy(text)?;
+        self.store_proposal(origin, proposed)
+    }
+
+    fn propose_from_file(&mut self, text: &str) -> Handled {
+        let proposed = validate_policy(text)?;
+        self.store_proposal(ProposalOrigin::File, proposed)
+    }
+
+    /// Store a validated proposal and answer with its diff from the active
+    /// policy. An agent re-proposing a stored digest changes nothing, so it
+    /// can neither take over nor move another origin's entry; the operator or
+    /// the file proposing an agent's digest moves it into the operator class.
+    /// Quotas: 32 per class, and 8 per agent within the agent class.
+    /// Eviction removes the proposer's own oldest entry first.
+    fn store_proposal(&mut self, origin: ProposalOrigin, proposed: Policy) -> Handled {
+        let active = self.active()?;
         let id = proposed.digest();
         let changes = diff(active, &proposed);
         let reply = Reply::Proposed {
@@ -866,46 +930,98 @@ impl Engine {
             changes: changes.changes,
             explanation: explain(&proposed),
         };
-        // Agents and the operator have separate quotas, so agents cannot push
-        // the operator's proposals out. A digest the operator proposed stays
-        // operator-owned.
-        let operator = agent.is_none() || self.proposals.iter().any(|p| p.id == id && p.operator);
+        if let Some(existing) = self.proposals.iter().find(|p| p.id == id) {
+            let keep = match (&origin, &existing.origin) {
+                (ProposalOrigin::Agent(_), _) => true,
+                (ProposalOrigin::File, e) => e.operator_class(),
+                (ProposalOrigin::Operator, _) => false,
+            };
+            if keep {
+                return Ok(reply);
+            }
+        }
         self.proposals.retain(|p| p.id != id);
         self.proposals.push(Proposal {
             id,
             policy: proposed,
-            operator,
-            agent: agent.map(str::to_string),
+            origin: origin.clone(),
         });
-        let in_class = self.proposals.iter().filter(|p| p.operator == operator);
-        if in_class.count() > MAX_PROPOSALS_PER_CLASS
-            && let Some(oldest) = self.proposals.iter().position(|p| p.operator == operator)
-        {
-            self.proposals.remove(oldest);
+        if let ProposalOrigin::Agent(agent) = &origin {
+            let own = |p: &Proposal| matches!(&p.origin, ProposalOrigin::Agent(a) if a == agent);
+            if self.proposals.iter().filter(|p| own(p)).count() > MAX_PROPOSALS_PER_AGENT
+                && let Some(oldest) = self.proposals.iter().position(own)
+            {
+                self.proposals.remove(oldest);
+            }
+            let agents = self
+                .proposals
+                .iter()
+                .filter(|p| !p.origin.operator_class())
+                .count();
+            if agents > MAX_PROPOSALS_PER_CLASS
+                && let Some(victim) = self.agent_proposal_victim()
+            {
+                self.proposals.remove(victim);
+            }
+        } else {
+            let operators = self
+                .proposals
+                .iter()
+                .filter(|p| p.origin.operator_class())
+                .count();
+            if operators > MAX_PROPOSALS_PER_CLASS
+                && let Some(oldest) = self
+                    .proposals
+                    .iter()
+                    .position(|p| p.origin.operator_class())
+            {
+                self.proposals.remove(oldest);
+            }
         }
         Ok(reply)
     }
 
-    /// Remember a `NeedsApproval` decision. When full, evict the oldest entry
-    /// without a live approval (or else the oldest), with its approval. A later
-    /// `Approve` of an evicted id is `unknown_decision`; a re-`Check` restores it.
+    /// The oldest agent-class proposal of the agent that holds the most of
+    /// them (ties: the agent whose oldest entry is oldest). Deterministic.
+    fn agent_proposal_victim(&self) -> Option<usize> {
+        let mut counts: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+        for (index, p) in self.proposals.iter().enumerate() {
+            if let ProposalOrigin::Agent(agent) = &p.origin {
+                counts.entry(agent.as_str()).or_insert((0, index)).0 += 1;
+            }
+        }
+        counts
+            .values()
+            .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)))
+            .map(|(_, first)| *first)
+    }
+
+    /// Remember a `NeedsApproval` decision. Each agent keeps at most 64 and
+    /// everyone together at most 1,024. When the asking agent is at its own
+    /// cap, its own oldest entry without a live approval goes (or else its
+    /// own oldest). When the global cap is hit, the asking agent's own
+    /// entries go first, then anyone's, entries without a live approval
+    /// before approved ones. An evicted entry takes its approval with it. A
+    /// later `Approve` of an evicted id is `unknown_decision`; a re-`Check`
+    /// restores it.
     fn remember(&mut self, at: u64, id: String, mut entry: Remembered) {
         entry.seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
-        if !self.decisions.contains_key(&id) && self.decisions.len() >= MAX_DECISIONS {
-            let live = |key: &String| {
-                self.approvals
-                    .get(key)
-                    .is_some_and(|g| approval_live(g.issued_at, g.valid_for, at, g.voided))
+        if !self.decisions.contains_key(&id) {
+            let agent = entry.agent.clone();
+            let own = self.decisions.values().filter(|d| d.agent == agent).count();
+            let victim = if own >= MAX_DECISIONS_PER_AGENT {
+                self.decision_victim(at, Some(&agent), true)
+                    .or_else(|| self.decision_victim(at, Some(&agent), false))
+            } else if self.decisions.len() >= MAX_DECISIONS {
+                self.decision_victim(at, Some(&agent), true)
+                    .or_else(|| self.decision_victim(at, None, true))
+                    .or_else(|| self.decision_victim(at, Some(&agent), false))
+                    .or_else(|| self.decision_victim(at, None, false))
+            } else {
+                None
             };
-            let oldest = |keep_live: bool| {
-                self.decisions
-                    .iter()
-                    .filter(|(key, _)| !(keep_live && live(key)))
-                    .min_by_key(|(key, d)| (d.seq, *key))
-                    .map(|(key, _)| key.clone())
-            };
-            if let Some(victim) = oldest(true).or_else(|| oldest(false)) {
+            if let Some(victim) = victim {
                 self.decisions.remove(&victim);
                 if let Some(granted) = self.approvals.remove(&victim) {
                     self.graph.revoke_approval(&granted.approval);
@@ -913,6 +1029,17 @@ impl Engine {
             }
         }
         self.decisions.insert(id, entry);
+    }
+
+    /// The oldest remembered decision, of `agent` when given, skipping those
+    /// with a live approval when `skip_live`.
+    fn decision_victim(&self, at: u64, agent: Option<&str>, skip_live: bool) -> Option<String> {
+        self.decisions
+            .iter()
+            .filter(|(_, d)| agent.is_none_or(|a| d.agent == a))
+            .filter(|(key, _)| !(skip_live && self.approval_is_live(key, at)))
+            .min_by_key(|(key, d)| (d.seq, *key))
+            .map(|(key, _)| key.clone())
     }
 
     fn activate_proposal(&mut self, at: u64, proposal: &str, operator: &str) -> Handled {

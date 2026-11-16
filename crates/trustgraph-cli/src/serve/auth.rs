@@ -1,12 +1,15 @@
 //! Operator sessions and loopback request checks for `trustgraph serve`.
 //!
-//! The operator authority is never a long-lived bearer token. Each server start
-//! generates a single-use launch secret in memory and writes it only to a private
-//! launch file. Exchanging it (once) yields a random, short-lived session ID in an
-//! HttpOnly, SameSite=Strict cookie. Owner routes accept only that cookie.
+//! The operator authority is never a long-lived bearer token and never a
+//! cookie (cookies ignore ports, so any other server on 127.0.0.1 would
+//! receive one). Each server holds a single-use launch secret in memory and
+//! writes it only to a private launch file. Exchanging it yields a random
+//! session id in the JSON body; the page keeps it in `sessionStorage` (scoped
+//! to this origin, port included) and sends it as `X-TrustGraph-Operator`.
+//! Only one session is live at a time: a new exchange ends the previous one.
+//! Every exchange makes a fresh launch secret for the next sign-in.
 use axum::http::{HeaderMap, header};
 use std::{
-    collections::HashMap,
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -16,7 +19,8 @@ use std::{
 
 /// Default operator session lifetime.
 pub const SESSION_LIFETIME: Duration = Duration::from_secs(8 * 60 * 60);
-const MAX_SESSIONS: usize = 8;
+/// The request header that carries the operator session id.
+pub const OPERATOR_HEADER: &str = "x-trustgraph-operator";
 
 /// Compare secrets without an early exit on the first differing byte.
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -62,107 +66,118 @@ pub fn bearer(headers: &HeaderMap) -> Option<&str> {
         .strip_prefix("Bearer ")
 }
 
-pub fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers
-        .get_all(header::COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|s| s.split(';'))
-        .map(str::trim)
-        .find_map(|c| c.strip_prefix(name)?.strip_prefix('='))
+/// What an operator request's session header amounts to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Session {
+    /// The current, unexpired session.
+    Valid,
+    /// The session a newer sign-in replaced.
+    Replaced,
+    /// No header, a wrong one, or an expired session.
+    Invalid,
 }
 
 struct Inner {
-    launch: Option<String>,
+    launch: String,
     launch_file: Option<PathBuf>,
-    sessions: HashMap<String, Instant>,
+    /// `(id, expiry)` of the one live session.
+    session: Option<(String, Instant)>,
+    /// The id the last sign-in replaced, to tell its page why it is out.
+    replaced: Option<String>,
 }
 
-/// Single-use launch secret plus short-lived operator sessions.
+/// Single-use launch secret plus the one operator session.
 pub struct OwnerSessions {
-    cookie_name: String,
     lifetime: Duration,
     inner: Mutex<Inner>,
 }
+
 impl OwnerSessions {
-    /// `scope` separates cookies of servers on different ports (cookies ignore ports).
-    pub fn new(scope: &str, lifetime: Duration) -> Self {
-        let safe: String = scope
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect();
+    pub fn new(lifetime: Duration) -> Self {
         Self {
-            cookie_name: format!("trustgraph_owner_{safe}"),
             lifetime,
             inner: Mutex::new(Inner {
-                launch: Some(random_secret()),
+                launch: random_secret(),
                 launch_file: None,
-                sessions: HashMap::new(),
+                session: None,
+                replaced: None,
             }),
         }
     }
-    #[cfg(test)]
-    pub fn cookie_name(&self) -> &str {
-        &self.cookie_name
+
+    pub fn lifetime(&self) -> Duration {
+        self.lifetime
     }
+
     fn inner(&self) -> std::sync::MutexGuard<'_, Inner> {
         // The session table holds no cross-field invariants a panic could break.
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
-    /// The unused launch secret, if it has not been exchanged yet.
-    pub fn launch_secret(&self) -> Option<String> {
+
+    /// The current, unused launch secret.
+    pub fn launch_secret(&self) -> String {
         self.inner().launch.clone()
     }
-    /// Write a private (0600) launch file; it is deleted after the secret is exchanged.
+
+    /// Write the private (0600) launch file atomically: a new temp file,
+    /// then a rename over the old one.
     pub fn write_launch_file(&self, path: &Path, contents: &str) -> std::io::Result<()> {
-        match fs::symlink_metadata(path) {
-            Ok(_) => fs::remove_file(path)?,
+        let temp = path.with_extension("html.tmp");
+        match fs::symlink_metadata(&temp) {
+            Ok(_) => fs::remove_file(&temp)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        let mut file = private_create(path)?;
+        let mut file = private_create(&temp)?;
         file.write_all(contents.as_bytes())?;
         file.sync_all()?;
+        drop(file);
+        fs::rename(&temp, path)?;
         self.inner().launch_file = Some(path.to_owned());
         Ok(())
     }
-    /// Exchange the launch secret once. Returns the `Set-Cookie` header value.
+
+    /// Exchange the launch secret. On success the secret is dead, a new one
+    /// replaces it (the caller writes the new launch file), the previous
+    /// session ends, and the new session id is returned.
     pub fn exchange(&self, presented: &str) -> Option<String> {
         let mut inner = self.inner();
-        let launch = inner.launch.as_deref()?;
-        if !constant_time_eq(launch.as_bytes(), presented.as_bytes()) {
+        if !constant_time_eq(inner.launch.as_bytes(), presented.as_bytes()) {
             return None;
         }
-        inner.launch = None;
-        if let Some(path) = inner.launch_file.take() {
-            let _ = fs::remove_file(path);
-        }
-        let now = Instant::now();
-        inner.sessions.retain(|_, expiry| *expiry > now);
-        if inner.sessions.len() >= MAX_SESSIONS {
-            return None;
-        }
+        inner.launch = random_secret();
         let id = random_secret();
-        inner.sessions.insert(id.clone(), now + self.lifetime);
-        Some(format!(
-            "{}={id}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
-            self.cookie_name,
-            self.lifetime.as_secs()
-        ))
+        let previous = inner
+            .session
+            .replace((id.clone(), Instant::now() + self.lifetime));
+        inner.replaced = previous.map(|(old, _)| old);
+        Some(id)
     }
-    /// True when the request carries a current operator session cookie.
-    pub fn valid(&self, headers: &HeaderMap) -> bool {
-        let Some(presented) = cookie(headers, &self.cookie_name) else {
-            return false;
+
+    /// The operator session named by the request's `X-TrustGraph-Operator`.
+    pub fn check(&self, headers: &HeaderMap) -> Session {
+        let Some(presented) = headers.get(OPERATOR_HEADER).and_then(|v| v.to_str().ok()) else {
+            return Session::Invalid;
         };
-        let now = Instant::now();
         let inner = self.inner();
-        // Compare against every live session so timing does not reveal prefixes.
-        inner.sessions.iter().fold(false, |found, (id, expiry)| {
-            found | (constant_time_eq(id.as_bytes(), presented.as_bytes()) && *expiry > now)
-        })
+        let now = Instant::now();
+        let current = inner.session.as_ref().is_some_and(|(id, expiry)| {
+            constant_time_eq(id.as_bytes(), presented.as_bytes()) & (*expiry > now)
+        });
+        let replaced = inner
+            .replaced
+            .as_ref()
+            .is_some_and(|id| constant_time_eq(id.as_bytes(), presented.as_bytes()));
+        if current {
+            Session::Valid
+        } else if replaced {
+            Session::Replaced
+        } else {
+            Session::Invalid
+        }
     }
 }
+
 impl Drop for OwnerSessions {
     fn drop(&mut self) {
         if let Some(path) = self.inner().launch_file.take() {
@@ -171,13 +186,14 @@ impl Drop for OwnerSessions {
     }
 }
 
-fn private_create(path: &Path) -> std::io::Result<fs::File> {
+/// Create a new 0600 file; never through a link.
+pub(crate) fn private_create(path: &Path) -> std::io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     options.open(path)
 }
@@ -223,10 +239,10 @@ mod tests {
     }
 
     #[test]
-    fn launch_secret_is_single_use_and_sessions_are_cookie_only() {
+    fn launch_secret_is_single_use_and_sessions_are_header_only() {
         let dir = tempfile::tempdir().unwrap();
-        let sessions = OwnerSessions::new("8787", SESSION_LIFETIME);
-        let launch = sessions.launch_secret().unwrap();
+        let sessions = OwnerSessions::new(SESSION_LIFETIME);
+        let launch = sessions.launch_secret();
         let file = dir.path().join("operator.html");
         sessions.write_launch_file(&file, &launch).unwrap();
         #[cfg(unix)]
@@ -238,41 +254,61 @@ mod tests {
             );
         }
         assert!(sessions.exchange(&"0".repeat(64)).is_none());
-        assert!(
-            sessions.launch_secret().is_some(),
+        assert_eq!(
+            sessions.launch_secret(),
+            launch,
             "a wrong guess must not burn the secret"
         );
-        let set_cookie = sessions.exchange(&launch).unwrap();
-        assert!(set_cookie.contains("HttpOnly") && set_cookie.contains("SameSite=Strict"));
-        assert!(set_cookie.starts_with("trustgraph_owner_8787="));
-        assert!(!file.exists(), "launch file is removed after exchange");
+        let id = sessions.exchange(&launch).unwrap();
+        assert_ne!(id, launch);
+        assert_ne!(sessions.launch_secret(), launch, "a new secret replaces it");
         assert!(
             sessions.exchange(&launch).is_none(),
-            "launch secret is single-use"
+            "the old secret is dead"
         );
-        let cookie_value = set_cookie.split(';').next().unwrap();
-        assert!(!cookie_value.contains(&launch));
-        assert!(sessions.valid(&headers(&[(header::COOKIE, cookie_value)])));
-        assert!(!sessions.valid(&headers(&[(
-            header::AUTHORIZATION,
-            &format!("Bearer {launch}")
-        )])));
-        assert!(!sessions.valid(&headers(&[(
-            header::COOKIE,
-            &format!("trustgraph_owner_8787={launch}")
-        )])));
-        let other_port = OwnerSessions::new("8789", SESSION_LIFETIME);
-        assert_ne!(other_port.cookie_name(), sessions.cookie_name());
-        assert!(!other_port.valid(&headers(&[(header::COOKIE, cookie_value)])));
+        let with = |name: &str, value: &str| {
+            headers(&[(
+                header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value,
+            )])
+        };
+        assert_eq!(sessions.check(&with(OPERATOR_HEADER, &id)), Session::Valid);
+        assert_eq!(sessions.check(&HeaderMap::new()), Session::Invalid);
+        assert_eq!(
+            sessions.check(&with("cookie", &format!("trustgraph_owner={id}"))),
+            Session::Invalid,
+            "a cookie is never a session"
+        );
+        assert_eq!(
+            sessions.check(&with("authorization", &format!("Bearer {id}"))),
+            Session::Invalid
+        );
+        assert_eq!(
+            sessions.check(&with(OPERATOR_HEADER, &launch)),
+            Session::Invalid
+        );
+
+        // A second sign-in ends the first session.
+        let second = sessions.exchange(&sessions.launch_secret()).unwrap();
+        assert_eq!(
+            sessions.check(&with(OPERATOR_HEADER, &id)),
+            Session::Replaced
+        );
+        assert_eq!(
+            sessions.check(&with(OPERATOR_HEADER, &second)),
+            Session::Valid
+        );
     }
 
     #[test]
     fn sessions_expire() {
-        let sessions = OwnerSessions::new("1", Duration::from_millis(0));
-        let launch = sessions.launch_secret().unwrap();
-        let cookie_value = sessions.exchange(&launch).unwrap();
-        let cookie_value = cookie_value.split(';').next().unwrap();
-        assert!(!sessions.valid(&headers(&[(header::COOKIE, cookie_value)])));
+        let sessions = OwnerSessions::new(Duration::from_millis(0));
+        let id = sessions.exchange(&sessions.launch_secret()).unwrap();
+        let h = headers(&[(
+            header::HeaderName::from_static(OPERATOR_HEADER),
+            id.as_str(),
+        )]);
+        assert_eq!(sessions.check(&h), Session::Invalid);
     }
 
     #[test]

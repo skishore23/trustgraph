@@ -3,10 +3,21 @@
 //!
 //! Identity is the whole point. An agent is known ONLY by its bearer token
 //! (one per agent, in `<state>/tokens/`); no request body names an agent.
-//! The operator is known ONLY by a session cookie obtained once through the
-//! private launch file; the reviewer sent to the engine is always the
-//! configured `--operator`. Agent tokens never reach an operator route, and
-//! no agent route or MCP tool can approve, revoke or activate.
+//! The operator is known ONLY by the `X-TrustGraph-Operator` session id that
+//! the single-use launch file's secret is exchanged for (never a cookie:
+//! cookies ignore ports). One operator session is live at a time. The
+//! reviewer sent to the engine is always the configured `--operator`. A
+//! request with an `Authorization` header never reaches an operator route,
+//! and no agent route or MCP tool can approve, revoke or activate.
+//!
+//! An artifact an agent may not use answers exactly like one that does not
+//! exist (404 `unknown_artifact`), and neither is journaled. Requests that
+//! would change nothing or that the engine would refuse for their shape are
+//! answered without journaling, so agents spend their journal budget only on
+//! real work.
+//!
+//! Time: `now` is the larger of the wall clock and the last journaled time
+//! at start, plus monotonic time since; later wall-clock jumps are ignored.
 //!
 //! Every request must name the loopback `Host` with this server's port, and
 //! a browser `Origin`, when present, must be the same origin. A journal
@@ -19,8 +30,9 @@ mod tokens;
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::extract::{Path as UrlPath, Request, State};
@@ -32,8 +44,11 @@ use http_body_util::BodyExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use trustgraph_engine::{Event, FileJournal, Journal, MemoryJournal, Reply, Runtime};
-use trustgraph_policy::{Policy, Severity, lint, parse, run_tests};
+use trustgraph_engine::{
+    Engine, Event, FileJournal, FileOutcome, Journal, MemoryJournal, PolicyFile, ProposalOrigin,
+    Reply, Runtime,
+};
+use trustgraph_policy::{ChangeKind, Policy, Severity, lint, parse, run_tests};
 
 use crate::policy_cmd::text as policy_text;
 
@@ -45,6 +60,13 @@ pub const BODY_LIMIT: usize = 512 * 1024;
 const DRAIN_LIMIT: usize = 8 * 1024 * 1024;
 pub const DEFAULT_MAX_ARTIFACTS: usize = 100_000;
 pub const DEFAULT_MAX_JOURNAL_BYTES: u64 = 1 << 30;
+/// Journal bytes one agent may cause per process lifetime.
+pub const DEFAULT_AGENT_JOURNAL_BYTES: u64 = 64 << 20;
+/// Artifacts one agent may create per process lifetime.
+pub const DEFAULT_AGENT_ARTIFACTS: u64 = 10_000;
+/// How far the wall clock may be behind the journal at start before
+/// approvals are refused.
+pub const CLOCK_BEHIND_TOLERANCE: u64 = 300;
 pub const DEFAULT_PORT: u16 = 8787;
 /// `policy_simulate` bounds: the server runs it on the caller's behalf.
 pub const MAX_SIMULATE_COUNT: u64 = 8;
@@ -78,10 +100,18 @@ impl ServeJournal for MemoryJournal {
 pub struct Limits {
     pub max_artifacts: usize,
     pub max_journal_bytes: u64,
+    /// Journal bytes each agent may cause per process lifetime.
+    pub agent_journal_bytes: u64,
+    /// Artifacts each agent may create per process lifetime.
+    pub agent_artifacts: u64,
     /// Sustained requests per second per agent.
     pub rate_per_second: f64,
     /// Requests an agent may make at once before the rate applies.
     pub burst: f64,
+    /// Per agent, for the pure policy helpers other than simulate.
+    pub helper_rate_per_second: f64,
+    /// Per agent, for `policy_simulate`.
+    pub simulate_rate_per_second: f64,
 }
 
 impl Default for Limits {
@@ -89,9 +119,40 @@ impl Default for Limits {
         Limits {
             max_artifacts: DEFAULT_MAX_ARTIFACTS,
             max_journal_bytes: DEFAULT_MAX_JOURNAL_BYTES,
+            agent_journal_bytes: DEFAULT_AGENT_JOURNAL_BYTES,
+            agent_artifacts: DEFAULT_AGENT_ARTIFACTS,
             rate_per_second: 50.0,
             burst: 200.0,
+            helper_rate_per_second: 10.0,
+            simulate_rate_per_second: 2.0,
         }
+    }
+}
+
+/// The server's time source. `trustgraph serve` uses `SystemClock`; tests
+/// drive their own.
+pub trait Clock: Send + Sync {
+    /// Seconds since the Unix epoch, as the wall clock says now.
+    fn wall(&self) -> u64;
+    /// Time since an arbitrary fixed point; never goes backwards.
+    fn monotonic(&self) -> Duration;
+}
+
+/// The system wall clock and `Instant`.
+pub struct SystemClock(Instant);
+
+impl Default for SystemClock {
+    fn default() -> Self {
+        SystemClock(Instant::now())
+    }
+}
+
+impl Clock for SystemClock {
+    fn wall(&self) -> u64 {
+        unix_now()
+    }
+    fn monotonic(&self) -> Duration {
+        self.0.elapsed()
     }
 }
 
@@ -150,6 +211,16 @@ impl ApiError {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
     }
 
+    /// The one answer for an artifact that does not exist AND for one the
+    /// agent may not use, so ids of other agents' content cannot be probed.
+    fn unknown_artifact() -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "unknown_artifact",
+            "no artifact with that id that this agent may use",
+        )
+    }
+
     /// An engine `Rejected` reply.
     fn rejected(code: String, message: String) -> Self {
         let status = match code.as_str() {
@@ -198,6 +269,22 @@ struct Bucket {
     at: Instant,
 }
 
+/// Which rate limit a request is charged to. Every agent request is charged
+/// to `Requests`; the pure helpers also to their own, lower lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Lane {
+    Requests,
+    Helper,
+    Simulate,
+}
+
+/// What one agent has made the server store since this process started.
+#[derive(Debug, Default, Clone, Copy)]
+struct Usage {
+    journal_bytes: u64,
+    artifacts: u64,
+}
+
 /// The server: one runtime behind one mutex, plus the identity tables.
 pub struct Server<J: ServeJournal> {
     settings: Settings,
@@ -205,7 +292,18 @@ pub struct Server<J: ServeJournal> {
     /// `(agent, token)` for every agent of the active policy with a token.
     tokens: RwLock<Vec<(String, String)>>,
     sessions: auth::OwnerSessions,
-    buckets: Mutex<HashMap<String, Bucket>>,
+    buckets: Mutex<HashMap<(String, Lane), Bucket>>,
+    /// Per agent; only touched while the runtime lock is held.
+    usage: Mutex<HashMap<String, Usage>>,
+    clock: Arc<dyn Clock>,
+    /// `now` = `base` + monotonic time since `start`.
+    base: u64,
+    start: Duration,
+    /// When nonzero, the journal time the wall clock must reach before
+    /// approvals are accepted again.
+    behind_until: AtomicU64,
+    /// Lines `main` prints at start about the policy file.
+    report: Vec<String>,
     /// Why the server stopped serving; set once, never cleared.
     broken: Mutex<Option<String>>,
 }
@@ -287,6 +385,13 @@ fn digest_of(sha256: Option<String>, content: Option<String>) -> Result<String, 
             "send exactly one of `sha256` or `content`",
         )),
     }
+}
+
+/// The engine's shape bounds, checked before the runtime lock and journal.
+fn shape(event: &Event) -> Result<(), ApiError> {
+    event
+        .validate_shape()
+        .or_else(|reply| reply_value(reply).map(|_| ()))
 }
 
 fn reply_value(reply: Reply) -> ApiResult {
@@ -413,6 +518,24 @@ impl<J: ServeJournal> Server<J> {
     /// A server over an opened runtime. Writes the token files of every agent
     /// in the active policy; any token problem is an error.
     pub fn new(runtime: Runtime<J>, settings: Settings) -> std::io::Result<Arc<Self>> {
+        Self::with_clock(runtime, settings, Arc::new(SystemClock::default()))
+    }
+
+    /// `new` with its own time source.
+    pub fn with_clock(
+        runtime: Runtime<J>,
+        settings: Settings,
+        clock: Arc<dyn Clock>,
+    ) -> std::io::Result<Arc<Self>> {
+        Self::build(runtime, settings, clock, Vec::new())
+    }
+
+    fn build(
+        runtime: Runtime<J>,
+        settings: Settings,
+        clock: Arc<dyn Clock>,
+        report: Vec<String>,
+    ) -> std::io::Result<Arc<Self>> {
         tokens::private_dir(&settings.state_dir)?;
         let agents = runtime
             .engine()
@@ -423,15 +546,36 @@ impl<J: ServeJournal> Server<J> {
         if !problems.is_empty() {
             return Err(std::io::Error::other(problems.join("; ")));
         }
-        let sessions = auth::OwnerSessions::new(&settings.port.to_string(), auth::SESSION_LIFETIME);
+        let wall = clock.wall();
+        let journaled = runtime.last_at();
+        let behind_until = if journaled > wall.saturating_add(CLOCK_BEHIND_TOLERANCE) {
+            eprintln!(
+                "warning: the system clock ({wall}) is {} s behind the last journaled time ({journaled}); approvals are refused until the clock catches up",
+                journaled - wall
+            );
+            journaled
+        } else {
+            0
+        };
         Ok(Arc::new(Server {
             settings,
             runtime: Mutex::new(runtime),
             tokens: RwLock::new(tokens),
-            sessions,
+            sessions: auth::OwnerSessions::new(auth::SESSION_LIFETIME),
             buckets: Mutex::new(HashMap::new()),
+            usage: Mutex::new(HashMap::new()),
+            base: wall.max(journaled),
+            start: clock.monotonic(),
+            clock,
+            behind_until: AtomicU64::new(behind_until),
+            report,
             broken: Mutex::new(None),
         }))
+    }
+
+    /// What `main` prints at start about the policy file.
+    pub fn startup_report(&self) -> &[String] {
+        &self.report
     }
 
     pub fn settings(&self) -> &Settings {
@@ -445,10 +589,7 @@ impl<J: ServeJournal> Server<J> {
     /// Write the single-use operator launch file, `<state>/operator.html`.
     pub fn write_launch_file(&self) -> std::io::Result<PathBuf> {
         let path = self.settings.state_dir.join("operator.html");
-        let secret = self
-            .sessions
-            .launch_secret()
-            .ok_or_else(|| std::io::Error::other("the launch secret was already used"))?;
+        let secret = self.sessions.launch_secret();
         self.sessions.write_launch_file(
             &path,
             &format!(
@@ -459,9 +600,9 @@ impl<J: ServeJournal> Server<J> {
         Ok(path)
     }
 
-    /// The unused launch secret, for tests and the launch file.
+    /// The current, unused launch secret, for tests and the launch file.
     pub fn launch_secret(&self) -> Option<String> {
-        self.sessions.launch_secret()
+        Some(self.sessions.launch_secret())
     }
 
     /// `revision`, `digest` and `source` of the active policy.
@@ -473,6 +614,11 @@ impl<J: ServeJournal> Server<J> {
             digest,
             rt.policy_source().as_str(),
         ))
+    }
+
+    /// Bytes in the journal; `None` when unknown or the server stopped.
+    pub fn journal_size(&self) -> Option<u64> {
+        self.lock().ok()?.journal().size()
     }
 
     fn broken(&self) -> Option<String> {
@@ -504,22 +650,68 @@ impl<J: ServeJournal> Server<J> {
         Ok(guard)
     }
 
-    /// Seconds since the epoch, never before the last journaled record.
-    fn now(rt: &Runtime<J>) -> u64 {
-        unix_now().max(rt.last_at())
+    /// Seconds: the start base plus monotonic time since, never before the
+    /// last journaled record. Wall-clock jumps after start do not move it.
+    fn now(&self, rt: &Runtime<J>) -> u64 {
+        let elapsed = self.clock.monotonic().saturating_sub(self.start).as_secs();
+        self.base.saturating_add(elapsed).max(rt.last_at())
+    }
+
+    /// True while the wall clock is still behind the journal it found at start.
+    fn clock_behind(&self) -> bool {
+        let until = self.behind_until.load(Ordering::SeqCst);
+        if until == 0 {
+            return false;
+        }
+        if self.clock.wall() >= until {
+            self.behind_until.store(0, Ordering::SeqCst);
+            eprintln!(
+                "trustgraph serve: the system clock caught up with the journal; approvals work again"
+            );
+            return false;
+        }
+        true
     }
 
     fn handle(&self, rt: &mut Runtime<J>, event: Event) -> Result<Reply, ApiError> {
-        let at = Self::now(rt);
+        let at = self.now(rt);
         rt.handle(at, event).map_err(|e| {
             self.mark_broken(format!("journal failure: {e}"));
             ApiError::restart_required()
         })
     }
 
-    /// Quotas checked before an agent write is journaled.
-    fn agent_quota(&self, rt: &Runtime<J>, new_artifact: bool) -> Result<(), ApiError> {
+    fn usage(&self, agent: &str) -> Usage {
+        self.usage
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(agent)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Quotas checked before an agent write is journaled: the server's and
+    /// the agent's own.
+    fn agent_quota(
+        &self,
+        rt: &Runtime<J>,
+        agent: &str,
+        new_artifact: bool,
+    ) -> Result<(), ApiError> {
         let limits = &self.settings.limits;
+        let usage = self.usage(agent);
+        if usage.journal_bytes >= limits.agent_journal_bytes {
+            return Err(ApiError::quota(format!(
+                "agent `{agent}` has written its limit of {} journal bytes since the server started",
+                limits.agent_journal_bytes
+            )));
+        }
+        if new_artifact && usage.artifacts >= limits.agent_artifacts {
+            return Err(ApiError::quota(format!(
+                "agent `{agent}` has created its limit of {} artifacts since the server started",
+                limits.agent_artifacts
+            )));
+        }
         match rt.journal().size() {
             Some(size) if size < limits.max_journal_bytes => {}
             _ => {
@@ -538,6 +730,54 @@ impl<J: ServeJournal> Server<J> {
         Ok(())
     }
 
+    /// `handle` for an agent's event, charging what it stored to the agent.
+    fn agent_handle(
+        &self,
+        rt: &mut Runtime<J>,
+        agent: &str,
+        event: Event,
+    ) -> Result<Reply, ApiError> {
+        let bytes = rt.journal().size().unwrap_or(0);
+        let artifacts = rt.engine().artifact_count();
+        let reply = self.handle(rt, event)?;
+        let written = rt
+            .journal()
+            .size()
+            .unwrap_or(u64::MAX)
+            .saturating_sub(bytes);
+        let created = rt.engine().artifact_count().saturating_sub(artifacts) as u64;
+        let mut usage = self.usage.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = usage.entry(agent.to_string()).or_default();
+        entry.journal_bytes = entry.journal_bytes.saturating_add(written);
+        entry.artifacts = entry.artifacts.saturating_add(created);
+        Ok(reply)
+    }
+
+    /// The source names `artifact` derives from, when it exists and `agent`
+    /// may use every one of them; otherwise the uniform `unknown_artifact`.
+    /// Both outcomes walk the lineage and the policy the same way.
+    fn visible_sources(
+        engine: &Engine,
+        policy: &Policy,
+        agent: &str,
+        artifact: &str,
+    ) -> Result<BTreeSet<String>, ApiError> {
+        let lineage = engine.lineage(artifact);
+        let known = lineage.is_some();
+        let sources = lineage.unwrap_or_default();
+        let allowed = sources.iter().fold(true, |ok, name| {
+            ok & policy
+                .sources
+                .get(name)
+                .is_some_and(|s| s.agents.contains(agent))
+        });
+        if known & allowed & !sources.is_empty() {
+            Ok(sources)
+        } else {
+            Err(ApiError::unknown_artifact())
+        }
+    }
+
     /// The agent whose token is the request's bearer credential, charged one
     /// request against its rate limit.
     pub fn authenticate_agent(&self, headers: &HeaderMap) -> Result<String, ApiError> {
@@ -552,33 +792,54 @@ impl<J: ServeJournal> Server<J> {
                 found.push(agent);
             }
         }
+        // A token held by two agents identifies nobody.
         let [agent] = found[..] else {
             return Err(missing());
         };
         let agent = agent.to_string();
         drop(tokens);
-        self.charge(&agent)?;
+        self.charge(&agent, Lane::Requests)?;
         Ok(agent)
     }
 
-    fn charge(&self, agent: &str) -> Result<(), ApiError> {
+    /// Charge one call of the pure helper `name` (`check`, `test`,
+    /// `explain`, `diff`, `schema`, `simulate`) to its own, lower rate limit.
+    pub fn charge_helper(&self, agent: &str, name: &str) -> Result<(), ApiError> {
+        let lane = if name == "simulate" {
+            Lane::Simulate
+        } else {
+            Lane::Helper
+        };
+        self.charge(agent, lane)
+    }
+
+    fn charge(&self, agent: &str, lane: Lane) -> Result<(), ApiError> {
         let limits = &self.settings.limits;
+        let (rate, burst) = match lane {
+            Lane::Requests => (limits.rate_per_second, limits.burst),
+            Lane::Helper => (
+                limits.helper_rate_per_second,
+                limits.helper_rate_per_second.max(1.0),
+            ),
+            Lane::Simulate => (
+                limits.simulate_rate_per_second,
+                limits.simulate_rate_per_second.max(1.0),
+            ),
+        };
         let mut buckets = self.buckets.lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
-        let bucket = buckets.entry(agent.to_string()).or_insert(Bucket {
-            tokens: limits.burst,
+        let bucket = buckets.entry((agent.to_string(), lane)).or_insert(Bucket {
+            tokens: burst,
             at: now,
         });
-        let refill = now.duration_since(bucket.at).as_secs_f64() * limits.rate_per_second;
-        bucket.tokens = (bucket.tokens + refill).min(limits.burst);
+        let refill = now.duration_since(bucket.at).as_secs_f64() * rate;
+        bucket.tokens = (bucket.tokens + refill).min(burst);
         bucket.at = now;
         if bucket.tokens >= 1.0 {
             bucket.tokens -= 1.0;
             return Ok(());
         }
-        let wait = ((1.0 - bucket.tokens) / limits.rate_per_second)
-            .ceil()
-            .max(1.0);
+        let wait = ((1.0 - bucket.tokens) / rate).ceil().max(1.0);
         let mut error = ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limited",
@@ -588,14 +849,25 @@ impl<J: ServeJournal> Server<J> {
         Err(error)
     }
 
+    /// The operator session header, and no `Authorization` header: an agent
+    /// token never reaches an operator route, even next to a valid session.
     fn require_operator(&self, headers: &HeaderMap) -> Result<(), ApiError> {
-        if self.sessions.valid(headers) {
-            Ok(())
-        } else {
-            Err(ApiError::unauthorized(
+        let required = || {
+            ApiError::unauthorized(
                 "operator_session_required",
-                "open the operator launch file to sign in",
-            ))
+                "sign in by opening the operator launch file",
+            )
+        };
+        if headers.contains_key(header::AUTHORIZATION) {
+            return Err(required());
+        }
+        match self.sessions.check(headers) {
+            auth::Session::Valid => Ok(()),
+            auth::Session::Replaced => Err(ApiError::unauthorized(
+                "operator_session_replaced",
+                "Signed out: a newer operator session was started. If that was not you, stop the server.",
+            )),
+            auth::Session::Invalid => Err(required()),
         }
     }
 
@@ -603,89 +875,108 @@ impl<J: ServeJournal> Server<J> {
 
     pub fn register_source(&self, agent: &str, request: SourceRequest) -> ApiResult {
         let sha = digest_of(request.sha256, request.content)?;
+        let event = Event::RegisterSource {
+            source: request.source,
+            sha256: sha,
+        };
+        shape(&event)?;
+        let Event::RegisterSource { source, sha256 } = &event else {
+            return Err(ApiError::internal("unexpected event"));
+        };
         let mut rt = self.lock()?;
         let policy = rt
             .engine()
             .policy()
             .ok_or_else(|| ApiError::internal("no active policy"))?;
-        let Some(source) = policy.sources.get(&request.source) else {
+        let Some(rule) = policy.sources.get(source) else {
             return Err(ApiError::rejected(
                 "unknown_source".into(),
                 "that is not a source in the active policy".into(),
             ));
         };
-        if !source.agents.contains(agent) {
+        if !rule.agents.contains(agent) {
             return Err(ApiError::rejected(
                 "agent_cannot_use_source".into(),
                 format!("agent `{agent}` may not use this source"),
             ));
         }
-        self.agent_quota(&rt, true)?;
-        let reply = self.handle(
-            &mut rt,
-            Event::RegisterSource {
-                source: request.source,
-                sha256: sha,
-            },
-        )?;
+        // Already registered: the same answer, nothing journaled or charged.
+        if let Some(id) = rt.engine().source_artifact(source, sha256) {
+            return Ok(json!({"artifact": id}));
+        }
+        self.agent_quota(&rt, agent, true)?;
+        let reply = self.agent_handle(&mut rt, agent, event)?;
         reply_value(reply)
     }
 
     pub fn record_output(&self, agent: &str, request: OutputRequest) -> ApiResult {
         let sha = digest_of(request.sha256, request.content)?;
+        let event = Event::RecordOutput {
+            agent: agent.into(),
+            step: request.step,
+            inputs: request.inputs,
+            sha256: sha,
+        };
+        shape(&event)?;
+        let Event::RecordOutput {
+            step,
+            inputs,
+            sha256,
+            ..
+        } = &event
+        else {
+            return Err(ApiError::internal("unexpected event"));
+        };
         let mut rt = self.lock()?;
-        self.agent_quota(&rt, true)?;
-        let reply = self.handle(
-            &mut rt,
-            Event::RecordOutput {
-                agent: agent.into(),
-                step: request.step,
-                inputs: request.inputs,
-                sha256: sha,
-            },
-        )?;
+        let engine = rt.engine();
+        let policy = engine
+            .policy()
+            .ok_or_else(|| ApiError::internal("no active policy"))?;
+        // Walk every input, so the answer takes the same work whichever
+        // input is unknown or not the agent's.
+        let visible = inputs.iter().fold(true, |ok, input| {
+            ok & Self::visible_sources(engine, policy, agent, input).is_ok()
+        });
+        if !visible {
+            return Err(ApiError::unknown_artifact());
+        }
+        if let Some(id) = engine.output_artifact(agent, step, inputs, sha256) {
+            return Ok(json!({"artifact": id}));
+        }
+        self.agent_quota(&rt, agent, true)?;
+        let reply = self.agent_handle(&mut rt, agent, event)?;
         reply_value(reply)
     }
 
     pub fn check(&self, agent: &str, request: CheckRequest) -> ApiResult {
+        let event = Event::Check {
+            agent: agent.into(),
+            artifact: request.artifact,
+            action: request.action,
+            recipients: request.recipients.map(|r| r.into_iter().collect()),
+        };
+        shape(&event)?;
+        let Event::Check { artifact, .. } = &event else {
+            return Err(ApiError::internal("unexpected event"));
+        };
         let mut rt = self.lock()?;
-        self.agent_quota(&rt, false)?;
-        let reply = self.handle(
-            &mut rt,
-            Event::Check {
-                agent: agent.into(),
-                artifact: request.artifact,
-                action: request.action,
-                recipients: request.recipients.map(|r| r.into_iter().collect()),
-            },
-        )?;
+        let engine = rt.engine();
+        let policy = engine
+            .policy()
+            .ok_or_else(|| ApiError::internal("no active policy"))?;
+        Self::visible_sources(engine, policy, agent, artifact)?;
+        self.agent_quota(&rt, agent, false)?;
+        let reply = self.agent_handle(&mut rt, agent, event)?;
         reply_value(reply)
     }
 
     pub fn explain_artifact(&self, agent: &str, artifact: &str) -> ApiResult {
         let rt = self.lock()?;
         let engine = rt.engine();
-        let Some(sources) = engine.lineage(artifact) else {
-            return Err(ApiError::rejected(
-                "unknown_artifact".into(),
-                "no such artifact".into(),
-            ));
-        };
         let policy = engine
             .policy()
             .ok_or_else(|| ApiError::internal("no active policy"))?;
-        let allowed = sources.iter().all(|name| {
-            policy
-                .sources
-                .get(name)
-                .is_some_and(|s| s.agents.contains(agent))
-        });
-        if !allowed {
-            return Err(ApiError::rejected(
-                "agent_cannot_use_source".into(),
-                format!("agent `{agent}` may not use every source of this artifact"),
-            ));
-        }
+        let sources = Self::visible_sources(engine, policy, agent, artifact)?;
         Ok(json!({
             "artifact": artifact,
             "readers": readers(policy, &sources),
@@ -695,17 +986,19 @@ impl<J: ServeJournal> Server<J> {
 
     pub fn propose(&self, agent: Option<&str>, request: PolicyRequest) -> ApiResult {
         validate_policy(&request.policy)?;
+        let event = Event::ProposePolicy {
+            agent: agent.map(str::to_string),
+            policy: request.policy,
+        };
+        shape(&event)?;
         let mut rt = self.lock()?;
-        if agent.is_some() {
-            self.agent_quota(&rt, false)?;
-        }
-        let reply = self.handle(
-            &mut rt,
-            Event::ProposePolicy {
-                agent: agent.map(str::to_string),
-                policy: request.policy,
-            },
-        )?;
+        let reply = match agent {
+            Some(agent) => {
+                self.agent_quota(&rt, agent, false)?;
+                self.agent_handle(&mut rt, agent, event)?
+            }
+            None => self.handle(&mut rt, event)?,
+        };
         reply_value(reply)
     }
 
@@ -740,12 +1033,33 @@ impl<J: ServeJournal> Server<J> {
 
     fn operator_state(&self) -> ApiResult {
         let rt = self.lock()?;
-        let now = Self::now(&rt);
+        let now = self.now(&rt);
         let engine = rt.engine();
+        let operator = &self.settings.operator;
+        let policy = engine.policy();
         let pending: Vec<Value> = engine
             .pending_decisions(now)
             .into_iter()
             .map(|p| {
+                let reviewers: BTreeSet<String> = policy
+                    .and_then(|policy| {
+                        let rule = policy.actions.get(&p.action)?.approval.as_ref()?;
+                        Some(policy.people(&rule.reviewers))
+                    })
+                    .unwrap_or_default();
+                let sources: BTreeSet<String> = p.sources.iter().cloned().collect();
+                let reads =
+                    policy.is_some_and(|policy| readers(policy, &sources).contains(operator));
+                // The engine's own rule; the page only hides what would fail.
+                let blocked = if !reviewers.contains(operator) {
+                    Some("you are not a reviewer for this action")
+                } else if !reads {
+                    Some("you may not read this output, so you cannot approve it")
+                } else if &p.agent == operator {
+                    Some("an agent cannot approve its own request")
+                } else {
+                    None
+                };
                 json!({
                     "decision": p.decision,
                     "agent": p.agent,
@@ -754,6 +1068,9 @@ impl<J: ServeJournal> Server<J> {
                     "sources": p.sources,
                     "reason": p.reason,
                     "requested_at": p.requested_at,
+                    "reviewers": reviewers,
+                    "can_approve": blocked.is_none(),
+                    "cannot_approve": blocked,
                 })
             })
             .collect();
@@ -774,9 +1091,15 @@ impl<J: ServeJournal> Server<J> {
             .stored_proposals()
             .into_iter()
             .map(|p| {
+                let (origin, from) = match &p.origin {
+                    ProposalOrigin::Operator => ("operator", "operator"),
+                    ProposalOrigin::File => ("file", "file"),
+                    ProposalOrigin::Agent(agent) => ("agent", agent.as_str()),
+                };
                 json!({
                     "proposal": p.proposal,
-                    "from": p.agent.as_deref().unwrap_or("operator"),
+                    "origin": origin,
+                    "from": from,
                     "widens": p.widens,
                     "changes": p.changes,
                     "explanation": p.explanation,
@@ -786,6 +1109,7 @@ impl<J: ServeJournal> Server<J> {
         Ok(json!({
             "operator": self.settings.operator,
             "now": now,
+            "clock_behind": self.behind_until.load(Ordering::SeqCst) != 0,
             "policy": {
                 "revision": engine.policy_revision(),
                 "digest": engine.policy().map(Policy::digest),
@@ -798,6 +1122,13 @@ impl<J: ServeJournal> Server<J> {
     }
 
     fn approve(&self, decision: String) -> ApiResult {
+        if self.clock_behind() {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "clock_behind",
+                "the system clock is behind the journal; approvals are refused until it catches up",
+            ));
+        }
         let mut rt = self.lock()?;
         let reviewer = self.settings.operator.clone();
         let reply = self.handle(&mut rt, Event::Approve { decision, reviewer })?;
@@ -1002,6 +1333,7 @@ async fn get_policy<J: ServeJournal>(State(s): Shared<J>, headers: HeaderMap) ->
 async fn get_schema<J: ServeJournal>(State(s): Shared<J>, headers: HeaderMap) -> Response {
     respond(
         s.authenticate_agent(&headers)
+            .and_then(|agent| s.charge_helper(&agent, "schema"))
             .map(|_| trustgraph_policy::schema()),
     )
 }
@@ -1041,7 +1373,8 @@ macro_rules! helper_post {
         async fn $name<J: ServeJournal>(State(s): Shared<J>, request: Request) -> Response {
             respond(
                 async {
-                    s.authenticate_agent(request.headers())?;
+                    let agent = s.authenticate_agent(request.headers())?;
+                    s.charge_helper(&agent, $helper)?;
                     let body: Value = read_json(request).await?;
                     blocking(&s, move |_| policy_helper($helper, body)).await
                 }
@@ -1059,7 +1392,8 @@ helper_post!(post_policy_simulate, "simulate");
 async fn post_policy_diff<J: ServeJournal>(State(s): Shared<J>, request: Request) -> Response {
     respond(
         async {
-            s.authenticate_agent(request.headers())?;
+            let agent = s.authenticate_agent(request.headers())?;
+            s.charge_helper(&agent, "diff")?;
             let body: DiffRequest = read_json(request).await?;
             blocking(&s, move |s| s.policy_diff(body)).await
         }
@@ -1067,22 +1401,33 @@ async fn post_policy_diff<J: ServeJournal>(State(s): Shared<J>, request: Request
     )
 }
 
+/// Exchange the launch secret for THE operator session (ending any other)
+/// and write a new single-use launch file for the next sign-in.
 async fn session<J: ServeJournal>(State(s): Shared<J>, headers: HeaderMap) -> Response {
-    if s.sessions.valid(&headers) {
-        return axum::Json(json!({"authenticated": true})).into_response();
-    }
-    let Some(cookie) = auth::bearer(&headers).and_then(|secret| s.sessions.exchange(secret)) else {
+    let Some(id) = auth::bearer(&headers).and_then(|secret| s.sessions.exchange(secret)) else {
         return ApiError::unauthorized(
             "invalid_launch_secret",
-            "the launch link is invalid or already used; restart trustgraph serve for a new one",
+            "this sign-in link is not valid or was already used. If you did not use it, stop the server: someone else holds the operator session",
         )
         .into_response();
     };
-    let mut response = axum::Json(json!({"authenticated": true})).into_response();
-    if let Ok(v) = HeaderValue::from_str(&cookie) {
-        response.headers_mut().insert(header::SET_COOKIE, v);
+    let expires_at = s
+        .clock
+        .wall()
+        .saturating_add(s.sessions.lifetime().as_secs());
+    let server = s.clone();
+    let written = tokio::task::spawn_blocking(move || server.write_launch_file()).await;
+    match written {
+        Ok(Ok(path)) => eprintln!(
+            "trustgraph serve: operator signed in; a new single-use sign-in link is at {}",
+            path.display()
+        ),
+        Ok(Err(e)) => {
+            eprintln!("trustgraph serve: cannot write the next operator launch file: {e}")
+        }
+        Err(_) => eprintln!("trustgraph serve: cannot write the next operator launch file"),
     }
-    response
+    axum::Json(json!({"session": id, "expires_at": expires_at})).into_response()
 }
 
 async fn operator_state<J: ServeJournal>(State(s): Shared<J>, headers: HeaderMap) -> Response {
@@ -1192,6 +1537,9 @@ pub struct Options {
     pub operator: String,
     pub state: Option<PathBuf>,
     pub allow_state_in_repository: bool,
+    /// Apply a policy file that differs from the active policy at start,
+    /// instead of storing it as a proposal for the operator.
+    pub activate_policy_file: bool,
     pub limits: Limits,
 }
 
@@ -1243,7 +1591,7 @@ fn default_state() -> Result<PathBuf, StartError> {
 pub fn start(options: Options, port: u16) -> Result<Arc<Server<FileJournal>>, StartError> {
     let text = read_policy(&options.policy)?;
     let parsed = parse(&text);
-    let Some(policy) = parsed.policy else {
+    let Some(file_policy) = parsed.policy else {
         let lines: Vec<String> = parsed
             .diagnostics
             .iter()
@@ -1254,20 +1602,6 @@ pub fn start(options: Options, port: u16) -> Result<Arc<Server<FileJournal>>, St
             format!("the policy file is invalid:\n{}", lines.join("\n")),
         ));
     };
-    if !policy
-        .groups
-        .values()
-        .any(|members| members.contains(&options.operator))
-    {
-        return Err(start_error(
-            2,
-            format!(
-                "--operator `{}` is not a person in any group of {}; name a person listed under `groups`",
-                options.operator,
-                options.policy.display()
-            ),
-        ));
-    }
     let state = match options.state {
         Some(state) => state,
         None => default_state()?,
@@ -1282,7 +1616,8 @@ pub fn start(options: Options, port: u16) -> Result<Arc<Server<FileJournal>>, St
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     let mut repositories: Vec<PathBuf> = Vec::new();
-    repositories.extend(git_root(policy_dir));
+    let policy_repository = git_root(policy_dir);
+    repositories.extend(policy_repository.clone());
     if let Ok(cwd) = std::env::current_dir() {
         repositories.extend(git_root(&cwd));
     }
@@ -1291,7 +1626,12 @@ pub fn start(options: Options, port: u16) -> Result<Arc<Server<FileJournal>>, St
         .map_err(|e| start_error(2, e.to_string()))?;
     let journal = FileJournal::open(&state)
         .map_err(|e| start_error(2, format!("cannot open the journal: {e}")))?;
-    let runtime = Runtime::open(journal, &text, unix_now()).map_err(|e| match e {
+    let mode = if options.activate_policy_file {
+        PolicyFile::Activate
+    } else {
+        PolicyFile::Propose
+    };
+    let runtime = Runtime::open_with(journal, &text, unix_now(), mode).map_err(|e| match e {
         trustgraph_engine::OpenError::InvalidPolicy(diagnostics) => {
             let lines: Vec<String> = diagnostics
                 .iter()
@@ -1304,7 +1644,34 @@ pub fn start(options: Options, port: u16) -> Result<Arc<Server<FileJournal>>, St
         }
         other => start_error(2, format!("cannot open the journal: {other}")),
     })?;
-    Server::new(
+    // The operator must be a person of the policy actually in force, which
+    // need not be the file's.
+    let active = runtime
+        .engine()
+        .policy()
+        .ok_or_else(|| start_error(2, "the journal has no active policy"))?;
+    if !active
+        .groups
+        .values()
+        .any(|members| members.contains(&options.operator))
+    {
+        return Err(start_error(
+            2,
+            format!(
+                "--operator `{}` is not a person in any group of the active policy (revision {}); name a person listed under `groups`",
+                options.operator,
+                runtime.engine().policy_revision()
+            ),
+        ));
+    }
+    let mut report = file_report(runtime.file_outcome(), active, &file_policy);
+    if let Some(repository) = policy_repository {
+        report.push(format!(
+            "warning: the policy file is inside the Git repository {}; agents working there can edit it. Changes to it never apply without the operator.",
+            repository.display()
+        ));
+    }
+    Server::build(
         runtime,
         Settings {
             operator: options.operator,
@@ -1312,8 +1679,53 @@ pub fn start(options: Options, port: u16) -> Result<Arc<Server<FileJournal>>, St
             state_dir: state,
             limits: options.limits,
         },
+        Arc::new(SystemClock::default()),
+        report,
     )
     .map_err(|e| start_error(2, format!("cannot write agent tokens: {e}")))
+}
+
+/// `WIDENS subject: summary` lines, as `trustgraph policy diff` prints them.
+fn diff_lines(old: &Policy, new: &Policy) -> Vec<String> {
+    let changes = trustgraph_policy::diff(old, new).changes;
+    if changes.is_empty() {
+        return vec!["  No changes.".into()];
+    }
+    changes
+        .iter()
+        .map(|c| {
+            let tag = match c.kind {
+                ChangeKind::Widens => "WIDENS ",
+                ChangeKind::Narrows => "narrows",
+                ChangeKind::Neutral => "neutral",
+            };
+            format!("  {tag} {}: {}", c.subject, c.summary)
+        })
+        .collect()
+}
+
+/// What to tell the person at the terminal about the policy file.
+fn file_report(outcome: &FileOutcome, active: &Policy, file: &Policy) -> Vec<String> {
+    let how = "To apply it, activate it on the operator page, or restart once with --activate-policy-file.";
+    let mut lines = Vec::new();
+    match outcome {
+        FileOutcome::Genesis | FileOutcome::Unchanged => {}
+        FileOutcome::Proposed { .. } | FileOutcome::AlreadyRecorded { proposal: true, .. } => {
+            lines.push("The policy file differs from the active policy. It was NOT applied; it is stored as a proposal from the file. Changes it would make:".into());
+            lines.extend(diff_lines(active, file));
+            lines.push(how.into());
+        }
+        FileOutcome::AlreadyRecorded { .. } => {
+            lines.push("The policy file differs from the active policy. It was applied or proposed before and is not proposed again. Changes it would make:".into());
+            lines.extend(diff_lines(active, file));
+            lines.push("To apply it, restart once with --activate-policy-file.".into());
+        }
+        FileOutcome::Activated { previous } => {
+            lines.push("Applied the policy file (--activate-policy-file). Changes from the previous policy:".into());
+            lines.extend(diff_lines(previous, file));
+        }
+    }
+    lines
 }
 
 /// `trustgraph serve`: returns the process exit code.
@@ -1354,13 +1766,22 @@ pub async fn main(options: Options, port: u16) -> i32 {
     println!("Agent tokens: {}", server.token_dir().display());
     println!(
         "Policy in force: revision {revision} ({}), digest {short}",
-        if source == "file" {
-            "from the policy file"
-        } else {
+        if source != "file" {
             "activated in service"
+        } else if server
+            .startup_report()
+            .first()
+            .is_some_and(|line| line.starts_with("The policy file differs"))
+        {
+            "from an earlier version of the policy file"
+        } else {
+            "from the policy file"
         }
     );
     println!("Operator: {}", server.settings().operator);
+    for line in server.startup_report() {
+        println!("{line}");
+    }
     let app = router(server);
     match axum::serve(listener, app)
         .with_graceful_shutdown(async {
@@ -1417,6 +1838,35 @@ mod tests {
         assert!(!PAGE_JS.contains("setAttribute('style'"));
         assert!(!PAGE_JS.contains("eval("));
         assert!(!PAGE_JS.contains("window.confirm"));
+    }
+
+    #[test]
+    fn a_token_held_by_two_agents_authenticates_nobody() {
+        let state = tempfile::tempdir().unwrap();
+        let runtime = Runtime::open(MemoryJournal::new(), trustgraph_policy::STARTER, 0).unwrap();
+        let server = Server::new(
+            runtime,
+            Settings {
+                operator: "leo".into(),
+                port: 1,
+                state_dir: state.path().to_path_buf(),
+                limits: Limits::default(),
+            },
+        )
+        .unwrap();
+        let shared = "ab".repeat(32);
+        *server.tokens.write().unwrap() = vec![
+            ("mailer".into(), shared.clone()),
+            ("planner".into(), shared.clone()),
+            ("other".into(), "cd".repeat(32)),
+        ];
+        let mut headers = HeaderMap::new();
+        let bearer = |t: &str| HeaderValue::from_str(&format!("Bearer {t}")).unwrap();
+        headers.insert(header::AUTHORIZATION, bearer(&shared));
+        let error = server.authenticate_agent(&headers).unwrap_err();
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        headers.insert(header::AUTHORIZATION, bearer(&"cd".repeat(32)));
+        assert_eq!(server.authenticate_agent(&headers).unwrap(), "other");
     }
 
     #[test]

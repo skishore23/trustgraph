@@ -69,12 +69,14 @@ fn tools() -> Vec<Tool> {
                 .open_world(false),
         )
     };
+    // Every call of these is journaled (a check records a decision), so
+    // none is read-only or idempotent, even when the answer repeats.
     let writes = |t: Tool| {
         t.with_annotations(
             ToolAnnotations::new()
                 .read_only(false)
                 .destructive(false)
-                .idempotent(true)
+                .idempotent(false)
                 .open_world(false),
         )
     };
@@ -212,6 +214,18 @@ impl<J: ServeJournal> Tools<J> {
         name: &str,
         arguments: Value,
     ) -> Result<Value, ApiError> {
+        let helper = match name {
+            "policy_schema" => Some("schema"),
+            "policy_check" => Some("check"),
+            "policy_test" => Some("test"),
+            "policy_explain" => Some("explain"),
+            "policy_diff" => Some("diff"),
+            "policy_simulate" => Some("simulate"),
+            _ => None,
+        };
+        if let Some(helper) = helper {
+            server.charge_helper(agent, helper)?;
+        }
         match name {
             "register_source" => server.register_source(agent, args::<SourceRequest>(arguments)?),
             "record_output" => server.record_output(agent, args::<OutputRequest>(arguments)?),
@@ -350,6 +364,25 @@ mod tests {
             }
             let description = tool.description.as_deref().unwrap_or_default();
             assert!(!description.is_empty() && description.len() < 300, "{name}");
+        }
+        for tool in tools() {
+            let annotations = tool.annotations.clone().unwrap();
+            let journaled = matches!(
+                tool.name.as_ref(),
+                "register_source" | "record_output" | "check" | "policy_propose"
+            );
+            assert_eq!(
+                annotations.read_only_hint,
+                Some(!journaled),
+                "{}",
+                tool.name
+            );
+            assert_eq!(
+                annotations.idempotent_hint,
+                Some(!journaled),
+                "{}",
+                tool.name
+            );
         }
         let check = tools().into_iter().find(|t| t.name == "check").unwrap();
         assert!(
