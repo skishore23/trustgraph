@@ -332,7 +332,7 @@ mod unix {
                 .unwrap()
                 .success()
         );
-        for cmd in ["check", "test", "explain"] {
+        for cmd in ["check", "test", "explain", "simulate"] {
             let mut child = Command::new(env!("CARGO_BIN_EXE_trustgraph"))
                 .current_dir(d.path())
                 .args(["policy", cmd, "p.fifo", "--json"])
@@ -353,6 +353,10 @@ mod unix {
                 std::thread::sleep(Duration::from_millis(20));
             };
             assert_eq!(status.code(), Some(2), "{cmd}");
+            let mut body = String::new();
+            std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut body).unwrap();
+            let v: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["error"]["code"], "io", "{cmd}");
         }
     }
 

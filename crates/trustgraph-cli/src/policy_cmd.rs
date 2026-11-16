@@ -545,7 +545,13 @@ fn thousands(n: u64) -> String {
 /// whether it had to be converted lossily because it is not UTF-8.
 fn shell_quote(path: &Path) -> (String, bool) {
     let lossy = path.to_str().is_none();
-    let text = path.to_string_lossy();
+    let lossy_text = path.to_string_lossy();
+    // A leading `-` would be read as an option; `./` keeps it a path.
+    let text = if lossy_text.starts_with('-') {
+        std::borrow::Cow::Owned(format!("./{lossy_text}"))
+    } else {
+        lossy_text
+    };
     let plain = !text.is_empty()
         && text
             .chars()
@@ -724,6 +730,12 @@ mod tests {
         assert!(replay_for("my dir/p.yaml").contains("simulate 'my dir/p.yaml' --seed"));
         assert!(replay_for("it's.yaml").contains("simulate 'it'\\''s.yaml' --seed"));
         assert!(replay_for("a;rm -rf x.yaml").contains("simulate 'a;rm -rf x.yaml' --seed"));
+    }
+
+    #[test]
+    fn replay_line_protects_leading_dash() {
+        assert!(replay_for("-p.yaml").contains("simulate ./-p.yaml --seed"));
+        assert!(replay_for("-my p.yaml").contains("simulate './-my p.yaml' --seed"));
     }
 
     #[cfg(unix)]
