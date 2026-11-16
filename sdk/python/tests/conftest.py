@@ -70,9 +70,13 @@ def _post(url: str, body: object, headers: dict[str, str]) -> dict:
         return json.load(response)
 
 
-def start(tmp: Path, policy: str = "starter") -> Server:
+def start(tmp: Path, policy: str = "starter", text: str | None = None) -> Server:
+    """Start a server on a named policy; `text` replaces the file, keeping its operator."""
     path, operator = POLICIES[policy]
-    shutil.copy(path, tmp / "policy.yaml")
+    if text is None:
+        shutil.copy(path, tmp / "policy.yaml")
+    else:
+        (tmp / "policy.yaml").write_text(text)
     state = tmp / "state"
     log = tmp / "serve.log"
     with open(log, "w") as out:

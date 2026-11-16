@@ -1,0 +1,11 @@
+sources:
+  read_file:
+    - source: salaries
+      when: {path: "hr/*"}
+    - source: roadmap
+      when: {path: "product/*"}
+actions:
+  post_message:
+    action: post_to_engineering
+    content: text
+unmapped: block
