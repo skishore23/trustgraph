@@ -1473,3 +1473,109 @@ fn operator_views_list_pending_approved_and_proposals() {
     assert!(engine.pending_decisions(13).is_empty());
     assert!(engine.live_approvals(13).is_empty());
 }
+
+fn carry(engine: &mut Engine, at: u64, session: &str, agent: &str, artifacts: &[&String]) -> Reply {
+    engine.apply(
+        at,
+        &Event::SessionCarry {
+            session: session.into(),
+            agent: agent.into(),
+            artifacts: artifacts.iter().map(|a| a.to_string()).collect(),
+        },
+    )
+}
+
+#[test]
+fn gateway_sessions_carry_what_the_agent_may_use_and_change_no_decision() {
+    let mut engine = genesis(SPEC);
+    let salaries = register(&mut engine, 1, "salaries", 1);
+    let roadmap = register(&mut engine, 1, "roadmap", 2);
+    let prices = register(&mut engine, 1, "price_sheet", 3);
+
+    let reply = carry(&mut engine, 2, "s1", "planner", &[&salaries]);
+    assert_eq!(
+        reply,
+        Reply::Session {
+            session: "s1".into(),
+            artifacts: vec![salaries.clone()],
+        }
+    );
+    let Reply::Session { artifacts, .. } = carry(&mut engine, 3, "s1", "planner", &[&roadmap])
+    else {
+        panic!("expected a session");
+    };
+    assert_eq!(artifacts.len(), 2);
+    let session = engine.session("s1").unwrap();
+    assert_eq!(session.agent, "planner");
+    assert_eq!(session.started_at, 2);
+    assert_eq!(session.sources, vec!["roadmap", "salaries"]);
+
+    // Every refusal leaves the sessions as they were.
+    let before = engine.sessions();
+    let mailer_reads_salaries = carry(&mut engine, 4, "s2", "mailer", &[&salaries]);
+    assert_eq!(
+        rejected_code(&mailer_reads_salaries),
+        "agent_cannot_use_source"
+    );
+    let other_agent = carry(&mut engine, 4, "s1", "mailer", &[&prices]);
+    assert_eq!(rejected_code(&other_agent), "session_agent_mismatch");
+    let unknown = carry(&mut engine, 4, "s1", "planner", &[&"nope".to_string()]);
+    assert_eq!(rejected_code(&unknown), "unknown_artifact");
+    let stranger = carry(&mut engine, 4, "s3", "stranger", &[&roadmap]);
+    assert_eq!(rejected_code(&stranger), "unknown_agent");
+    let empty = carry(&mut engine, 4, "s1", "planner", &[]);
+    assert_eq!(rejected_code(&empty), "invalid_inputs");
+    assert_eq!(engine.sessions(), before);
+
+    // A session changes no decision: the check is about the output's lineage.
+    let both = record(&mut engine, 5, "planner", &[&salaries, &roadmap], 9);
+    let digest = engine.state_digest();
+    let ended = engine.apply(
+        6,
+        &Event::EndSession {
+            session: "s1".into(),
+        },
+    );
+    assert_eq!(
+        ended,
+        Reply::SessionEnded {
+            session: "s1".into()
+        }
+    );
+    assert_ne!(engine.state_digest(), digest, "sessions are state");
+    assert!(engine.session("s1").is_none());
+    let again = engine.apply(
+        6,
+        &Event::EndSession {
+            session: "s1".into(),
+        },
+    );
+    assert_eq!(rejected_code(&again), "unknown_session");
+    let decision = engine.apply(7, &check_event("planner", &both, "post_to_slack"));
+    assert!(
+        matches!(
+            decision,
+            Reply::Decision {
+                verdict: Verdict::Deny,
+                ..
+            }
+        ),
+        "{decision:?}"
+    );
+}
+
+#[test]
+fn gateway_sessions_are_capped() {
+    let mut engine = genesis(SPEC);
+    let roadmap = register(&mut engine, 1, "roadmap", 2);
+    for n in 0..64 {
+        let reply = carry(&mut engine, 2, &format!("s{n}"), "planner", &[&roadmap]);
+        assert!(matches!(reply, Reply::Session { .. }), "{reply:?}");
+    }
+    let over = carry(&mut engine, 2, "s64", "planner", &[&roadmap]);
+    assert_eq!(rejected_code(&over), "too_many_sessions");
+    // An existing session still takes more.
+    let salaries = register(&mut engine, 3, "salaries", 1);
+    let more = carry(&mut engine, 3, "s0", "planner", &[&salaries]);
+    assert!(matches!(more, Reply::Session { .. }), "{more:?}");
+}

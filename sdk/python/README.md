@@ -6,7 +6,7 @@ the standard library.
 
 ```sh
 pip install ./sdk/python                     # the core
-pip install "./sdk/python[langchain]"        # or [openai-agents], [claude-agent-sdk], [mcp]
+pip install "./sdk/python[langchain]"        # or [openai-agents], [claude-agent-sdk]
 ```
 
 - Reference: [docs/sdk-python.md](../../docs/sdk-python.md)

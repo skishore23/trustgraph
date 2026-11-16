@@ -27,7 +27,7 @@
 
   // The confirmation keys the page would render for `state`: an Approve for
   // each pending decision the operator can approve, an Activate for each
-  // proposal.
+  // proposal, an End for each gateway session.
   function confirmableKeys(state) {
     var keys = [];
     (state.pending || []).forEach(function (p) {
@@ -36,7 +36,21 @@
     (state.proposals || []).forEach(function (p) {
       keys.push('activate:' + p.proposal);
     });
+    gatewaySessions(state).forEach(function (s) {
+      keys.push('end:' + s.session);
+    });
     return keys;
+  }
+
+  function gatewaySessions(state) {
+    return (state.gateway && state.gateway.sessions) || [];
+  }
+
+  // Ending a session makes the gateway forget what it read, so the
+  // confirmation says exactly what the agent stops carrying.
+  function endSummary(s) {
+    return 'End this session? ' + s.agent + "'s later actions will no longer count what it read" +
+      (s.sources && s.sources.length ? ': ' + s.sources.join(', ') + '.' : ' (nothing yet).');
   }
 
   // True when a confirmation is open for an item `state` no longer has
@@ -89,6 +103,7 @@
     GONE: GONE,
     approvalSummary: approvalSummary,
     confirmableKeys: confirmableKeys,
+    endSummary: endSummary,
     proposer: proposer,
     staleConfirmation: staleConfirmation,
     createScheduler: createScheduler,
@@ -283,6 +298,39 @@
     });
   }
 
+  function renderSessions(state) {
+    var gateway = state.gateway;
+    $('gateway').hidden = !gateway;
+    if (!gateway) return;
+    var problems = $('gateway-problems');
+    problems.replaceChildren();
+    (gateway.problems || []).forEach(function (line) {
+      problems.appendChild(el('p', line, 'warn'));
+    });
+    var box = $('sessions');
+    box.replaceChildren();
+    var sessions = gatewaySessions(state);
+    if (!sessions.length) return empty(box, 'No live sessions (' + gateway.mode + ' mode).');
+    sessions.forEach(function (s) {
+      var key = 'end:' + s.session;
+      var item = el('div', null, 'item');
+      item.appendChild(el('p', s.agent + ' · since ' + clock(s.started_at)));
+      item.appendChild(el('p', 'carries: ' + (s.sources.length ? s.sources.join(', ') : 'nothing yet')));
+      item.appendChild(el('p', 'session ' + s.session, 'muted'));
+      if (confirming === key) {
+        confirmStep(item, key, endSummary(s), 'End now', function () {
+          act('/v1/operator/end-session', { session: s.session }, 'Ended the session of ' + s.agent + '.');
+        });
+      } else {
+        item.appendChild(button('End session', key, false, function () {
+          confirming = key;
+          load(true, 'yes:' + key);
+        }));
+      }
+      box.appendChild(item);
+    });
+  }
+
   function render(state, focusKey) {
     var active = document.activeElement;
     var key = focusKey || (active && active.getAttribute && active.getAttribute('data-key'));
@@ -298,6 +346,7 @@
     renderPending(state.pending);
     renderApprovals(state.approvals);
     renderProposals(state.proposals);
+    renderSessions(state);
     if (key) {
       var target = document.querySelector('[data-key="' + key.replace(/"/g, '') + '"]');
       if (target) target.focus();

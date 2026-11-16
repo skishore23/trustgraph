@@ -8,17 +8,20 @@
 - [Starter policy](crates/trustgraph-policy/starter.policy.yaml): the commented file written by `trustgraph policy init`.
 - [trustgraph serve](docs/serve.md): the local HTTP API and MCP endpoint agents use to register what they read, record what they wrote and check right before they act; per-agent tokens, the operator page, limits and the threat model.
 - [Python SDK](docs/sdk-python.md): `trustgraph.Client`, sessions (what was read follows what is written), `@source` / `@action` decorators, hand-off tokens, exceptions and fail-closed behaviour.
-- [Integrations](docs/integrations.md): LangChain / LangGraph, OpenAI Agents SDK, Claude Agent SDK and an MCP proxy; what each covers and what it does not.
+- [trustgraph gateway](docs/gateway.md): the MCP endpoint between agents and their MCP servers that agents cannot skip: it holds upstream credentials, records what each agent reads, checks every action before forwarding it; `gateway.yaml` reference, sessions, hand-off tools and threat model.
+- [Integrations](docs/integrations.md): LangChain / LangGraph, OpenAI Agents SDK and Claude Agent SDK; what each covers and what it does not.
 
 ## Examples
 
 - [examples/policies/](examples/policies/): six complete, tested policies (handoff, slack-digest, customer-email, pull-request-bot, support-replies, multi-agent-research).
 - [examples/python_client.py](examples/python_client.py): a dependency-free client for `trustgraph serve`.
-- [examples/integrations/](examples/integrations/): a hand-off example per integration (langgraph, openai-agents, claude-agent-sdk, mcp).
+- [examples/gateway/](examples/gateway/): the hand-off story through `trustgraph gateway`, with fake upstream MCP servers.
+- [examples/integrations/](examples/integrations/): a hand-off example per integration (langgraph, openai-agents, claude-agent-sdk).
 
 ## Commands
 
 - Print the JSON Schema of the policy file: `trustgraph policy schema`
 - Validate, test, explain and compare: `trustgraph policy check FILE`, `trustgraph policy test FILE`, `trustgraph policy explain FILE`, `trustgraph policy diff OLD NEW` (add `--json` for machine output)
 - Serve the runtime to agents over HTTP and MCP (`http://127.0.0.1:8787/mcp`, `Authorization: Bearer <agent token>`): `trustgraph serve --policy FILE --operator PERSON`
+- Put the gateway between agents and their MCP servers (`http://127.0.0.1:8787/gateway/mcp`): `trustgraph gateway --policy FILE --operator PERSON --config gateway.yaml`; validate a config: `trustgraph gateway check --config gateway.yaml --policy FILE`; relay for stdio-only MCP clients: `trustgraph gateway stdio --token-file FILE`
 - Stress a policy on the real runtime with seeded random scenarios (agents, policy changes, crashes, approval expiry) and check the safety invariants: `trustgraph policy simulate FILE [--seed 0] [--count 64] [--steps 200] [--json]`

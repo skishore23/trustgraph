@@ -14,7 +14,7 @@ session read to the next agent's session, so restrictions follow the work.
 | [LangChain / LangGraph](#langchain-and-langgraph) | Tool wrappers, or `ToolNode` `wrap_tool_call` / `create_agent` middleware | Only through tools you did not wrap or map |
 | [OpenAI Agents SDK](#openai-agents-sdk) | Function-tool input and output guardrails; run hooks for hand-offs | Only through tools you did not map, or tool kinds guardrails do not cover |
 | [Claude Agent SDK](#claude-agent-sdk) | `PreToolUse` / `PostToolUse` / `SubagentStart` / `SubagentStop` / `UserPromptSubmit` hooks | Only through tools you did not map; hooks see every tool call, built-in and MCP |
-| [MCP proxy](#mcp-proxy) | A process between any MCP client and one MCP server | Not if the proxy alone holds the upstream's credentials |
+| [MCP: `trustgraph gateway`](#mcp) | One MCP endpoint between any MCP client and its MCP servers (Rust, not the SDK) | Not if the gateway alone holds the upstreams' credentials |
 
 The texts the agent gets, and every case that fails closed, are in
 [Exceptions and failing closed](sdk-python.md#exceptions-and-failing-closed);
@@ -22,9 +22,9 @@ what each integration does about resumed conversations is in
 [Sessions](sdk-python.md#sessions).
 
 A library integration is only as strong as the host program: a tool called
-without the wrapper, or a tool missing from the map, is not checked. The MCP
-proxy is the option an agent cannot skip, provided only the proxy can reach
-the upstream server. Sessions over-restrict by design (see
+without the wrapper, or a tool missing from the map, is not checked. The
+gateway is the option an agent cannot skip, provided only the gateway can
+reach the upstream servers. Sessions over-restrict by design (see
 [Sessions](sdk-python.md#sessions)).
 
 ## LangChain and LangGraph
@@ -226,57 +226,10 @@ detection looks for `tool_result` entries in the transcript, in a format the
 tests write rather than one observed from the CLI. Unmapped tools, including `Bash`, run untouched: a shell command
 can read a source or post somewhere without a check.
 
-## MCP proxy
+## MCP
 
-Tested with mcp 2.3.0.
-
-```sh
-pip install "./sdk/python[mcp]"
-trustgraph-mcp-proxy --map mapping.yaml --token-file ~/.trustgraph/serve/tokens/planner.token \
-    -- python files_server.py            # or --upstream-url http://127.0.0.1:9000/mcp
-```
-
-```yaml
-sources:
-  read_file:
-    - { source: salaries, when: { path: "hr/*" } }   # argument matchers: globs on the value
-    - { source: roadmap, when: { path: "product/*" } }
-actions:
-  post_message: { action: post_to_engineering, content: text, recipients: to }
-resources:
-  "file:///hr/*": salaries
-unmapped: block                                      # unclassified | allow | block
-```
-
-Point the MCP client at the proxy command instead of the server.
-
-- **What it does.** The proxy serves MCP on stdio to one client and forwards
-  to one upstream server, over stdio or streamable HTTP. A mapped action is
-  checked before the call is forwarded; `content` names the argument recorded
-  as the output (default: all arguments) and `recipients` the argument naming
-  who receives it (default: the action's whole audience). A mapped tool's
-  result, or a mapped resource's contents, is registered as the source before
-  it is returned. A tool whose matchers all fail is unmapped.
-- **Unmapped tools and resources.** `unclassified` forwards them and
-  registers what they return as source `unclassified`; `allow` forwards them
-  untracked; `block` hides them from listings and refuses them. Without
-  `unmapped:`, the proxy uses `unclassified` if the active policy defines that
-  source and `block` otherwise.
-- **Blocked calls** are an MCP error result (`isError`) and are not
-  forwarded.
-- **Sessions.** One per proxy process. `--handoff-file PATH` writes the hand-off
-  token after every read; `--carry TOKEN` (or `TRUSTGRAPH_CARRY`) starts from
-  one. If this agent is not cleared for what the token carries, the proxy does
-  not start. A bad mapping file also stops it from starting.
-  Example: [examples/integrations/mcp](../examples/integrations/mcp).
-- **Cannot be skipped** when the upstream server's credentials are given only
-  to the proxy and the agent cannot read them or reach the upstream another
-  way. The upstream command gets a minimal environment plus the variables
-  named with `--pass-env NAME`.
-
-Not covered: prompts, sampling and other MCP features are not proxied; only
-tools and resources are. The proxy serves stdio only (one client); it does not
-serve HTTP, and it sends no credentials of its own to an HTTP upstream. Unmapped tools under `unclassified` or `allow` are forwarded
-without a check, so a posting tool you forgot to map can send anything; use
-`block` for the strict form. A tool's own side effects beyond its result (a
-file it writes, a request it makes) are not tracked.
+For MCP servers, use [`trustgraph gateway`](gateway.md) instead of a
+library. It is part of the `trustgraph` binary, serves one MCP endpoint to
+every agent, holds the upstream servers' credentials, registers what listed
+tools return and checks listed actions before forwarding them. Hand-offs are
+two tools of its own. Example: [examples/gateway](../examples/gateway).

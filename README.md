@@ -131,6 +131,25 @@ or [llms.txt](llms.txt). Protect the policy file with code review.
 
 ## Use it in your system
 
+### `trustgraph gateway`: the option agents cannot skip
+
+Put the gateway between your agents and the MCP servers they use. It holds
+the servers' credentials, records what each agent reads through them, and
+checks every action against it before forwarding the call. A `gateway.yaml`
+says which tool reads which source and which tool is which action:
+
+```sh
+trustgraph gateway --policy trustgraph.policy.yaml --operator leo --config gateway.yaml
+```
+
+```text
+planner slack__post_message #engineering: error: TrustGraph gateway: `post_to_engineering` was not forwarded: denied: `salaries` is readable by hr only; engineering (ravi, sam) is not included (denied)
+```
+
+Config, sessions, hand-offs and the threat model:
+[docs/gateway.md](docs/gateway.md). A runnable example:
+[examples/gateway](examples/gateway).
+
 ### `trustgraph serve`
 
 A local service over HTTP and MCP, so any agent stack can register what it
@@ -184,9 +203,8 @@ deny denied: `salaries` is readable by hr only; engineering (ravi, sam) is not i
 ```
 
 Integrations, each with a hand-off example: [LangChain / LangGraph, OpenAI
-Agents SDK, Claude Agent SDK and an MCP proxy](docs/integrations.md). A
-wrapper checks only the tools it wraps; the MCP proxy cannot be skipped when
-it alone holds the upstream's credentials.
+Agents SDK and Claude Agent SDK](docs/integrations.md). A wrapper checks only
+the tools it wraps.
 
 ### Rust crates
 
@@ -217,8 +235,8 @@ states exactly what each covers.
 
 - **It only knows what you tell it.** If your system does not report a source
   the agent read, TrustGraph cannot account for it.
-- **It decides; it does not act.** Your system must ask right before it acts,
-  and act only on *allow*.
+- **It decides; it does not act.** Except through the gateway, your system
+  must ask right before it acts, and act only on *allow*.
 - **The rule is strict.** One sensitive input restricts the whole output to
   that input's readers. There is no "this summary is safe to share" exception
   yet.
@@ -239,9 +257,10 @@ read. TrustGraph decides where what it wrote may go. Use both.
 | `crates/trustgraph-core` | Proof-friendly kernels and their Kani harnesses |
 | `crates/trustgraph-framework` | The lineage graph the engine is built on |
 | `crates/trustgraph-sim` | The seeded policy simulator and its safety checks |
-| `crates/trustgraph-cli` | The `trustgraph` command: `policy` and `serve` |
+| `crates/trustgraph-cli` | The `trustgraph` command: `policy`, `serve` and `gateway` |
 | `sdk/python` | The Python SDK and its framework integrations |
 | `examples/policies` | Six worked policies |
+| `examples/gateway` | The hand-off story through the gateway |
 | `examples/integrations` | A hand-off example per integration |
 | `docs/agents` | The policy-writing guide for agents |
 | `web`, `api`, `hosted` | The public site and its playground endpoint |

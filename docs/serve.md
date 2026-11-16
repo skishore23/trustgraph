@@ -14,6 +14,10 @@ activate; and a changed policy file waits for the operator. These hold only
 while agents cannot read the state directory, which means running them as a
 different OS user or in a sandbox; see [Threat model](#threat-model).
 
+To put TrustGraph between agents and the MCP servers they use, so that agents
+cannot skip it, run [`trustgraph gateway`](gateway.md): this server plus an
+MCP endpoint that holds the upstreams' credentials.
+
 ## Five-minute quickstart
 
 Install the CLI (see the [README](../README.md#quickstart)), then write the

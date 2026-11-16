@@ -54,11 +54,24 @@ pub enum Event {
     ProposeFromFile {
         policy: String,
     },
+    /// The gateway, for an agent: gateway session `session`, which belongs
+    /// to `agent`, now also carries `artifacts` (what the agent read through
+    /// the gateway or received in a hand-off). It is recorded so a restart
+    /// can rebuild the session; it changes no decision.
+    SessionCarry {
+        session: String,
+        agent: String,
+        artifacts: Vec<String>,
+    },
+    /// System or operator: forget gateway session `session`.
+    EndSession {
+        session: String,
+    },
 }
 
 impl Event {
-    /// True for the events an agent token may send. None of them can change
-    /// the active policy.
+    /// True for the events an agent token may send (`SessionCarry` only
+    /// through the gateway). None of them can change the active policy.
     pub fn agent_callable(&self) -> bool {
         matches!(
             self,
@@ -66,6 +79,7 @@ impl Event {
                 | Event::RecordOutput { .. }
                 | Event::Check { .. }
                 | Event::ProposePolicy { .. }
+                | Event::SessionCarry { .. }
         )
     }
 
@@ -141,6 +155,27 @@ impl Event {
                 field("proposal", proposal)?;
                 field("operator", operator)
             }
+            Event::SessionCarry {
+                session,
+                agent,
+                artifacts,
+            } => {
+                field("session", session)?;
+                field("agent", agent)?;
+                if artifacts.is_empty() || artifacts.len() > MAX_INPUTS {
+                    return Err(reject(
+                        "invalid_inputs",
+                        format!(
+                            "a session carries 1 to {MAX_INPUTS} artifacts at a time, not {}",
+                            artifacts.len()
+                        ),
+                    ));
+                }
+                artifacts
+                    .iter()
+                    .try_for_each(|artifact| field("artifacts", artifact))
+            }
+            Event::EndSession { session } => field("session", session),
         }
     }
 }
@@ -191,6 +226,14 @@ pub enum Reply {
     Rejected {
         code: String,
         message: String,
+    },
+    /// `SessionCarry`: everything the session now carries, sorted.
+    Session {
+        session: String,
+        artifacts: Vec<String>,
+    },
+    SessionEnded {
+        session: String,
     },
 }
 

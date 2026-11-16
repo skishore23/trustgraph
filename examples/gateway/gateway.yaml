@@ -1,0 +1,31 @@
+# trustgraph gateway config for the hand-off example. Run from the
+# repository root: the fake upstream is crates/trustgraph-cli/examples/fake_upstream.rs.
+version: 1
+session: connection
+
+upstreams:
+  drive:                                   # a file store
+    command: [target/debug/examples/fake_upstream, --stdio]
+  slack:                                   # a chat; its token stays with the gateway
+    command: [target/debug/examples/fake_upstream, --stdio]
+    env: { SLACK_BOT_TOKEN: "${env:SLACK_BOT_TOKEN}" }
+  # A remote server over streamable HTTP looks like this:
+  #   url: https://drive.example.com/mcp
+  #   headers: { Authorization: "Bearer ${env:DRIVE_TOKEN}" }
+
+tools:
+  drive.read_file:
+    reads:
+      - when: { path: "HR/Compensation/**" }
+        source: salaries
+      - when: { path: "Product/**" }
+        source: roadmap
+      - when: { path: "Public/**" }
+        source: benchmarks
+    otherwise: salaries                    # restrictive: an unmatched path counts as salaries
+  slack.post_message:
+    acts:
+      - when: { channel: "#engineering" }
+        action: post_to_engineering
+        content: text
+    otherwise: block

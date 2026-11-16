@@ -28,13 +28,14 @@
 //! with 503 `restart_required` until the process is restarted.
 
 mod auth;
+pub mod gateway;
 pub mod mcp;
 mod tokens;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
@@ -347,6 +348,20 @@ pub struct Server<J: ServeJournal> {
     report: Vec<String>,
     /// Why the server stopped serving; set once, never cleared.
     broken: Mutex<Option<String>>,
+    /// The gateway's view for the operator page, when one is attached.
+    gateway: OnceLock<Arc<dyn GatewayView>>,
+}
+
+/// What the operator routes need from an attached gateway.
+pub(crate) trait GatewayView: Send + Sync {
+    /// `connection` or `agent`.
+    fn mode(&self) -> &'static str;
+    /// Problems of the gateway config against `policy`, as lines.
+    fn problems(&self, policy: &Policy) -> Vec<String>;
+    /// Live MCP connections in `connection` mode: `(session, agent, started_at)`.
+    fn connections(&self) -> Vec<(String, String, u64)>;
+    /// Close the MCP connection of `session`; false when there is none.
+    fn close(&self, session: &str) -> bool;
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -555,6 +570,12 @@ struct ProposalRequest {
     proposal: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionRequest {
+    session: String,
+}
+
 impl<J: ServeJournal> Server<J> {
     /// A server over an opened runtime. Writes the token files of every agent
     /// in the active policy; any token problem is an error.
@@ -622,6 +643,7 @@ impl<J: ServeJournal> Server<J> {
             behind_until: AtomicU64::new(behind_until),
             report,
             broken: Mutex::new(None),
+            gateway: OnceLock::new(),
         }))
     }
 
@@ -1168,9 +1190,40 @@ impl<J: ServeJournal> Server<J> {
                 })
             })
             .collect();
+        let gateway = self.gateway.get().map(|g| {
+            let mut sessions: BTreeMap<String, Value> = engine
+                .sessions()
+                .into_iter()
+                .map(|s| {
+                    let row = json!({
+                        "session": s.session,
+                        "agent": s.agent,
+                        "started_at": s.started_at,
+                        "sources": s.sources,
+                    });
+                    (s.session, row)
+                })
+                .collect();
+            for (session, agent, started_at) in g.connections() {
+                sessions.entry(session.clone()).or_insert_with(|| {
+                    json!({
+                        "session": session,
+                        "agent": agent,
+                        "started_at": started_at,
+                        "sources": [],
+                    })
+                });
+            }
+            json!({
+                "mode": g.mode(),
+                "problems": policy.map(|p| g.problems(p)).unwrap_or_default(),
+                "sessions": sessions.into_values().collect::<Vec<_>>(),
+            })
+        });
         Ok(json!({
             "operator": self.settings.operator,
             "now": now,
+            "gateway": gateway,
             "clock_behind": self.behind_until.load(Ordering::SeqCst) != 0,
             "policy": {
                 "revision": engine.policy_revision(),
@@ -1202,6 +1255,31 @@ impl<J: ServeJournal> Server<J> {
         let reviewer = self.settings.operator.clone();
         let reply = self.handle(&mut rt, Event::Revoke { decision, reviewer })?;
         reply_value(reply)
+    }
+
+    /// End a gateway session: forget what it carries and, in `connection`
+    /// mode, close its MCP connection. Only the operator can.
+    fn end_session(&self, session: String) -> ApiResult {
+        let mut rt = self.lock()?;
+        let carried = rt.engine().session(&session).is_some();
+        let connected = self.gateway.get().is_some_and(|g| g.close(&session));
+        if carried {
+            let event = Event::EndSession {
+                session: session.clone(),
+            };
+            match self.handle(&mut rt, event)? {
+                Reply::SessionEnded { .. } => {}
+                other => return reply_value(other),
+            }
+        }
+        if !carried && !connected {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "unknown_session",
+                "no live session with that id",
+            ));
+        }
+        Ok(json!({"session": session, "ended": true}))
     }
 
     fn activate(&self, proposal: String) -> ApiResult {
@@ -1534,6 +1612,17 @@ async fn operator_activate<J: ServeJournal>(State(s): Shared<J>, request: Reques
     )
 }
 
+async fn operator_end_session<J: ServeJournal>(State(s): Shared<J>, request: Request) -> Response {
+    respond(
+        async {
+            s.require_operator(request.headers())?;
+            let body: SessionRequest = read_json(request).await?;
+            blocking(&s, move |s| s.end_session(body.session)).await
+        }
+        .await,
+    )
+}
+
 async fn operator_propose<J: ServeJournal>(State(s): Shared<J>, request: Request) -> Response {
     respond(
         async {
@@ -1555,6 +1644,11 @@ async fn not_found() -> Response {
 
 /// Every route, behind the Host/Origin/health guard.
 pub fn router<J: ServeJournal>(server: Arc<Server<J>>) -> Router {
+    router_with(server, Router::new())
+}
+
+/// `router` with `extra` routes (the gateway's) behind the same guard.
+fn router_with<J: ServeJournal>(server: Arc<Server<J>>, extra: Router<Arc<Server<J>>>) -> Router {
     Router::new()
         .route(
             "/",
@@ -1583,7 +1677,9 @@ pub fn router<J: ServeJournal>(server: Arc<Server<J>>) -> Router {
         .route("/v1/operator/revoke", post(operator_revoke::<J>))
         .route("/v1/operator/activate", post(operator_activate::<J>))
         .route("/v1/operator/propose", post(operator_propose::<J>))
+        .route("/v1/operator/end-session", post(operator_end_session::<J>))
         .merge(mcp::router(server.clone()))
+        .merge(extra)
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(server.clone(), guard::<J>))
         .with_state(server)
@@ -1829,23 +1925,31 @@ pub async fn main(options: Options, port: u16) -> i32 {
             return e.code;
         }
     };
+    if let Err(code) = banner(&server, port, "TrustGraph serve", "/mcp") {
+        return code;
+    }
+    run(listener, router(server)).await
+}
+
+/// Write the launch file and print what the person at the terminal needs.
+fn banner(server: &Server<FileJournal>, port: u16, title: &str, mcp: &str) -> Result<(), i32> {
     let launch = match server.write_launch_file() {
         Ok(path) => path,
         Err(e) => {
             eprintln!("error: cannot write the operator launch file: {e}");
-            return 2;
+            return Err(2);
         }
     };
     let (revision, digest, source) = match server.policy_summary() {
         Ok(summary) => summary,
         Err(e) => {
             eprintln!("error: {}", e.message);
-            return 2;
+            return Err(2);
         }
     };
     let short = digest.get(..12).unwrap_or(&digest);
-    println!("TrustGraph serve: http://127.0.0.1:{port}");
-    println!("MCP endpoint: http://127.0.0.1:{port}/mcp");
+    println!("{title}: http://127.0.0.1:{port}");
+    println!("MCP endpoint: http://127.0.0.1:{port}{mcp}");
     println!("Operator sign-in (single use): {}", launch.display());
     println!("Agent tokens: {}", server.token_dir().display());
     println!(
@@ -1862,7 +1966,11 @@ pub async fn main(options: Options, port: u16) -> i32 {
     for line in server.startup_report() {
         println!("{line}");
     }
-    let app = router(server);
+    Ok(())
+}
+
+/// Serve `app` until Ctrl-C; the exit code.
+async fn run(listener: tokio::net::TcpListener, app: Router) -> i32 {
     match axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;

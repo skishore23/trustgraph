@@ -1,6 +1,6 @@
 [package]
 name = "trustgraph-cli"
-description = "The trustgraph command: write, check and test a policy, and serve it to agents over HTTP and MCP."
+description = "The trustgraph command: write, check and test a policy, serve it to agents over HTTP and MCP, and gate their MCP servers."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -23,7 +23,18 @@ serde_json.workspace = true
 clap.workspace = true
 tokio.workspace = true
 axum.workspace = true
-rmcp = { version = "=3.10.0", default-features = false, features = ["server", "transport-streamable-http-server"] }
+# The gateway is also an MCP client: of upstream servers over streamable
+# HTTP (rustls) or a child process's stdio, and, in `gateway stdio`, of itself.
+rmcp = { version = "=3.10.0", default-features = false, features = [
+    "server",
+    "client",
+    "transport-streamable-http-server",
+    "transport-streamable-http-client-reqwest",
+    "reqwest",
+    "transport-child-process",
+    "transport-io",
+] }
+serde_yaml = "0.9"
 [target.'cfg(unix)'.dependencies]
 # O_NOFOLLOW / O_NONBLOCK for token and launch files.
 libc = "0.2"
