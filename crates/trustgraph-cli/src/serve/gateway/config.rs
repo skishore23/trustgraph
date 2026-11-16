@@ -1159,25 +1159,22 @@ pub fn warnings(config: &Config) -> Vec<Problem> {
                     });
                 }
             }
-            let constrained: BTreeSet<&str> = rules
-                .iter()
-                .flat_map(|r| &r.when)
-                .map(|m| m.argument.as_str())
-                .collect();
-            let free: Vec<&str> = tool
-                .arguments
-                .iter()
-                .map(String::as_str)
-                .filter(|a| !constrained.contains(a))
-                .collect();
-            if !free.is_empty() {
-                out.push(Problem {
-                    path: join(&path, "arguments"),
-                    message: format!(
-                        "not constrained by any `when`: {}; each is hashed into the checked output and shown to the approver, but can hold anything, so it must not be able to choose who the call reaches",
-                        free.join(", ")
-                    ),
-                });
+            for (i, rule) in rules.iter().enumerate() {
+                let free: Vec<&str> = tool
+                    .arguments
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|a| !rule.when.iter().any(|m| m.argument == *a))
+                    .collect();
+                if !free.is_empty() {
+                    out.push(Problem {
+                        path: format!("{path}.acts[{i}].arguments"),
+                        message: format!(
+                            "this rule's `when` does not constrain: {}; each is hashed into the checked output and shown to the approver, but can hold anything, so it must not be able to choose who the call reaches",
+                            free.join(", ")
+                        ),
+                    });
+                }
             }
         }
         for (j, later) in whens.iter().enumerate() {
