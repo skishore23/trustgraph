@@ -81,7 +81,7 @@ async function main() {
     { op: 'decide', policy: POLICY, query: { output_from: ['salaries', 'roadmap'], agent: 'planner', action: 'post_to_slack', recipients: null } });
   assert.deepEqual(req('decide', { policy: POLICY, output_from: ['roadmap'], agent: 'planner', action: 'post_to_slack', recipients: ['sam'] }).query.recipients, ['sam']);
   assert.deepEqual(req('diff', { old: 'a', new: 'b' }), { op: 'diff', old: 'a', new: 'b' });
-  assert.deepEqual(req('simulate', { policy: POLICY, seed: 7 }), { op: 'simulate', policy: POLICY, seed: 7, count: 4, steps: 80 });
+  assert.deepEqual(req('simulate', { policy: POLICY, seed: 7 }), { op: 'simulate', policy: POLICY, seed: 7, count: 8, steps: 120 });
   assert.throws(() => p.run('buildRequest("explode")'), /Unknown policy operation/);
   for (const [input, want] of [['0', 0], ['65535', 65535], [' 42 ', 42]]) assert.equal(p.run(`parseSeed(${JSON.stringify(input)})`), want);
   for (const bad of ['', '-1', '65536', '1.5', 'abc', '1e3']) assert.equal(p.run(`parseSeed(${JSON.stringify(bad)})`), null);
@@ -203,7 +203,7 @@ async function main() {
   pageB.$('sim-seed').value = '3';
   pageB.queue.push(res({ ok: true, diagnostics: [], first_seed: 3, count: 4, steps: 80, events: 1234, decisions: { allow: 10, deny: 20, needs_approval: 3 }, violations: [], coverage: { crash_torn_tail: 2, expiry_boundary_at: 0, future_key: 1 }, digest: 'abcdef0123456789abcdef' }));
   await pageB.run('runSimulation()');
-  assert.deepEqual(pageB.calls.at(-1).body, { op: 'simulate', policy: 'edited twice', seed: 3, count: 4, steps: 80 });
+  assert.deepEqual(pageB.calls.at(-1).body, { op: 'simulate', policy: 'edited twice', seed: 3, count: 8, steps: 120 });
   const sim = text(pageB.$('sim-result'));
   assert.match(sim, /1,234/);
   assert.match(sim, /Crash with a torn journal write/);

@@ -8,8 +8,8 @@
 
 const API_URL = '/api/policy';
 const CHECK_DELAY_MS = 400;
-const SIM_COUNT = 4;
-const SIM_STEPS = 80;
+const SIM_COUNT = 8;
+const SIM_STEPS = 120;
 const SEED_MAX = 65535;
 const DEFAULT_EXAMPLE = 'starter';
 const SVG_NS = 'http://www.w3.org/2000/svg';
