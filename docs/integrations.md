@@ -231,5 +231,7 @@ can read a source or post somewhere without a check.
 For MCP servers, use [`trustgraph gateway`](gateway.md) instead of a
 library. It is part of the `trustgraph` binary, serves one MCP endpoint to
 every agent, holds the upstream servers' credentials, registers what listed
-tools return and checks listed actions before forwarding them. Hand-offs are
-two tools of its own. Example: [examples/gateway](../examples/gateway).
+tools return and checks listed actions before forwarding them. Each listed
+tool forwards only the arguments it lists, and one approval releases one
+call. Hand-offs are two tools of its own. Example:
+[examples/gateway](../examples/gateway).

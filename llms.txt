@@ -8,7 +8,7 @@
 - [Starter policy](crates/trustgraph-policy/starter.policy.yaml): the commented file written by `trustgraph policy init`.
 - [trustgraph serve](docs/serve.md): the local HTTP API and MCP endpoint agents use to register what they read, record what they wrote and check right before they act; per-agent tokens, the operator page, limits and the threat model.
 - [Python SDK](docs/sdk-python.md): `trustgraph.Client`, sessions (what was read follows what is written), `@source` / `@action` decorators, hand-off tokens, exceptions and fail-closed behaviour.
-- [trustgraph gateway](docs/gateway.md): the MCP endpoint between agents and their MCP servers that agents cannot skip: it holds upstream credentials, records what each agent reads, checks every action before forwarding it; `gateway.yaml` reference, sessions, hand-off tools and threat model.
+- [trustgraph gateway](docs/gateway.md): the MCP endpoint between agents and their MCP servers, which agents cannot skip while it alone holds the upstream credentials: it records what each agent reads, forwards only the arguments each tool lists, and checks every action before forwarding it (one approval releases one call); `gateway.yaml` reference, sessions, hand-off tools, what it does not cover and threat model.
 - [Integrations](docs/integrations.md): LangChain / LangGraph, OpenAI Agents SDK and Claude Agent SDK; what each covers and what it does not.
 
 ## Examples

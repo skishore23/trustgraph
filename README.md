@@ -131,12 +131,15 @@ or [llms.txt](llms.txt). Protect the policy file with code review.
 
 ## Use it in your system
 
-### `trustgraph gateway`: the option agents cannot skip
+### `trustgraph gateway`: agents cannot skip it while it alone holds the credentials
 
 Put the gateway between your agents and the MCP servers they use. It holds
 the servers' credentials, records what each agent reads through them, and
-checks every action against it before forwarding the call. A `gateway.yaml`
-says which tool reads which source and which tool is which action:
+checks every action against it before forwarding the call. Agents cannot
+skip it as long as the gateway alone holds the upstream credentials and the
+agents have no other route to those servers. A `gateway.yaml` says which
+tool reads which source, which tool is which action, and which arguments
+each tool may carry:
 
 ```sh
 trustgraph gateway --policy trustgraph.policy.yaml --operator leo --config gateway.yaml
