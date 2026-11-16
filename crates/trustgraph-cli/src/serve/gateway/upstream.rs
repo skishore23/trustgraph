@@ -3,8 +3,10 @@
 //!
 //! Credentials stay here. Header and environment values are [`Secret`]s of
 //! at least 12 characters; an upstream child gets only its configured
-//! environment, a minimal `PATH` and a private, empty `HOME` (0700, removed
-//! when the connection ends); its stderr is forwarded with every secret
+//! environment, a minimal `PATH` and a private, empty `HOME` (0700, locked
+//! while in use, removed when the connection ends or the gateway shuts
+//! down, and by the next gateway's startup if a killed one left it); its
+//! stderr is forwarded with every secret
 //! value replaced; and an error an agent sees never carries transport
 //! detail, only the upstream's name. A child runs as the gateway's own OS
 //! user, so it can still read whatever that user can (see docs/gateway.md).
@@ -122,31 +124,129 @@ enum Spec {
     },
 }
 
+/// The name prefix of every private `HOME` in the temp directory.
+pub const HOME_PREFIX: &str = "trustgraph-upstream-";
+/// The lock file of a private `HOME`: beside it, so the `HOME` stays empty.
+fn lock_path(home: &Path) -> PathBuf {
+    let mut name = home.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    home.with_file_name(name)
+}
+
 /// A stdio upstream's `HOME`: a new, empty directory only the gateway's
-/// user can open, removed when the connection is dropped.
-struct PrivateHome(PathBuf);
+/// user can open, removed when the connection is dropped. Beside it is a
+/// lock file the gateway keeps locked (an exclusive OS lock, released when
+/// the process ends however it ends), so a later gateway's startup cleanup
+/// can tell a live one from one a killed process left behind.
+struct PrivateHome {
+    path: PathBuf,
+    _lock: std::fs::File,
+}
 
 impl PrivateHome {
     fn create(upstream: &str) -> std::io::Result<Self> {
-        let path = std::env::temp_dir().join(format!(
-            "trustgraph-upstream-{upstream}-{}",
-            &crate::serve::auth::random_secret()[..16]
-        ));
+        Self::create_in(&std::env::temp_dir(), upstream)
+    }
+
+    /// The lock is made and taken before the directory exists, so no
+    /// cleanup ever sees the directory unlocked.
+    fn create_in(base: &Path, upstream: &str) -> std::io::Result<Self> {
+        let id = &crate::serve::auth::random_secret()[..16];
+        let path = base.join(format!("{HOME_PREFIX}{upstream}-{id}"));
+        let lock = crate::serve::auth::private_create(&lock_path(&path))?;
+        if let Err(e) = lock.try_lock() {
+            let _ = std::fs::remove_file(lock_path(&path));
+            return Err(std::io::Error::other(e));
+        }
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
             builder.mode(0o700);
         }
-        builder.create(&path)?;
-        Ok(PrivateHome(path))
+        if let Err(e) = builder.create(&path) {
+            let _ = std::fs::remove_file(lock_path(&path));
+            return Err(e);
+        }
+        Ok(PrivateHome { path, _lock: lock })
     }
 }
 
 impl Drop for PrivateHome {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let _ = std::fs::remove_dir_all(&self.path);
+        let _ = std::fs::remove_file(lock_path(&self.path));
     }
+}
+
+/// Remove the private `HOME` directories under `base` that a gateway left
+/// behind (it was killed, or crashed): every `trustgraph-upstream-*`
+/// directory, not a link, owned by this user, whose lock file exists and is
+/// not locked by a live gateway. A directory without a lock file is kept:
+/// nothing proves no one uses it. Returns how many were removed.
+pub fn remove_stale_homes(base: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return 0;
+    };
+    // This process's user: the owner of a file it creates.
+    #[cfg(unix)]
+    let me = {
+        use std::os::unix::fs::MetadataExt;
+        let probe = base.join(format!(
+            "trustgraph-owner-probe-{}",
+            &crate::serve::auth::random_secret()[..16]
+        ));
+        let uid = crate::serve::auth::private_create(&probe)
+            .and_then(|f| f.metadata())
+            .map(|m| m.uid())
+            .ok();
+        let _ = std::fs::remove_file(&probe);
+        match uid {
+            Some(uid) => Some(uid),
+            None => return 0,
+        }
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_str().is_some_and(|n| n.starts_with(HOME_PREFIX)) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if Some(metadata.uid()) != me {
+                continue;
+            }
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let Ok(lock) = options.open(lock_path(&path)) else {
+            continue;
+        };
+        if !lock.metadata().is_ok_and(|m| m.is_file()) || lock.try_lock().is_err() {
+            continue;
+        }
+        // Held while removing, so no gateway can take it meanwhile.
+        if std::fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+            let _ = std::fs::remove_file(lock_path(&path));
+        }
+        drop(lock);
+    }
+    removed
 }
 
 /// The program to run, found on the gateway's `PATH` when it is a bare
@@ -305,6 +405,14 @@ impl Upstreams {
     pub fn iter(&self) -> impl Iterator<Item = (&String, &Arc<UpstreamConn>)> {
         self.by_name.iter()
     }
+
+    /// Close every connection: stop each stdio child and remove its private
+    /// `HOME`. A later call connects again.
+    pub async fn shutdown(&self) {
+        for conn in self.by_name.values() {
+            conn.reset().await;
+        }
+    }
 }
 
 impl UpstreamConn {
@@ -343,7 +451,7 @@ impl UpstreamConn {
                 cmd.args(&command[1..])
                     .env_clear()
                     .env("PATH", path)
-                    .env("HOME", &private.0);
+                    .env("HOME", &private.path);
                 home = Some(private);
                 for (var, value) in env {
                     cmd.env(var, value.expose());
@@ -526,6 +634,42 @@ mod tests {
         assert!(redactor.leaks(secret.as_bytes()));
         assert_eq!(redactor.redact(&format!("x {secret} y")), "x [redacted] y");
         assert!(!redactor.leaks(b"nothing here"));
+    }
+
+    #[test]
+    fn stale_homes_are_removed_and_live_ones_kept() {
+        let base = tempfile::tempdir().unwrap();
+        let live = PrivateHome::create_in(base.path(), "slack").unwrap();
+        assert!(lock_path(&live.path).is_file());
+        assert_eq!(std::fs::read_dir(&live.path).unwrap().count(), 0, "empty");
+        // A gateway that was killed: its lock file is no longer locked.
+        let stale = base.path().join(format!("{HOME_PREFIX}old-0000"));
+        std::fs::create_dir(&stale).unwrap();
+        std::fs::write(lock_path(&stale), "").unwrap();
+        std::fs::write(stale.join("leftover"), "x").unwrap();
+        // No lock file: nothing proves it unused, so it is kept.
+        let unknown = base.path().join(format!("{HOME_PREFIX}legacy-1111"));
+        std::fs::create_dir(&unknown).unwrap();
+        // Not ours by name, and a link by the name: kept.
+        let other = base.path().join("other-dir");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(lock_path(&other), "").unwrap();
+        #[cfg(unix)]
+        {
+            let link = base.path().join(format!("{HOME_PREFIX}link"));
+            std::os::unix::fs::symlink(&other, &link).unwrap();
+            std::fs::write(lock_path(&link), "").unwrap();
+        }
+
+        assert_eq!(remove_stale_homes(base.path()), 1);
+        assert!(!stale.exists() && !lock_path(&stale).exists());
+        assert!(live.path.exists(), "a live gateway's HOME is kept");
+        assert!(unknown.exists());
+        assert!(other.exists());
+        let live_path = live.path.clone();
+        drop(live);
+        assert!(!live_path.exists(), "removed when the connection ends");
+        assert!(!lock_path(&live_path).exists());
     }
 
     #[test]

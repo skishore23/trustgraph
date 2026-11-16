@@ -1360,6 +1360,12 @@ pub async fn main(options: super::Options, config_path: PathBuf, port: u16) -> i
     for warning in config::warnings(&config) {
         eprintln!("warning: {warning}");
     }
+    let stale = upstream::remove_stale_homes(&std::env::temp_dir());
+    if stale > 0 {
+        eprintln!(
+            "trustgraph gateway: removed {stale} private upstream HOME directories a stopped gateway left behind"
+        );
+    }
     let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
         Ok(l) => l,
         Err(e) => {
@@ -1389,6 +1395,20 @@ pub async fn main(options: super::Options, config_path: PathBuf, port: u16) -> i
             return 1;
         }
     };
+    let code = serve_gateway(&gateway, &server, &config_path, listener, port).await;
+    // Every exit path stops the stdio children and removes their private
+    // HOME directories before the process ends.
+    gateway.upstreams.shutdown().await;
+    code
+}
+
+async fn serve_gateway(
+    gateway: &Arc<Gateway<FileJournal>>,
+    server: &Server<FileJournal>,
+    config_path: &Path,
+    listener: tokio::net::TcpListener,
+    port: u16,
+) -> i32 {
     let problems = gateway.verify_upstreams().await;
     if !problems.is_empty() {
         eprintln!(
@@ -1400,7 +1420,7 @@ pub async fn main(options: super::Options, config_path: PathBuf, port: u16) -> i
         }
         return 1;
     }
-    if let Err(code) = super::banner(&server, port, "TrustGraph gateway", "/gateway/mcp") {
+    if let Err(code) = super::banner(server, port, "TrustGraph gateway", "/gateway/mcp") {
         return code;
     }
     println!(
@@ -1408,7 +1428,7 @@ pub async fn main(options: super::Options, config_path: PathBuf, port: u16) -> i
         gateway.config().session.as_str(),
         gateway.config().tools.len() + 2
     );
-    super::run(listener, router(gateway)).await
+    super::run(listener, router(gateway.clone())).await
 }
 
 /// `trustgraph gateway check`: validate `gateway.yaml` against a policy and

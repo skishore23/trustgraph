@@ -2138,14 +2138,51 @@ fn banner(server: &Server<FileJournal>, port: u16, title: &str, mcp: &str) -> Re
     Ok(())
 }
 
-/// Serve `app` until Ctrl-C; the exit code.
-async fn run(listener: tokio::net::TcpListener, app: Router) -> i32 {
-    match axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await
+/// Resolves on SIGINT (Ctrl-C) or, on Unix, SIGTERM.
+async fn shutdown_signal() {
+    #[cfg(unix)]
     {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// How long open connections get to finish after a shutdown signal.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+
+/// Serve `app` until SIGINT or SIGTERM, then give open connections a few
+/// seconds to finish (long-lived streams would otherwise hold the process
+/// forever); the exit code. The caller then releases what it holds.
+async fn run(listener: tokio::net::TcpListener, app: Router) -> i32 {
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let serve = axum::serve(listener, app).with_graceful_shutdown(async {
+        let _ = stopped.await;
+    });
+    let mut serve = std::pin::pin!(std::future::IntoFuture::into_future(serve));
+    let result = tokio::select! {
+        result = &mut serve => result,
+        () = shutdown_signal() => {
+            let _ = stop.send(());
+            tokio::time::timeout(SHUTDOWN_GRACE, &mut serve)
+                .await
+                .unwrap_or(Ok(()))
+        }
+    };
+    match result {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("error: {e}");

@@ -186,8 +186,13 @@ tools:
   value. An upstream result that contains one, as is or JSON-escaped, is
   withheld. A stdio upstream gets the variables in its `env`, a minimal
   `PATH` (the program's own directory, `/usr/bin` and `/bin`) and a private,
-  empty `HOME` directory (mode 0700, removed when the connection ends); it
-  never gets the gateway's `HOME` or the rest of its environment. That is
+  empty `HOME` directory, `$TMPDIR/trustgraph-upstream-*` (mode 0700). It is
+  removed when the connection ends, and when the gateway exits on SIGINT or
+  SIGTERM, which stops every stdio upstream first. Each one holds a lock
+  file the gateway keeps locked; one that a killed gateway left behind
+  (owned by your user, lock not held) is removed when a gateway next
+  starts, and one whose lock is held by a running gateway is never touched.
+  The child never gets the gateway's `HOME` or the rest of its environment. That is
   not isolation: see [Threat model](#threat-model). Its stderr is printed
   with every secret value replaced by `[redacted]`.
 - **Tools.** Only the tools listed under `tools:` exist for agents. They are
