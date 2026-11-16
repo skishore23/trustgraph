@@ -26,3 +26,7 @@ __pycache__/
 # Agent planning and scratch files (not part of the project)
 /docs/superpowers/
 /.superpowers/
+
+# Old local state and configs from removed tools (may hold tokens); never commit
+/.trustgraph*/
+*.local.json
