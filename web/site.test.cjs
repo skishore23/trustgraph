@@ -54,7 +54,8 @@ function page() {
   return { $, calls, queue, context, run: code => vm.runInContext(code, context) };
 }
 
-const POLICY = 'version: 1\n# starter';
+const POLICY = 'version: 1\nagents: [planner]';
+const STARTER = fs.readFileSync('crates/trustgraph-policy/starter.policy.yaml', 'utf8');
 const SUMMARY = {
   agents: ['planner', 'mailer'],
   sources: {
@@ -91,6 +92,32 @@ async function main() {
   assert.equal(p.run('coverageLabel("expiry_boundary_at")'), 'Denied exactly at approval expiry');
   assert.equal(p.run('coverageLabel("brand_new_path")'), 'brand_new_path');
   assert.equal(p.run('coverageLabel("constructor")'), 'constructor');
+
+  // The five experiments: each makes the expected edit to the comment-free starter and picks the expected run.
+  p.context.__starter = STARTER;
+  const stripped = p.run('stripComments(__starter)');
+  assert.doesNotMatch(stripped, /^\s*#/m, 'comment lines are removed');
+  assert.match(stripped, /^version: 1\n/);
+  assert.doesNotMatch(stripped, /\n\n\n/);
+  p.context.__stripped = stripped;
+  const exp = id => JSON.parse(p.run(`JSON.stringify(applyExperiment(${JSON.stringify(id)}, __stripped))`));
+  const leakRun = { agent: 'planner', sources: ['salaries', 'roadmap'], action: 'post_to_slack', recipients: null };
+  assert.deepEqual(exp('leak'), { policy: stripped, run: leakRun, note: 'planner read salaries and roadmap and posts the result to engineering.' });
+  assert.deepEqual(exp('roadmap').run, { agent: 'planner', sources: ['roadmap'], action: 'post_to_slack', recipients: null });
+  assert.equal(exp('roadmap').policy, stripped);
+  assert.deepEqual(exp('email').run, { agent: 'mailer', sources: ['price_sheet'], action: 'email_customer', recipients: null });
+  const widen = exp('widen');
+  assert.deepEqual(widen.run, leakRun);
+  assert.equal(widen.policy, stripped.replace('  salaries:\n    readers: [hr]', '  salaries:\n    readers: [hr, engineering]'));
+  assert.notEqual(widen.policy, stripped);
+  const typo = exp('typo');
+  assert.equal(typo.policy, stripped.replace('readers: [hr, engineering]', 'readers: [hr, enginering]'));
+  assert.notEqual(typo.policy, stripped);
+  assert.equal(p.run('applyExperiment("widen", "version: 1")'), null, 'an edit that does not apply is refused');
+  assert.equal(p.run('applyExperiment("nope", "")'), null);
+  p.context.__examples = [{ id: 'a', title: 'A', policy: 'x' }, { id: 'starter', title: 'Starter', policy: '# c\nversion: 1' }];
+  assert.deepEqual(JSON.parse(p.run('JSON.stringify(arrangeExamples(__examples).map(e => [e.id, e.title, e.policy]))')),
+    [['starter', 'Starter', 'version: 1'], ['starter-annotated', 'Starter (annotated)', '# c\nversion: 1'], ['a', 'A', 'x']]);
 
   // Status line and the interesting default run.
   assert.equal(p.run(`checkStatus(${JSON.stringify(CHECK_OK)}).text`), 'valid · 1 test pass');
@@ -145,7 +172,24 @@ async function main() {
   assert.deepEqual(pageB.calls[2].body.query, { output_from: ['salaries', 'roadmap'], agent: 'planner', action: 'post_to_slack', recipients: null });
   assert.match(text(pageB.$('decision')), /DENIED/);
   assert.equal(text(pageB.$('check-status')), 'valid · 1 test pass');
-  assert.match(text(pageB.$('diff')), /No changes yet/);
+  assert.match(text(pageB.$('diff')), /No changes from the example as loaded/);
+  const pressed = all(pageB.$('experiment-buttons'), n => n.tagName === 'BUTTON' && n.attributes['aria-pressed'] === 'true').map(text);
+  assert.deepEqual(pressed, ['Leak the salary file'], 'the leak experiment is selected on load');
+  assert.match(text(pageB.$('experiment-note')), /planner read salaries and roadmap/);
+  assert.deepEqual(all(pageB.$('example'), n => n.tagName === 'OPTION').map(n => n.value), ['starter', 'starter-annotated', 'slack-digest'], 'starter first, annotated copy second');
+
+  // Clicking an experiment sets up the run and asks for a decision at once.
+  const emailButton = all(pageB.$('experiment-buttons'), n => n.tagName === 'BUTTON' && text(n) === 'Email a customer')[0];
+  pageB.queue.push(res(CHECK_OK));
+  pageB.queue.push(res({ ok: true, diagnostics: [], outcome: { verdict: 'needs_approval', code: 'needs_approval', reason: 'needs approval', blocking: [], readers: ['acme', 'leo'] } }));
+  await emailButton.fire('click');
+  await new Promise(r => setImmediate(r));
+  assert.deepEqual(pageB.calls.at(-1).body.query, { output_from: ['price_sheet'], agent: 'mailer', action: 'email_customer', recipients: null });
+  assert.match(text(pageB.$('decision')), /NEEDS APPROVAL/);
+  pageB.queue.push(res({ ok: true, diagnostics: [], outcome: DENY }));
+  await pageB.$('agent').fire('change');
+  assert.equal(all(pageB.$('experiment-buttons'), n => n.attributes && n.attributes['aria-pressed'] === 'true').length, 0, 'changing the run clears the selected experiment');
+  pageB.run('state.run = { agent: "planner", sources: ["salaries", "roadmap"], action: "post_to_slack", recipients: null }; renderRunControls();');
   assert.match(text(pageB.$('explain')), /salaries: output can reach hr/);
 
   // Unticking a recipient sends an explicit recipient list.
@@ -231,7 +275,7 @@ async function main() {
   assert.deepEqual(pageC.calls.map(c => c.body.op), ['examples', 'check', 'decide']);
   assert.match(text(pageC.$('decision')), /DENIED/);
 
-  console.log('Landing page logic passed: request shapes, seeds, coverage labels, status line, default run, allow/approval/deny rendering, diagnostics with suggestions, recipients, stale responses, non-JSON and network errors, simulator results and violations.');
+  console.log('Landing page logic passed: request shapes, seeds, coverage labels, status line, default run, five experiments, allow/approval/deny rendering, diagnostics with suggestions, recipients, stale responses, non-JSON and network errors, simulator results and violations.');
 }
 
 main().catch(error => { console.error(error); process.exitCode = 1; });

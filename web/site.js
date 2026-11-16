@@ -311,7 +311,7 @@ function renderExplain(text) {
 const DIFF_TAGS = { widens: 'WIDENS', narrows: 'NARROWS', neutral: 'CHANGE' };
 
 function renderDiff(result) {
-  if (!result) return [h('li', { class: 'muted', text: 'No changes yet. Try adding engineering to the salaries readers.' })];
+  if (!result) return [h('li', { class: 'muted', text: 'No changes from the example as loaded.' })];
   if (!result.ok && result.file) {
     return [h('li', { class: 'muted', text: result.file === 'old' ? 'The original policy could not be read.' : 'Fix the errors in the policy to compare it with the original.' })];
   }
@@ -384,6 +384,53 @@ function renderSimulation(result) {
   return out;
 }
 
+/* ---------- experiments (defined against the starter policy) ---------- */
+
+const LEAK_RUN = { agent: 'planner', sources: ['salaries', 'roadmap'], action: 'post_to_slack' };
+const EXPERIMENTS = [
+  { id: 'leak', label: 'Leak the salary file', run: LEAK_RUN,
+    note: 'planner read salaries and roadmap and posts the result to engineering.' },
+  { id: 'roadmap', label: 'Post only the roadmap', run: { agent: 'planner', sources: ['roadmap'], action: 'post_to_slack' },
+    note: 'planner read only the roadmap and posts it to engineering.' },
+  { id: 'email', label: 'Email a customer', run: { agent: 'mailer', sources: ['price_sheet'], action: 'email_customer' },
+    note: 'mailer read the price sheet and emails the customer.' },
+  { id: 'widen', label: 'Give engineering the salary file', run: LEAK_RUN,
+    edit: [/(\n {2}salaries:\n {4}readers: \[)([^\]\n]*)\]/, '$1$2, engineering]'],
+    note: 'Added `engineering` to salaries.readers. A test now fails and the diff flags it.' },
+  { id: 'typo', label: 'Misspell a group', run: LEAK_RUN,
+    edit: [/(\n {2}roadmap:\n {4}readers: \[hr, )engineering\]/, '$1enginering]'],
+    note: 'Changed `engineering` to `enginering` in roadmap.readers.' },
+];
+
+// The policy text and run an experiment produces from the original, or null if it does not apply.
+function applyExperiment(id, original) {
+  const experiment = EXPERIMENTS.find(e => e.id === id);
+  if (!experiment) return null;
+  let policy = String(original ?? '');
+  if (experiment.edit) {
+    const [pattern, replacement] = experiment.edit;
+    if (!pattern.test(policy)) return null;
+    policy = policy.replace(pattern, replacement);
+  }
+  return { policy, run: { ...experiment.run, sources: experiment.run.sources.slice(), recipients: null }, note: experiment.note };
+}
+
+// The starter without its comment lines: the same policy, shorter to read.
+function stripComments(text) {
+  return String(text).split('\n').filter(line => !/^\s*#/.test(line)).join('\n').replace(/\n{3,}/g, '\n\n').replace(/^\n+/, '');
+}
+
+// Starter first and comment-free; its annotated original kept as a second entry.
+function arrangeExamples(examples) {
+  const starter = examples.find(e => e.id === DEFAULT_EXAMPLE);
+  if (!starter) return examples.slice();
+  return [
+    { ...starter, policy: stripComments(starter.policy) },
+    { ...starter, id: `${DEFAULT_EXAMPLE}-annotated`, title: `${starter.title || 'Starter'} (annotated)` },
+    ...examples.filter(e => e !== starter),
+  ];
+}
+
 /* ---------- the live page ---------- */
 
 const ui = {};
@@ -396,6 +443,7 @@ const state = {
   valid: false,
   escaped: false,
   timer: null,
+  experiment: null,
 };
 const lanes = { examples: lane(), check: lane(), decide: lane(), diff: lane(), simulate: lane() };
 
@@ -416,6 +464,36 @@ function fillSelect(select, values, selected) {
   select.disabled = values.length === 0;
 }
 
+function experimentsApply() {
+  return state.exampleId === DEFAULT_EXAMPLE || (state.exampleId === null && state.original != null);
+}
+
+function renderExperiments() {
+  if (!ui.experiments) return;
+  ui.experiments.hidden = !experimentsApply();
+  ui.experimentButtons.replaceChildren(...EXPERIMENTS.map(e => h('button', {
+    type: 'button', class: 'exp', 'aria-pressed': String(state.experiment === e.id), on: { click: () => runExperiment(e.id) },
+  }, e.label)));
+  const current = EXPERIMENTS.find(e => e.id === state.experiment);
+  ui.experimentNote.replaceChildren(...(current ? richText(current.note) : []));
+}
+
+function clearExperiment() {
+  if (state.experiment === null) return;
+  state.experiment = null;
+  renderExperiments();
+}
+
+async function runExperiment(id) {
+  const result = applyExperiment(id, state.original);
+  if (!result) return;
+  state.experiment = id;
+  ui.policy.value = result.policy;
+  state.run = result.run;
+  renderExperiments();
+  await runCheck();
+}
+
 async function loadExamples() {
   setStatus('pending', 'Loading examples…');
   const res = await lanes.examples.run(buildRequest('examples'));
@@ -427,11 +505,10 @@ async function loadExamples() {
     await runCheck();
     return;
   }
-  state.examples = examples;
-  const start = examples.some(e => e.id === DEFAULT_EXAMPLE) ? DEFAULT_EXAMPLE : examples[0].id;
-  ui.example.replaceChildren(...examples.map(e => h('option', { value: e.id, text: e.title || e.id })));
+  state.examples = arrangeExamples(examples);
+  ui.example.replaceChildren(...state.examples.map(e => h('option', { value: e.id, text: e.title || e.id })));
   ui.example.disabled = false;
-  await loadExample(start);
+  await loadExample(state.examples[0].id);
 }
 
 async function loadExample(id) {
@@ -439,13 +516,18 @@ async function loadExample(id) {
   if (!example) return;
   state.exampleId = id;
   ui.example.value = id;
-  ui.summaryLine.textContent = example.summary || '';
   ui.policy.value = example.policy;
   state.original = example.policy;
   state.run = null;
+  state.experiment = null;
   lanes.simulate.cancel();
-  ui.simResult.replaceChildren(h('p', { class: 'muted', text: 'Uses the policy in the editor above. Seeds are 0 to 65535.' }));
+  ui.simResult.replaceChildren(h('p', { class: 'muted', text: 'Uses the policy in the playground above.' }));
   ui.simRun.disabled = false;
+  if (id === DEFAULT_EXAMPLE) {
+    await runExperiment('leak');
+    return;
+  }
+  renderExperiments();
   await runCheck();
 }
 
@@ -464,7 +546,7 @@ async function runCheck() {
     state.valid = false;
     setStatus('offline', `Couldn't check: ${res.error.message}`);
     lanes.decide.cancel();
-    showDecisionMessage('Engine unavailable', 'The decision will appear when the policy engine answers. Edit the policy to try again.');
+    showDecisionMessage('Engine unavailable', 'The answer will appear when the policy engine responds. Edit the policy to try again.');
     return;
   }
   const result = res.value;
@@ -481,7 +563,7 @@ async function runCheck() {
     runDecide();
   } else {
     lanes.decide.cancel();
-    showDecisionMessage('Policy has errors', 'Fix the errors in the policy to see a decision.');
+    showDecisionMessage('Policy has errors', 'Fix the errors in the policy to see an answer.');
   }
   runDiff(policy, Boolean(result.ok));
 }
@@ -499,13 +581,9 @@ async function runDecide() {
   if (!res.fresh) return;
   ui.decision.setAttribute('aria-busy', 'false');
   if (res.error) { showDecisionMessage('Engine unavailable', res.error.message); return; }
-  if (!res.value.outcome) { showDecisionMessage('Policy has errors', 'Fix the errors in the policy to see a decision.'); return; }
+  if (!res.value.outcome) { showDecisionMessage('Policy has errors', 'Fix the errors in the policy to see an answer.'); return; }
   const action = state.summary.actions[run.action] || {};
-  ui.decision.replaceChildren(...renderDecision(res.value.outcome, {
-    sources: run.sources,
-    people: expandRecipients(run, state.summary),
-    approval: action.approval || null,
-  }));
+  ui.decision.replaceChildren(...renderDecision(res.value.outcome, { approval: action.approval || null }));
 }
 
 async function runDiff(policy, ok) {
@@ -521,25 +599,23 @@ async function runDiff(policy, ok) {
   }
   const res = await lanes.diff.run(buildRequest('diff', { old: state.original, new: policy }));
   if (!res.fresh) return;
-  if (res.error) { ui.diff.replaceChildren(h('li', { class: 'empty-state', text: `Couldn't compare: ${res.error.message}` })); return; }
+  if (res.error) { ui.diff.replaceChildren(h('li', { class: 'muted', text: `Couldn't compare: ${res.error.message}` })); return; }
   ui.diff.replaceChildren(...renderDiff(res.value));
 }
 
+// The run as a sentence: "[agent] read [sources] and wants to [action] → [recipients]."
 function renderRunControls() {
   const summary = state.summary;
   const run = state.run;
   fillSelect(ui.agent, list(summary.agents), run.agent);
   fillSelect(ui.action, Object.keys(summary.actions || {}), run.action);
-  const box = (value, checked, onChange, note) => h('label', null,
-    h('input', { type: 'checkbox', value, checked, on: { change: event => onChange(value, event.target.checked) } }),
-    value, note ? h('span', { class: 'muted', text: ` (${note})` }) : null);
+  const chip = (value, checked, onChange, title) => h('label', { class: 'chip', title },
+    h('input', { type: 'checkbox', value, checked, on: { change: event => onChange(value, event.target.checked) } }), value);
   ui.sources.replaceChildren(...Object.entries(summary.sources || {}).map(([name, s]) =>
-    box(name, run.sources.includes(name), toggleSource, list(s.agents).includes(run.agent) ? null : `${run.agent} may not use`)));
+    chip(name, run.sources.includes(name), toggleSource, list(s.agents).includes(run.agent) ? null : `${run.agent} may not use ${name}`)));
   const action = summary.actions[run.action] || {};
-  const approval = action.approval;
-  ui.actionHelp.textContent = approval ? `needs approval by ${names(approval.reviewers)}` : '';
   const chosen = expandRecipients(run, summary);
-  ui.recipients.replaceChildren(...list(action.people).map(person => box(person, chosen.includes(person), toggleRecipient)));
+  ui.recipients.replaceChildren(...list(action.people).map(person => chip(person, chosen.includes(person), toggleRecipient)));
 }
 
 function toggleSource(name, on) {
@@ -547,6 +623,7 @@ function toggleSource(name, on) {
   if (on) set.add(name); else set.delete(name);
   const order = Object.keys(state.summary.sources || {});
   state.run.sources = order.filter(s => set.has(s));
+  clearExperiment();
   runDecide();
 }
 
@@ -556,6 +633,7 @@ function toggleRecipient(person, on) {
   if (on) set.add(person); else set.delete(person);
   const chosen = people.filter(p => set.has(p));
   state.run.recipients = chosen.length === people.length ? null : chosen;
+  clearExperiment();
   runDecide();
 }
 
@@ -588,7 +666,7 @@ async function runSimulation(event) {
   if (event) event.preventDefault();
   const seed = parseSeed(ui.seed.value);
   if (seed === null) {
-    ui.simResult.replaceChildren(h('p', { class: 'inline-error', text: 'Enter a whole number from 0 to 65535 as the seed.' }));
+    ui.simResult.replaceChildren(h('p', { class: 'alert', text: 'Enter a whole number from 0 to 65535 as the seed.' }));
     return;
   }
   ui.simRun.disabled = true;
@@ -597,7 +675,7 @@ async function runSimulation(event) {
   try {
     const res = await lanes.simulate.run(buildRequest('simulate', { policy: ui.policy.value, seed }));
     if (!res.fresh) return;
-    if (res.error) ui.simResult.replaceChildren(h('p', { class: 'inline-error', text: `The simulator could not run: ${res.error.message}` }));
+    if (res.error) ui.simResult.replaceChildren(h('p', { class: 'alert', text: `The simulator could not run: ${res.error.message}` }));
     else ui.simResult.replaceChildren(...renderSimulation(res.value));
   } finally {
     ui.simRun.disabled = false;
@@ -608,24 +686,28 @@ async function runSimulation(event) {
 
 function boot() {
   Object.assign(ui, {
-    example: $('example'), summaryLine: $('example-summary'), policy: $('policy'), status: $('check-status'),
-    reset: $('reset'), diagnostics: $('diagnostics'), tests: $('tests'), agent: $('agent'), sources: $('sources'),
-    action: $('action'), actionHelp: $('action-help'), recipients: $('recipients'), decision: $('decision'),
-    explain: $('explain'), diff: $('diff'), simForm: $('sim-form'), seed: $('sim-seed'), simRun: $('sim-run'), simResult: $('sim-result'),
+    example: $('example'), policy: $('policy'), status: $('check-status'), reset: $('reset'),
+    diagnostics: $('diagnostics'), tests: $('tests'), agent: $('agent'), sources: $('sources'),
+    action: $('action'), recipients: $('recipients'), decision: $('decision'), explain: $('explain'), diff: $('diff'),
+    experiments: $('experiments'), experimentButtons: $('experiment-buttons'), experimentNote: $('experiment-note'),
+    simForm: $('sim-form'), seed: $('sim-seed'), simRun: $('sim-run'), simResult: $('sim-result'),
   });
   if (!ui.policy) return;
-  ui.policy.addEventListener('input', scheduleCheck);
+  ui.policy.addEventListener('input', () => { clearExperiment(); scheduleCheck(); });
   ui.policy.addEventListener('keydown', onEditorKey);
   ui.example.addEventListener('change', () => loadExample(ui.example.value));
   ui.reset.addEventListener('click', () => {
     if (state.original == null) return;
+    if (state.exampleId === DEFAULT_EXAMPLE) { runExperiment('leak'); return; }
     ui.policy.value = state.original;
     state.run = null;
+    clearExperiment();
     runCheck();
   });
-  ui.agent.addEventListener('change', () => { state.run.agent = ui.agent.value; renderRunControls(); runDecide(); });
-  ui.action.addEventListener('change', () => { state.run.action = ui.action.value; state.run.recipients = null; renderRunControls(); runDecide(); });
+  ui.agent.addEventListener('change', () => { state.run.agent = ui.agent.value; clearExperiment(); renderRunControls(); runDecide(); });
+  ui.action.addEventListener('change', () => { state.run.action = ui.action.value; state.run.recipients = null; clearExperiment(); renderRunControls(); runDecide(); });
   ui.simForm.addEventListener('submit', runSimulation);
+  renderExperiments();
   return loadExamples();
 }
 

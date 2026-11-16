@@ -12,40 +12,54 @@
 <body>
 <a class="skip" href="#main">Skip to content</a>
 <header class="top">
-  <a class="brand" href="/">TrustGraph</a>
-  <a href="https://github.com/skishore23/trustgraph">GitHub</a>
+  <div class="page top-inner">
+    <a class="brand" href="/"><svg class="mark" width="18" height="18" viewBox="0 0 18 18" aria-hidden="true"><rect x="1.5" y="1.5" width="5" height="5"/><rect x="11.5" y="1.5" width="5" height="5"/><rect x="6.5" y="11.5" width="5" height="5"/><path d="M4 6.5V9h10V6.5M9 9v2.5"/></svg>TrustGraph</a>
+    <a href="https://github.com/skishore23/trustgraph">GitHub</a>
+  </div>
 </header>
 
-<main id="main">
+<main id="main" class="page">
 <h1>Decide where your agent's output can go, based on what it read.</h1>
+<div class="intro">
+<div>
+<p class="lead">TrustGraph is policy-as-code for what AI agents produce. One small YAML file says who may read each source and who receives each action. Every output gets <span class="mono">allow</span>, <span class="mono">needs approval</span> or <span class="mono">deny</span>, with the reason.</p>
+</div>
 
-<p>Your agent may read the salary file and the roadmap. It writes a "Q3 headcount plan" from both and posts it to #engineering. The plan is new, so it has no permissions of its own, and nothing stops it.</p>
+<figure class="hero">
+  <svg class="flow" viewBox="0 0 520 200" role="img" aria-label="The salary file (readers: hr) and the roadmap (readers: hr, engineering) flow into a headcount plan that only hr may read. Sending it to #hr is allowed; sending it to #engineering is denied.">
+    <g class="box"><rect x="1" y="12" width="138" height="56"/><text x="12" y="36" class="t-name">salaries</text><text x="12" y="56" class="t-sub">readers: hr</text></g>
+    <g class="box"><rect x="1" y="132" width="138" height="56"/><text x="12" y="156" class="t-name">roadmap</text><text x="12" y="176" class="t-sub">hr, engineering</text></g>
+    <path class="wire" d="M139 40H164V160H139M164 100H190"/>
+    <g class="box out"><rect x="190" y="72" width="140" height="56"/><text x="201" y="96" class="t-name">headcount plan</text><text x="201" y="116" class="t-sub">readers: hr</text></g>
+    <path class="wire ok" d="M330 100H355V40H378M371 35l8 5-8 5"/>
+    <path class="wire bad dash" d="M330 100H355V160H364"/>
+    <path class="wire bad" d="M366 155l10 10M376 155l-10 10"/>
+    <g class="box"><rect x="381" y="12" width="138" height="56"/><text x="392" y="36" class="t-name">#hr</text><text x="392" y="56" class="t-allow">ALLOWED</text></g>
+    <g class="box"><rect x="381" y="132" width="138" height="56"/><text x="392" y="156" class="t-name">#engineering</text><text x="392" y="176" class="t-deny">DENIED</text></g>
+  </svg>
+</figure>
+</div>
 
-<p>TrustGraph is policy-as-code for what agents produce. One small YAML policy says who may read each source and who receives each action. For every output it answers allow, needs approval or deny, with the reason. Restrictions follow the data.</p>
-
-<pre class="diagram" aria-label="Diagram: salaries (readers: hr) and roadmap (readers: hr, engineering) flow into a headcount plan readable by hr only. Sending it to hr is allowed; sending it to engineering is denied.">
- salaries        roadmap
- hr              hr, engineering
-    └───────┬───────┘
-            ▼
-  Q3 headcount plan
-  hr only (the overlap)
-            │
-    ┌───────┴───────┐
-    ▼               ▼
- #hr              #engineering
- <span class="v-allow">ALLOWED</span>          <span class="v-deny">DENIED</span>
-</pre>
 
 <section id="playground" aria-labelledby="try-title">
-<h2 id="try-title">Try it</h2>
-<p>This runs the real Rust policy engine. Edit the policy and the decision, tests and diff update as you type.</p>
+<div class="frame">
+  <h2 id="try-title" class="frame-head">Try it <span class="mono">— runs the real Rust engine</span></h2>
 
-<p class="row"><label for="example">Example:</label> <select id="example" name="example" disabled><option value="starter">Starter</option></select></p>
-<p id="example-summary" class="muted"></p>
+  <div id="experiments" class="cell experiments">
+    <div id="experiment-buttons" class="exp-row" role="group" aria-label="Experiments"></div>
+    <p id="experiment-note" class="note mono" aria-live="polite"></p>
+  </div>
 
-<label class="sr-only" for="policy">Policy YAML</label>
-<textarea id="policy" name="policy" class="editor" rows="22" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off" wrap="off" aria-describedby="editor-help check-status">version: 1
+  <div class="row two main">
+    <div class="cell">
+      <div class="cell-head">
+        <h3>Policy</h3>
+        <label class="sr-only" for="example">Example policy</label>
+        <select id="example" name="example" class="compact" disabled><option value="starter">Starter</option></select>
+        <button id="reset" class="plain" type="button">Reset</button>
+      </div>
+      <label class="sr-only" for="policy">Policy YAML</label>
+      <textarea id="policy" name="policy" class="editor" rows="18" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off" wrap="off" aria-describedby="editor-help check-status">version: 1
 
 groups:
   hr: [nina]
@@ -87,46 +101,81 @@ tests:
     action: post_to_slack
     expect: allow
 </textarea>
-<p class="muted small" id="editor-help">Tab inserts two spaces. Shift+Tab, or Esc then Tab, leaves the editor. <button id="reset" class="plain" type="button">Reset</button></p>
+      <div class="cell-foot">
+        <p id="check-status" class="status" role="status" aria-live="polite">Connecting to the policy engine…</p>
+        <ul id="diagnostics" class="lines" aria-label="Problems"></ul>
+        <p id="editor-help" class="hint">Tab indents. Shift+Tab, or Esc then Tab, leaves the editor.</p>
+      </div>
+    </div>
 
-<p id="check-status" class="status" role="status" aria-live="polite">Connecting to the policy engine…</p>
-<ul id="diagnostics" class="lines" aria-label="Problems"></ul>
+    <div class="cell">
+      <div class="cell-head"><h3>The run</h3></div>
+      <p class="sentence">
+        <label class="sr-only" for="agent">Agent</label><select id="agent" name="agent" disabled><option>planner</option></select>
+        read <span id="sources" class="chips" role="group" aria-label="Sources it read"></span>
+        and wants to <label class="sr-only" for="action">Action</label><select id="action" name="action" disabled><option>post_to_slack</option></select>
+        <span aria-hidden="true">→</span><span class="sr-only">sending to</span> <span id="recipients" class="chips" role="group" aria-label="Recipients"></span>.
+      </p>
+      <div id="decision" class="answer" aria-live="polite"><p class="muted">Waiting for the policy engine.</p></div>
+    </div>
+  </div>
 
-<h3>Tests</h3>
-<ul id="tests" class="lines"><li class="muted">Tests run when the policy is checked.</li></ul>
-
-<h3>Agent run</h3>
-<div class="form">
-  <p class="row"><label for="agent">Agent</label> <select id="agent" name="agent" disabled><option>planner</option></select></p>
-  <fieldset class="row"><legend class="sr-only">Read</legend><span class="label" aria-hidden="true">Read</span> <span id="sources" class="inline-checks"></span></fieldset>
-  <p class="row"><label for="action">Action</label> <select id="action" name="action" disabled><option>post_to_slack</option></select> <span id="action-help" class="muted"></span></p>
-  <fieldset class="row"><legend class="sr-only">Send to</legend><span class="label" aria-hidden="true">Send to</span> <span id="recipients" class="inline-checks"></span></fieldset>
+  <div class="row two main">
+    <div class="cell">
+      <div class="cell-head"><h3>Tests</h3></div>
+      <ul id="tests" class="lines"><li class="muted">Tests run when the policy is checked.</li></ul>
+    </div>
+    <div class="cell">
+      <div class="cell-head"><h3>What changed</h3></div>
+      <ul id="diff" class="lines" aria-live="polite"><li class="muted">No changes from the example as loaded.</li></ul>
+    </div>
+  </div>
 </div>
+<details class="explain">
+  <summary>Read this policy in plain English</summary>
+  <ul id="explain" class="lines"><li class="muted">Appears once the policy is valid.</li></ul>
+</details>
+</section>
 
-<h3>Decision</h3>
-<div id="decision" class="decision" aria-live="polite"><p class="muted">Waiting for the policy engine.</p></div>
-
-<h3>What this policy says</h3>
-<ul id="explain" class="lines"><li class="muted">Appears once the policy is valid.</li></ul>
-
-<h3>Changes from the original</h3>
-<ul id="diff" class="lines" aria-live="polite"><li class="muted">No changes yet. Try adding engineering to the salaries readers.</li></ul>
+<section aria-labelledby="problem-title">
+<h2 id="problem-title">The problem</h2>
+<p>Permission systems decide what an agent may read. They lose track the moment it writes something new.</p>
+<ol class="grid three">
+  <li class="cell">
+    <svg class="spot" viewBox="0 0 120 64" role="img" aria-label="Two documents read by an agent"><path class="ink" d="M10 4h24v26H10zM15 12h14M15 18h14M15 24h9M10 34h24v26H10zM15 42h14M15 48h14M15 54h9M34 17c22 0 26 15 46 15M34 47c22 0 26-15 46-15"/><rect class="accent" x="80" y="25" width="14" height="14"/></svg>
+    <b>It reads two allowed files.</b>
+    <p>The salary file and the roadmap. Each read passes its permission check.</p>
+  </li>
+  <li class="cell">
+    <svg class="spot" viewBox="0 0 120 64" role="img" aria-label="The agent writes a new document with no permissions"><rect class="accent" x="12" y="25" width="14" height="14"/><path class="ink" d="M26 32h34M54 27l6 5-6 5M72 10h28v44H72z" /><path class="ink dash" d="M78 20h16M78 27h16M78 34h16M78 41h10"/></svg>
+    <b>It writes something new.</b>
+    <p>A Q3 headcount plan built from both. A new document has no permissions of its own.</p>
+  </li>
+  <li class="cell">
+    <svg class="spot" viewBox="0 0 120 64" role="img" aria-label="The new document is posted to an engineering channel"><path class="ink" d="M10 14h26v36H10zM16 24h14M16 31h14M16 38h9M80 14h30v36H80zM89 26h12M89 38h12M92 22l-2 20M100 22l-2 20"/><path class="deny" d="M36 32h38M68 27l6 5-6 5"/></svg>
+    <b>It posts where it shouldn't.</b>
+    <p>The plan goes to #engineering, and the salaries go with it.</p>
+  </li>
+</ol>
+<p>TrustGraph makes the restriction follow the data.</p>
 </section>
 
 <section id="simulator" aria-labelledby="sim-title">
 <h2 id="sim-title">Simulate</h2>
-<p>Seeded runs drive the real TrustGraph runtime through policy changes, crashes and approval expiry, checking five safety invariants at every step. It cannot cover what your system does after "allow".</p>
-<form id="sim-form" class="row" novalidate>
-  <label for="sim-seed">Seed</label>
-  <input id="sim-seed" name="sim-seed" type="number" inputmode="numeric" min="0" max="65535" step="1" value="0" autocomplete="off">
-  <button id="sim-run" class="primary" type="submit">Run</button>
-</form>
-<div id="sim-result" aria-live="polite"><p class="muted">Uses the policy in the editor above. Seeds are 0 to 65535.</p></div>
+<p>Seeded runs drive the real runtime through policy changes, crashes and approval expiry, and check five safety invariants at every step. They cannot cover what your system does after <span class="mono">allow</span>.</p>
+<div class="frame">
+  <form id="sim-form" class="cell sim-form" novalidate>
+    <label for="sim-seed" class="mono">seed</label>
+    <input id="sim-seed" name="sim-seed" type="number" inputmode="numeric" min="0" max="65535" step="1" value="0" autocomplete="off">
+    <button id="sim-run" class="primary" type="submit">Run</button>
+  </form>
+  <div id="sim-result" class="cell" aria-live="polite"><p class="muted">Uses the policy in the playground above.</p></div>
+</div>
 </section>
 
 <section aria-labelledby="agents-title">
 <h2 id="agents-title">Written by agents, approved by people</h2>
-<p>Agents draft the policy: every command has <code>--json</code> output with a stable code, a path and a did-you-mean suggestion, and inline tests say what must be allowed or denied. A person reviews the plain-English explanation and a diff that flags every widening.</p>
+<p>Agents draft the policy: every command has <code>--json</code> output with a stable code, a path and a did-you-mean suggestion. A person reviews the plain-English explanation and a diff that flags every widening.</p>
 <pre>$ trustgraph policy check --json trustgraph.policy.yaml
 {
   "diagnostics": [
@@ -152,9 +201,24 @@ allowed         = everyone the action reaches ⊆ readers(output)</pre>
 
 <section aria-labelledby="proof-title">
 <h2 id="proof-title">How we know it works</h2>
-<p>Decisions are deterministic: no language model in the decision path, so the same policy and inputs give the same answer. That makes them repeatable, not right; your tests say what right means.</p>
-<p>The simulator above runs the shipped runtime, not a model of it, and checks five invariants after every step. A simulated schedule is evidence, not a proof over every execution.</p>
-<p>Ten bounded Kani proofs cover the allow / needs-approval / deny ordering, the approval window and the reader-set rules, and all pass in CI. They prove those kernels within fixed bounds, not the whole system. <a href="https://github.com/skishore23/trustgraph/blob/main/docs/verification.md">Verification details</a></p>
+<div class="grid three">
+  <div class="cell">
+    <b>Deterministic</b>
+    <p>No language model in the decision path. Same policy, same inputs, same answer.</p>
+    <p class="hint">Repeatable is not right: your tests say what right means.</p>
+  </div>
+  <div class="cell">
+    <b>Simulated</b>
+    <p>The simulator runs the shipped runtime and checks five invariants after every step.</p>
+    <p class="hint">Evidence, not a proof over every execution.</p>
+  </div>
+  <div class="cell">
+    <b>Proved, within bounds</b>
+    <p>Ten Kani proofs cover the decision ordering, the approval window and the reader rules. All pass in CI.</p>
+    <p class="hint">Those kernels within fixed bounds, not the whole system.</p>
+  </div>
+</div>
+<p><a href="https://github.com/skishore23/trustgraph/blob/main/docs/verification.md">Verification details</a></p>
 </section>
 
 <section id="install" aria-labelledby="use-title">
@@ -175,7 +239,7 @@ trustgraph policy diff old.policy.yaml trustgraph.policy.yaml</pre>
 <h2 id="limits-title">Limits</h2>
 <ul>
   <li>It only knows the inputs your system reports.</li>
-  <li>It decides; it does not act. Ask right before acting, and act only on "allow".</li>
+  <li>It decides; it does not act. Ask right before acting, and act only on <span class="mono">allow</span>.</li>
   <li>One sensitive input restricts the whole output.</li>
   <li>Groups are lists of names in the file, not a directory.</li>
 </ul>
@@ -188,10 +252,12 @@ trustgraph policy diff old.policy.yaml trustgraph.policy.yaml</pre>
 </main>
 
 <footer class="foot">
-  <a href="https://github.com/skishore23/trustgraph">GitHub</a> ·
-  <a href="https://github.com/skishore23/trustgraph/blob/main/docs/agents/writing-policies.md">Agent guide</a> ·
-  <a href="https://github.com/skishore23/trustgraph/tree/main/examples/policies">Example policies</a> ·
-  <a href="https://github.com/skishore23/trustgraph/blob/main/docs/verification.md">Verification</a>
+  <div class="page">
+    <a href="https://github.com/skishore23/trustgraph">GitHub</a> ·
+    <a href="https://github.com/skishore23/trustgraph/blob/main/docs/agents/writing-policies.md">Agent guide</a> ·
+    <a href="https://github.com/skishore23/trustgraph/tree/main/examples/policies">Example policies</a> ·
+    <a href="https://github.com/skishore23/trustgraph/blob/main/docs/verification.md">Verification</a>
+  </div>
 </footer>
 </body>
 </html>
