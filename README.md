@@ -230,11 +230,7 @@ read. TrustGraph decides where what it wrote may go. Use both.
 Earlier work that TrustGraph grew out of. They use their own policy formats.
 
 - **Typed dataflow SDK** — `crates/trustgraph-framework`, the lineage graph the
-  runtime is built on. [Guide](docs/framework.md) ·
-  [interactive lab](https://trustgraph-demo.vercel.app/lab.html)
-- **Guided story demo** — a fictional company walkthrough.
-  [Demo](https://trustgraph-demo.vercel.app/story.html) ·
-  [walkthrough](docs/demo.md)
+  runtime is built on. [Guide](docs/framework.md)
 - **Live coding gateway** — a fresh Codex run, isolated Rust checks, human
   approval and a GitHub draft pull request. [Architecture](docs/architecture.md) ·
   [setup](docs/development.md)

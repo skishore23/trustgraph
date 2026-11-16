@@ -12,18 +12,6 @@ workspace = true
 path = "hosted/lib.rs"
 
 [[bin]]
-name = "demo"
-path = "api/demo.rs"
-
-[[bin]]
-name = "simulation"
-path = "api/simulation.rs"
-
-[[bin]]
-name = "framework"
-path = "api/framework.rs"
-
-[[bin]]
 name = "policy"
 path = "api/policy.rs"
 
@@ -38,7 +26,6 @@ serde_json.workspace = true
 tokio.workspace = true
 tower = { version = "0.5", features = ["util"] }
 trustgraph-runtime = { path = "crates/trustgraph-runtime" }
-trustgraph-framework = { path = "crates/trustgraph-framework" }
 trustgraph-sim = { path = "crates/trustgraph-sim" }
 trustgraph-policy = { path = "crates/trustgraph-policy" }
 vercel_runtime = { version = "2.4", features = ["axum"] }

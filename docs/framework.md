@@ -137,23 +137,3 @@ the action rule. An unrelated source change does not stale that context. The
 `impact` method scans forward dependencies; it is not an indexed distributed
 incremental engine. Traversal has bounded resource limits rather than an
 unbounded guarantee for every graph size.
-
-## Interactive web demo
-
-```sh
-cargo run --locked --example framework_server
-```
-
-Open `http://127.0.0.1:9082`. The same assets are deployed at the Vercel root;
-`/story.html` preserves the previous guided gateway demo. `POST /api/framework`
-reconstructs a bounded fictional graph and evaluates it using this SDK on each
-request. Browser controls select a scenario, resolved audience, approval and
-one change. There is no shared user state, model call or external write.
-
-The document flow demonstrates inherited restrictions, mandatory review, stale
-approval after a relevant ACL revision or output change, and independence from
-an unrelated ACL change. The export flow has two outputs and an action that
-needs no approval. Input schema mismatch and forbidden executor access are
-rejected before the simulated execution. The ACL-change scenario intentionally
-keeps Finance permitted: it separates *access still allowed* from *old approval
-no longer applies*. No JavaScript function invents an authorization verdict.

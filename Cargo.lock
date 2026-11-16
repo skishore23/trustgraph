@@ -2048,7 +2048,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tower",
- "trustgraph-framework",
  "trustgraph-policy",
  "trustgraph-runtime",
  "trustgraph-sim",

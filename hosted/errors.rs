@@ -120,14 +120,9 @@ mod tests {
     #[tokio::test]
     async fn every_hosted_endpoint_returns_json_for_extractor_rejections() {
         let json = Some("application/json");
-        for path in ["/api/demo", "/api/framework", "/api/simulation"] {
+        {
+            let path = "/api/policy";
             let cases = [
-                (
-                    "POST",
-                    json,
-                    r#"{"unknown":true}"#.to_owned(),
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                ),
                 (
                     "POST",
                     json,
