@@ -21,7 +21,8 @@ alone; nothing in the SDK can name a different agent. Pass `token=` or
 The token is a bearer credential, so the client guards where it goes. `url`
 must be https, or plain http to a loopback address (`127.0.0.0/8`, `::1`,
 `localhost`); plain http to any other host raises `ValueError` unless you pass
-`allow_insecure=True`. A URL carrying credentials is refused. Redirects are
+`allow_insecure=True`. A URL carrying credentials, a query or a fragment is
+refused. Redirects are
 never followed: a 3xx answer raises `TrustGraphError("redirect_refused")`
 and nothing is sent to the address it names. Proxies are not used, and the
 token never appears in an exception or a `repr`.
@@ -87,14 +88,21 @@ was resumed without it:
 
 | Integration | Keeps the token in | Refuses when |
 | --- | --- | --- |
-| LangGraph `agent_node` | graph state, `state["trustgraph"]` (saved with the thread by a checkpointer) | the key is missing, or empty on any node but the `first=True` one, or empty on a thread that already holds model or tool messages (the node raises before its agent runs) |
-| LangChain / LangGraph `Guard` | graph state, `state["trustgraph"]`, for its per-thread sessions | the conversation holds a mapped source's result that the session did not record and the session carries no token (mapped tools are refused) |
+| LangGraph `agent_node` | graph state, `state["trustgraph"]` (saved with the thread by a checkpointer) | the key is not declared `Annotated[str, merge_tokens]`, or is empty on any node but the `first=True` one, or empty on a thread that already holds model or tool messages (the node raises before its agent runs) |
+| LangChain / LangGraph `Guard` | graph state, `state["trustgraph"]`, for its per-thread sessions (`client=`) | per-thread: the key is not declared `Annotated[str, merge_tokens]`; always: the conversation holds a mapped source's result that the session did not record and the session carries no token (mapped tools are refused) |
 | OpenAI Agents `Guard.run` | a dict run context, `context["trustgraph"]` (a `RunState` serialises it) | the run continues a conversation (`RunState`, a non-empty `session=`, `previous_response_id`, `conversation_id`, or earlier model or tool items in the input) and the context holds no token |
-| Claude Agent SDK `Guard` | a file per SDK session id under `Guard(store=DIR)` (off by default) | the SDK session's transcript already holds tool results the guard never saw and nothing is stored for it |
+| Claude Agent SDK `Guard` | a file per SDK session id under `Guard(store=DIR)` (off by default) | at every mapped action and subagent start: the transcript holds a mapped source's result the guard never recorded, or cannot be read and the guard has not seen the session from its start |
+| `as_source` / `as_action` (LangChain, OpenAI Agents), `@source` / `@action`, and `Runner` called inside your own `with client.session():` | nowhere: the session is yours | never: there is no resume detection, so the session must live as long as the conversation |
 
-Each detection sees only what the framework shows it. History that was
-trimmed or summarised away is not detected, and neither is an OpenAI Agents
-run under your own `with client.session():` instead of `Guard.run`.
+Each detection sees only what the framework shows it: history that was
+trimmed or summarised away is not detected.
+
+**A kept token never shrinks.** It is written with `s.persist(stored)`: the
+union of what was stored and everything the session saw, never less. A
+broken session writes a broken marker into it instead of an empty token,
+so every session later restored from it (`receive`) is refused too.
+`trustgraph.merge_tokens(a, b)` is the same union, and is the reducer
+LangGraph state uses for the key.
 
 ## Hand-offs
 
@@ -109,9 +117,9 @@ restriction follows the work to the next agent. The receiving agent must be
 listed in `agents` for every source the token carries; if it is not, the
 server answers 404 `unknown_artifact`, `receive` raises, and the session
 refuses every later read, output, check and hand-off (`session_broken`).
-`s.mark_broken(reason)` does the same on purpose, and `s.broken` says why.
-The token is not signed: code that drops or edits it drops the restrictions
-it carries.
+`s.mark_broken(reason)` does the same on purpose, and `s.broken` says why;
+`handoff()` on a broken session raises. The token is not signed: code that
+drops or edits it drops the restrictions it carries.
 
 ## Decorators
 
@@ -125,7 +133,10 @@ def post_to_slack(text): ...
 
 `@source` registers the return value as the source in the current session;
 a value that cannot be hashed raises `InvalidContent` instead of being
-returned, and a generator function needs `content=`. `@action` records and
+returned, and a generator function needs `content=`. So does a tool
+returning something else that is not JSON, such as a pydantic model
+(`content=lambda r: r.model_dump()`) or a LangChain `content_and_artifact`
+tuple (`content=lambda r: r[0]`), which is otherwise withheld. `@action` records and
 checks before the body runs, and runs it only on allow. `recipients` is a
 list or a function of `(args, kwargs)`; a `str` is one name, and `None` means
 the action's whole audience. Both work on `async def` functions. With no current

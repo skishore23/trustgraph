@@ -65,9 +65,14 @@ with client.session():
 - **Sessions.** The current session (`with client.session():` around the run).
   With no session, `Guard(..., client=client)` keeps one session per LangGraph
   `thread_id`, at most `max_threads` (1024) in memory. It restores a thread's
-  session from `state["trustgraph"]` and writes the token there after every
-  registered result; `guard.middleware()` declares that key, and a `ToolNode`
-  graph must declare `trustgraph: str` in its state for the token to be kept.
+  session from `state["trustgraph"]` and merges its token (or a broken
+  marker) back there after every mapped call. The key must be declared
+  `trustgraph: Annotated[str, merge_tokens]` (from
+  `trustgraph.integrations.langchain`): the reducer merges the writes of
+  parallel tool calls in one step and keeps the token from being replaced by
+  a smaller or empty one. `guard.middleware()` declares it for `create_agent`;
+  a `ToolNode` graph must declare it, and until it does every mapped call is
+  refused (`state_key_undeclared`, `state_key_without_reducer`).
   Either way, a mapped call is refused (`unrecorded_history`) when the
   conversation holds a mapped source's result that the session did not record
   and the session carries no token: a checkpointed thread resumed with a new
@@ -75,21 +80,21 @@ with client.session():
 - **Hand-offs.** `agent_node(client, agent)` makes a graph node that runs a
   sub-agent in a new session of that client's agent, starting from the
   hand-off token in `state["trustgraph"]` and writing its own token back.
-  Declare `trustgraph: str` in the graph's state and start the graph with
-  `{"trustgraph": ""}`: LangGraph silently drops undeclared keys, so a node
-  raises `handoff_missing`, before its agent runs, when the key is absent.
-  Mark the entry node `agent_node(..., first=True)`; it alone may start from
+  Declare `trustgraph: Annotated[str, merge_tokens]` in the graph's state:
+  LangGraph silently drops undeclared keys, so a node raises, before its
+  agent runs, when the key is undeclared or has another reducer. Mark the
+  entry node `agent_node(..., first=True)`; it alone may start from
   an empty token, and not on a thread that already holds model or tool
   messages (`resumed_without_session`). Every other node requires a valid
   token. If the receiving agent is not cleared for what the token carries,
-  the node raises and the run stops. On a checkpointed thread, invoke later
-  turns without `"trustgraph"` so the checkpointed token is kept. Example:
+  the node raises and the run stops. On a checkpointed thread the token is
+  kept; an empty or smaller `"trustgraph"` in a later input does not reset
+  it. Example:
   [examples/integrations/langgraph](../examples/integrations/langgraph).
 
 Not covered: tools that return a `Command` cannot be sources (the result is
 withheld); tool calls a graph makes outside `ToolNode` or `create_agent` are
-not seen by the guard; a node that replaces `state["trustgraph"]` with
-another valid token drops the restrictions the old one carried. A
+not seen by the guard. A
 `Guard`-mapped tool runs to completion before the guard registers or
 withholds its result, so callback handlers, `astream_events` and tracing
 integrations (such as LangSmith) receive the raw result first. Resumed
@@ -131,14 +136,22 @@ result = guard.run_sync(planner, "Post the Q3 plan")
   return a guarded copy of one `FunctionTool`; `guard.protect(*agents)` does
   this for every mapped tool of those agents, and adds the same checks to
   every server in their `mcp_servers` through the SDK's per-server tool
-  guardrails (map an MCP tool by the name the model calls).
+  guardrails (map an MCP tool by the name the model calls). Pass every agent
+  to one `protect` call: it raises `ValueError` for a mapped name that is a
+  tool kind guardrails do not cover (hosted, computer, shell) or that matches
+  no tool when none of the agents has MCP servers. It also checks that the
+  installed SDK still carries the guardrail fields and copies a server's
+  guardrails onto its tools, and refuses (`unsupported_framework`, naming the
+  version) when it does not.
 - **Blocked calls** are the guardrail's `reject_content`.
-- **Sessions.** `guard.run` / `guard.run_sync` / `await guard.run_streamed`
+- **Sessions.** `await guard.run` / `guard.run_sync` / `await guard.run_streamed`
   give each agent of the run its own session, from its entry in `clients`; an
   agent with no client is refused. Pass a dict as `context=` and the run's
   token is kept in `context["trustgraph"]`: every session of a later run given
   that context, or resumed from a `RunState`, starts carrying it. A run that
-  continues a conversation without it is refused. Without `Guard.run`, the
+  continues a conversation without it is refused, and leaves a broken marker
+  in that context, so a retry with it is refused too. `session=` takes the
+  async `guard.run` or `guard.run_streamed`; `run_sync` refuses it. Without `Guard.run`, the
   guardrails use the current session (`with client.session():`) as it is.
   To call `Runner` yourself, wrap it in `with guard.scope(input, **kwargs):`
   and pass `hooks=guard.hooks()`.
@@ -198,12 +211,19 @@ async with ClaudeSDKClient(ClaudeAgentOptions(hooks=guard.hooks(), mcp_servers=s
   timeout (30 s) below the hook timeout (`Guard(timeout=60)`).
 - **Sessions.** One per SDK `session_id`, at most `max_sessions` (1024) in
   memory; `guard.forget(session_id)` drops one from memory.
-  `Guard(store=DIR)` keeps each SDK session's token, and whether it is
-  broken, in a file under `DIR` (mode 0600), so an SDK session resumed in a
-  new process (`resume=`) starts from it. An SDK session the guard has no
-  record of, whose transcript (`transcript_path`) already holds tool results,
-  is refused: a resume without the store, a `fork_session` (a new id), or a
-  session evicted from memory. `guard.session(session_id).handoff()` hands a
+  `Guard(store=DIR)` keeps each SDK session's token (with a broken marker
+  once broken) and the tool results it recorded in a file under `DIR` (mode
+  0600, merged, never shrunk), so an SDK session resumed in a new process
+  (`resume=`) starts from it. At every mapped action and subagent start the
+  guard reads the transcript (`transcript_path`): a result of a mapped source
+  tool, or of a tool it cannot name, that it never recorded breaks the SDK
+  session: a resume without the store, a `fork_session` (a new id), a
+  session evicted from memory, or history that appears later. A transcript
+  that cannot be read refuses the call (`history_unverifiable`) unless the
+  guard has seen the session from its start, that is, first saw it at a
+  prompt with no transcript yet or one without tool results. A hook input
+  missing a field the guard reads refuses the call (`unsupported_framework`,
+  naming the version). `guard.session(session_id).handoff()` hands a
   session to another process.
 - **Subagents.** Each subagent (`agent_id`) gets its own session, from
   `subagents={agent_type: client}` or the main client. It starts with what its
@@ -221,10 +241,12 @@ async with ClaudeSDKClient(ClaudeAgentOptions(hooks=guard.hooks(), mcp_servers=s
   Example: [examples/integrations/claude-agent-sdk](../examples/integrations/claude-agent-sdk).
 
 Not covered: the tests drive the real `ClaudeSDKClient` hook dispatch with a
-scripted CLI on the other end, not the Claude Code CLI itself; the resume
-detection looks for `tool_result` entries in the transcript, in a format the
-tests write rather than one observed from the CLI. Unmapped tools, including `Bash`, run untouched: a shell command
-can read a source or post somewhere without a check.
+scripted CLI on the other end, not the Claude Code CLI itself; the transcript
+check reads Claude Code's `{"type": "user", "message": {"content": [{"type":
+"tool_result", ...}]}}` entries and the `tool_use` entries that name them,
+and an SDK session evicted from memory and seen again at a prompt with no
+transcript is taken as new. Unmapped tools, including `Bash`, run untouched:
+a shell command can read a source or post somewhere without a check.
 
 ## MCP
 
