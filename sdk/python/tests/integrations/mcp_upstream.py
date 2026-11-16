@@ -1,5 +1,7 @@
 """A small upstream MCP server for the proxy tests (stdio)."""
 
+import os
+
 from mcp.server import MCPServer
 
 server = MCPServer("upstream")
@@ -9,7 +11,9 @@ POSTED = []
 
 @server.tool()
 def read_file(path: str) -> str:
-    """Read a file."""
+    """Read a file (or `env:NAME`, to show what the server was given)."""
+    if path.startswith("env:"):
+        return os.environ.get(path[4:], "")
     return FILES[path]
 
 

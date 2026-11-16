@@ -5,7 +5,8 @@
 
 It serves MCP on stdio to one client and forwards to one upstream server
 (stdio command or streamable HTTP URL), with one TrustGraph session for the
-life of the process. The mapping file (YAML or JSON):
+life of the process. The upstream command gets only a minimal environment
+plus the variables named with ``--pass-env``. The mapping file (YAML or JSON):
 
     sources:
       read_file:                      # a tool: its result is registered as a source
@@ -292,7 +293,11 @@ async def _run(args: argparse.Namespace) -> None:
         command = args.command[1:] if args.command[:1] == ["--"] else args.command
         if not command:
             raise SystemExit("give the upstream server: --upstream-url URL, or -- COMMAND [ARGS...]")
-        upstream = StdioServerParameters(command=command[0], args=command[1:])
+        missing = [name for name in args.pass_env if name not in os.environ]
+        if missing:
+            raise SystemExit(f"--pass-env: not set: {', '.join(missing)}")
+        env = {name: os.environ[name] for name in args.pass_env}
+        upstream = StdioServerParameters(command=command[0], args=command[1:], env=env or None)
     carry = args.carry or os.environ.get("TRUSTGRAPH_CARRY")
     proxy = Proxy(client, mapping, upstream, carry=carry, handoff_file=args.handoff_file)
     async with proxy as server, stdio_server() as (read, write):
@@ -305,6 +310,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--token-file", required=True, help="this agent's TrustGraph token file")
     parser.add_argument("--url", default="http://127.0.0.1:8787", help="trustgraph serve")
     parser.add_argument("--upstream-url", help="upstream MCP server over streamable HTTP")
+    parser.add_argument("--pass-env", action="append", default=[], metavar="NAME",
+                        help="pass this environment variable to the upstream command (repeatable)")
     parser.add_argument("--carry", help="a hand-off token to start from (or TRUSTGRAPH_CARRY)")
     parser.add_argument("--handoff-file", help="write this session's hand-off token here after every read")
     parser.add_argument("command", nargs=argparse.REMAINDER, help="-- the upstream server command")

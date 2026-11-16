@@ -29,6 +29,8 @@ sources:
       when: {path: "hr/*"}
     - source: roadmap
       when: {path: "product/*"}
+    - source: salaries
+      when: {path: "env:*"}
 actions:
   post_message:
     action: post_to_slack
@@ -168,13 +170,14 @@ def test_the_command_over_stdio(server: Server, tmp_path: Path) -> None:
     proxy = StdioServerParameters(command=sys.executable, args=[
         "-m", "trustgraph.integrations.mcp", "--map", str(tmp_path / "mapping.yaml"),
         "--token-file", str(server.state / "tokens" / "planner.token"), "--url", server.url,
-        "--", UPSTREAM.command, *UPSTREAM.args,
-    ], env={"PATH": os.environ.get("PATH", "")})
+        "--pass-env", "UPSTREAM_SECRET", "--", UPSTREAM.command, *UPSTREAM.args,
+    ], env={"PATH": os.environ.get("PATH", ""), "UPSTREAM_SECRET": "only-the-proxy-has-this"})
 
     async def run() -> None:
         async with McpClient(proxy) as c:
             await c.call_tool("read_file", {"path": "hr/salaries.csv"})
             denied = await c.call_tool("post_message", {"text": "Q3 plan"})
             assert denied.is_error and "salaries" in text(denied)
+            assert text(await c.call_tool("read_file", {"path": "env:UPSTREAM_SECRET"})) == "only-the-proxy-has-this"
 
     asyncio.run(run())

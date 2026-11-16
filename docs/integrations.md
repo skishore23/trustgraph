@@ -217,12 +217,13 @@ Point the MCP client at the proxy command instead of the server.
   not start. A bad mapping file also stops it from starting.
   Example: [examples/integrations/mcp](../examples/integrations/mcp).
 - **Cannot be skipped** when the upstream server's credentials are given only
-  to the proxy (in its environment or command line) and the agent cannot read
-  them or reach the upstream another way.
+  to the proxy and the agent cannot read them or reach the upstream another
+  way. The upstream command gets a minimal environment plus the variables
+  named with `--pass-env NAME`.
 
 Not covered: prompts, sampling and other MCP features are not proxied; only
 tools and resources are. The proxy serves stdio only (one client); it does not
-serve HTTP. Unmapped tools under `unclassified` or `allow` are forwarded
+serve HTTP, and it sends no credentials of its own to an HTTP upstream. Unmapped tools under `unclassified` or `allow` are forwarded
 without a check, so a posting tool you forgot to map can send anything; use
 `block` for the strict form. A tool's own side effects beyond its result (a
 file it writes, a request it makes) are not tracked.
