@@ -165,6 +165,8 @@ Every `policy` command exits 0 when all is well; 1 for diagnostics with errors, 
    `--json` returns `{"ok": true, "widens": true, "changes": [{"kind": "widens", "subject": "action post_eng_channel", "gained": ["maya","nina","omar"], "lost": [], "summary": "audience gained maya, nina, omar"}]}`. Use `git show HEAD:trustgraph.policy.yaml > old.yaml` to get OLD.
 8. **Hand to a human**: give the file, the `explain` output and the `diff` output. Say which lines say `WIDENS`.
 
+   When `trustgraph serve` is running, the same loop is available over HTTP and as MCP tools: `policy_get` (the active policy), `policy_schema`, `policy_check`, `policy_test`, `policy_explain`, `policy_diff` (`old` defaults to the active policy) and `policy_simulate` (`count` up to 8, `steps` up to 120). Finish with `policy_propose`: it stores your file as a proposal and shows it to the operator with the explanation and every `WIDENS` line marked. It never changes the active policy; only the operator can activate it. See [docs/serve.md](../serve.md).
+
 `trustgraph policy schema` prints the JSON Schema of the file (it is JSON already; `--json` is accepted).
 
 ## 4. Diagnostic codes

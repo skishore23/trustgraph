@@ -174,9 +174,27 @@ cargo run -p trustgraph-policy --example decide
 | [`trustgraph-policy`](crates/trustgraph-policy) | Parse, validate, test, explain and diff policies. `decide` is a pure function. |
 | [`trustgraph-engine`](crates/trustgraph-engine) | A journaled runtime that records sources and outputs, tracks approvals and survives restarts. |
 
-**Coming next:** `trustgraph serve`, a local service over HTTP and MCP, so any
-agent stack can register what it read and ask before it acts. It is not built
-yet.
+### `trustgraph serve`
+
+A local service over HTTP and MCP, so any agent stack can register what it
+read, record what it wrote and ask before it acts:
+
+```sh
+trustgraph serve --policy trustgraph.policy.yaml --operator leo
+```
+
+Each agent gets its own token file. Ask right before acting:
+
+```sh
+curl -s localhost:8787/v1/check \
+  -H "Authorization: Bearer $(cat ~/.trustgraph/serve/tokens/mailer.token)" \
+  -H "Content-Type: application/json" \
+  -d '{"artifact": "<artifact id>", "action": "email_customer"}'
+```
+
+MCP clients connect to `http://127.0.0.1:8787/mcp` with the same token. The
+operator approves requests and activates proposed policies on a plain page
+opened from a single-use launch file. See [docs/serve.md](docs/serve.md).
 
 ## How we know it works
 
@@ -221,7 +239,7 @@ read. TrustGraph decides where what it wrote may go. Use both.
 | `crates/trustgraph-engine` | Deterministic runtime core, journal and replay |
 | `crates/trustgraph-core` | Proof-friendly kernels and their Kani harnesses |
 | `crates/trustgraph-sim` | The seeded simulator and its safety checks |
-| `crates/trustgraph-cli` | The `trustgraph` command |
+| `crates/trustgraph-cli` | The `trustgraph` command, including `trustgraph serve` |
 | `examples/policies` | Five worked policies |
 | `docs/agents` | The policy-writing guide for agents |
 

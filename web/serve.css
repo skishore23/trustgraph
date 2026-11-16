@@ -1,0 +1,92 @@
+/* trustgraph serve operator page: a plain monospace document. One size,
+   one narrow column, thin borders, square corners. The accent marks only
+   the primary button; the warning colour marks only widening changes. */
+
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --text: #2b2b2b;
+  --strong: #111111;
+  --muted: #6a6a6a;
+  --line: #d4d4d4;
+  --link: #1f5fbf;
+  --accent: #116149;
+  --on-accent: #ffffff;
+  --warn: #b3261e;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111213;
+    --text: #d6d6d6;
+    --strong: #f2f2f2;
+    --muted: #9a9a9a;
+    --line: #3a3a3a;
+    --link: #7fb0ff;
+    --accent: #3fae84;
+    --on-accent: #08130e;
+    --warn: #ff8a80;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.6 var(--mono);
+}
+
+main {
+  max-width: 64ch;
+  margin: 0 auto;
+  padding: 24px 16px 64px;
+}
+
+h1, h2 {
+  font-size: inherit;
+  font-weight: 700;
+  color: var(--strong);
+  margin: 2em 0 .75em;
+}
+h1 { margin-top: 0; }
+
+p { margin: 0 0 .5em; }
+
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; }
+:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
+
+.muted { color: var(--muted); }
+.warn { color: var(--warn); }
+.notice { border-left: 1px solid var(--warn); padding-left: 1ch; }
+
+.item {
+  border-top: 1px solid var(--line);
+  padding: .75em 0;
+}
+.item:last-child { border-bottom: 1px solid var(--line); }
+.item p { margin: 0 0 .25em; }
+
+ul.changes { list-style: none; padding: 0; margin: .25em 0 .5em; }
+
+button {
+  font: inherit;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 0;
+  padding: 2px 10px;
+  margin: .25em 1ch 0 0;
+  cursor: pointer;
+}
+button.primary {
+  color: var(--on-accent);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+button:disabled { opacity: .5; cursor: default; }

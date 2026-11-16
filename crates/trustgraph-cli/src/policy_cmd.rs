@@ -241,14 +241,117 @@ fn load(file: &Path) -> Result<Loaded, String> {
             });
         }
     };
-    let parsed = parse(&text);
+    Ok(load_text(&text))
+}
+
+/// Parse and lint policy text (`parse` reports oversize text as `too_large`).
+fn load_text(text: &str) -> Loaded {
+    let parsed = parse(text);
     let mut diagnostics = parsed.diagnostics;
     if let Some(policy) = &parsed.policy {
         diagnostics.extend(lint(policy));
     }
-    Ok(Loaded {
+    Loaded {
         policy: parsed.policy,
         diagnostics,
+    }
+}
+
+/// The `--json` documents of `check`, `test`, `explain`, `diff` and
+/// `simulate`, built from policy text instead of files, for `trustgraph
+/// serve`. The CLI builds its own `--json` output with the same functions.
+pub mod text {
+    use super::*;
+
+    /// `policy check --json`.
+    pub fn check(text: &str) -> Value {
+        check_doc(&load_text(text))
+    }
+
+    /// `policy test --json`.
+    pub fn test(text: &str) -> Value {
+        test_doc(&load_text(text)).0
+    }
+
+    /// `policy explain --json`.
+    pub fn explain(text: &str) -> Value {
+        explain_doc(&load_text(text))
+    }
+
+    /// `policy diff --json`; `file` names `old` or `new` when one is invalid.
+    pub fn diff(old: &str, new: &str) -> Value {
+        diff_doc(&[("old", load_text(old)), ("new", load_text(new))])
+    }
+
+    /// `policy simulate --json`, or the invalid-policy document. Bounds on
+    /// `count` and `steps` are the caller's.
+    pub fn simulate(text: &str, seed: u64, count: u64, steps: u32) -> Value {
+        match campaign(text, seed, count, steps) {
+            Ok(c) => simulation_doc(&c),
+            Err(diagnostics) => invalid_doc(
+                &Loaded {
+                    policy: None,
+                    diagnostics,
+                },
+                None,
+                false,
+            ),
+        }
+    }
+}
+
+fn check_doc(loaded: &Loaded) -> Value {
+    json!({"ok": !loaded.has_errors(), "diagnostics": loaded.diagnostics})
+}
+
+fn invalid_doc(loaded: &Loaded, extra: Option<(&str, Value)>, results: bool) -> Value {
+    let mut doc = json!({"ok": false, "diagnostics": loaded.diagnostics});
+    if results {
+        doc["results"] = json!([]);
+    }
+    if let Some((k, v)) = extra {
+        doc[k] = v;
+    }
+    doc
+}
+
+/// The document and the number of failed tests.
+fn test_doc(loaded: &Loaded) -> (Value, usize) {
+    let policy = match &loaded.policy {
+        Some(p) if !loaded.has_errors() => p,
+        _ => return (invalid_doc(loaded, None, true), 0),
+    };
+    let results = run_tests(policy);
+    let failed = results.iter().filter(|r| !r.pass).count();
+    let doc = json!({
+        "ok": failed == 0,
+        "diagnostics": loaded.diagnostics,
+        "results": results,
+    });
+    (doc, failed)
+}
+
+fn explain_doc(loaded: &Loaded) -> Value {
+    match &loaded.policy {
+        Some(p) if !loaded.has_errors() => json!({"ok": true, "text": explain(p)}),
+        _ => invalid_doc(loaded, None, false),
+    }
+}
+
+fn diff_doc(loaded: &[(&str, Loaded); 2]) -> Value {
+    for (name, l) in loaded {
+        if l.policy.is_none() || l.has_errors() {
+            return invalid_doc(l, Some(("file", json!(name))), false);
+        }
+    }
+    let (Some(old), Some(new)) = (&loaded[0].1.policy, &loaded[1].1.policy) else {
+        unreachable!("both policies were checked above")
+    };
+    let result = diff(old, new);
+    json!({
+        "ok": true,
+        "widens": result.widens(),
+        "changes": result.changes,
     })
 }
 
@@ -331,11 +434,7 @@ fn check(out: &mut String, file: &Path, json: bool) -> i32 {
     };
     let ok = !loaded.has_errors();
     if json {
-        outln!(
-            out,
-            "{}",
-            pretty(&json!({"ok": ok, "diagnostics": loaded.diagnostics}))
-        );
+        outln!(out, "{}", pretty(&check_doc(&loaded)));
     } else {
         print_diagnostics(out, &loaded.diagnostics);
         outln!(out, "{}", summary(&loaded.diagnostics));
@@ -352,14 +451,7 @@ fn report_invalid(
     results: bool,
 ) -> i32 {
     if json {
-        let mut doc = json!({"ok": false, "diagnostics": loaded.diagnostics});
-        if results {
-            doc["results"] = json!([]);
-        }
-        if let Some((k, v)) = extra {
-            doc[k] = v;
-        }
-        outln!(out, "{}", pretty(&doc));
+        outln!(out, "{}", pretty(&invalid_doc(loaded, extra, results)));
     } else {
         if let Some((_, Value::String(name))) = &extra {
             outln!(out, "{name}:");
@@ -379,19 +471,14 @@ fn test(out: &mut String, file: &Path, json: bool) -> i32 {
         Some(p) if !loaded.has_errors() => p,
         _ => return report_invalid(out, &loaded, json, None, true),
     };
+    if json {
+        let (doc, failed) = test_doc(&loaded);
+        outln!(out, "{}", pretty(&doc));
+        return i32::from(failed > 0);
+    }
     let results = run_tests(policy);
     let failed = results.iter().filter(|r| !r.pass).count();
-    if json {
-        outln!(
-            out,
-            "{}",
-            pretty(&json!({
-                "ok": failed == 0,
-                "diagnostics": loaded.diagnostics,
-                "results": results,
-            }))
-        );
-    } else {
+    {
         for r in &results {
             if r.pass {
                 outln!(out, "PASS {}", r.name);
@@ -420,11 +507,10 @@ fn explain_cmd(out: &mut String, file: &Path, json: bool) -> i32 {
         Some(p) if !loaded.has_errors() => p,
         _ => return report_invalid(out, &loaded, json, None, false),
     };
-    let text = explain(policy);
     if json {
-        outln!(out, "{}", pretty(&json!({"ok": true, "text": text})));
+        outln!(out, "{}", pretty(&explain_doc(&loaded)));
     } else {
-        out!(out, "{text}");
+        out!(out, "{}", explain(policy));
     }
     0
 }
@@ -446,15 +532,12 @@ fn diff_cmd(out: &mut String, old: &Path, new: &Path, json: bool) -> i32 {
     }
     let result = diff(&policies[0], &policies[1]);
     if json {
-        outln!(
-            out,
-            "{}",
-            pretty(&json!({
-                "ok": true,
-                "widens": result.widens(),
-                "changes": result.changes,
-            }))
-        );
+        let loaded = |p: &Policy| Loaded {
+            policy: Some(p.clone()),
+            diagnostics: Vec::new(),
+        };
+        let doc = diff_doc(&[("old", loaded(&policies[0])), ("new", loaded(&policies[1]))]);
+        outln!(out, "{}", pretty(&doc));
     } else if result.is_empty() {
         outln!(out, "No changes.");
     } else {
@@ -563,38 +646,39 @@ fn shell_quote(path: &Path) -> (String, bool) {
     }
 }
 
+fn simulation_doc(c: &Campaign) -> Value {
+    let decision = |k: &str| c.decisions.get(k).copied().unwrap_or(0);
+    let violations: Vec<Value> = c
+        .violations
+        .iter()
+        .map(|(seed, v)| {
+            json!({"seed": seed, "invariant": v.invariant, "step": v.step, "detail": v.detail})
+        })
+        .collect();
+    json!({
+        "ok": c.violations.is_empty(),
+        "first_seed": c.first_seed,
+        "count": c.count,
+        "steps": c.steps,
+        "events": c.events,
+        "decisions": {
+            "allow": decision("allow"),
+            "deny": decision("deny"),
+            "needs_approval": decision("needs_approval"),
+        },
+        "violations": violations,
+        "coverage": c.coverage,
+        "digest": c.digest,
+    })
+}
+
 /// Render a finished campaign: the output text and the exit code.
 fn render_simulation(file: &Path, c: &Campaign, json: bool) -> (String, i32) {
     let mut out = String::new();
     let ok = c.violations.is_empty();
     let decision = |k: &str| c.decisions.get(k).copied().unwrap_or(0);
     if json {
-        let violations: Vec<Value> = c
-            .violations
-            .iter()
-            .map(|(seed, v)| {
-                json!({"seed": seed, "invariant": v.invariant, "step": v.step, "detail": v.detail})
-            })
-            .collect();
-        outln!(
-            out,
-            "{}",
-            pretty(&json!({
-                "ok": ok,
-                "first_seed": c.first_seed,
-                "count": c.count,
-                "steps": c.steps,
-                "events": c.events,
-                "decisions": {
-                    "allow": decision("allow"),
-                    "deny": decision("deny"),
-                    "needs_approval": decision("needs_approval"),
-                },
-                "violations": violations,
-                "coverage": c.coverage,
-                "digest": c.digest,
-            }))
-        );
+        outln!(out, "{}", pretty(&simulation_doc(c)));
         return (out, i32::from(!ok));
     }
     outln!(

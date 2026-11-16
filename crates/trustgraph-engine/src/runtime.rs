@@ -21,6 +21,24 @@ pub enum OpenError {
     Replay { seq: u64, reason: String },
 }
 
+/// Where the active policy came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicySource {
+    /// The policy file given to `open` (the last `Genesis`).
+    File,
+    /// An in-service `ActivatePolicy` since the last `Genesis`.
+    Activated,
+}
+
+impl PolicySource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PolicySource::File => "file",
+            PolicySource::Activated => "activated",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Runtime<J: Journal> {
     journal: J,
@@ -216,6 +234,24 @@ impl<J: Journal> Runtime<J> {
 
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    /// Time of the last durable record; `handle` refuses anything earlier.
+    pub fn last_at(&self) -> u64 {
+        self.last_at
+    }
+
+    /// Whether the active policy is the file's or a later activation.
+    pub fn policy_source(&self) -> PolicySource {
+        if self.engine.policy_from_genesis() {
+            PolicySource::File
+        } else {
+            PolicySource::Activated
+        }
+    }
+
+    pub fn journal(&self) -> &J {
+        &self.journal
     }
 
     pub fn into_journal(self) -> J {

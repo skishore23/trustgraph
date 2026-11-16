@@ -37,9 +37,9 @@ mod runtime;
 /// engine bugs are compiled in. Production builds must have it false.
 pub const FAULT_INJECTION: bool = cfg!(feature = "fault-injection");
 
-pub use engine::Engine;
+pub use engine::{Engine, LiveApproval, PendingDecision, StoredProposal};
 #[cfg(feature = "fault-injection")]
 pub use event::Fault;
 pub use event::{Event, Reply};
 pub use journal::{FileJournal, Journal, JournalError, MemoryJournal, Record};
-pub use runtime::{OpenError, Runtime};
+pub use runtime::{OpenError, PolicySource, Runtime};

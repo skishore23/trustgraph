@@ -1299,3 +1299,66 @@ fn shape_rejection_leaves_the_clock_alone() {
 fn fault_injection_constant_is_on_in_engine_tests() {
     const { assert!(trustgraph_engine::FAULT_INJECTION) };
 }
+
+#[test]
+fn operator_views_list_pending_approved_and_proposals() {
+    let mut engine = genesis(SPEC);
+    assert!(engine.policy_from_genesis());
+    let (out, decision) = pending_email(&mut engine);
+    assert_eq!(engine.artifact_count(), 2);
+    let digest = engine.state_digest();
+
+    let pending = engine.pending_decisions(3);
+    assert_eq!(pending.len(), 1);
+    let p = &pending[0];
+    assert_eq!(
+        (p.decision.as_str(), p.agent.as_str(), p.action.as_str()),
+        (decision.as_str(), "mailer", "email_customer")
+    );
+    assert_eq!(p.artifact, out);
+    assert_eq!(p.recipients, ["acme"]);
+    assert_eq!(p.sources, ["price_sheet"]);
+    assert_eq!(p.requested_at, 3);
+    assert!(!p.reason.is_empty());
+    assert!(engine.live_approvals(3).is_empty());
+    assert_eq!(engine.state_digest(), digest, "views change nothing");
+
+    approve(&mut engine, 10, &decision, "leo");
+    assert!(engine.pending_decisions(10).is_empty());
+    let live = engine.live_approvals(10);
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].decision, decision);
+    assert_eq!(live[0].reviewer, "leo");
+    assert_eq!(live[0].expires_at, 1810);
+    assert_eq!(live[0].recipients, ["acme"]);
+    // Expired: pending again, not live.
+    assert!(engine.live_approvals(1810).is_empty());
+    assert_eq!(engine.pending_decisions(1810).len(), 1);
+
+    let agent_proposal = engine.apply(
+        11,
+        &Event::ProposePolicy {
+            agent: Some("planner".into()),
+            policy: narrowed(),
+        },
+    );
+    assert!(matches!(agent_proposal, Reply::Proposed { .. }));
+    // The first `readers: [hr] ` is the salaries source.
+    let widened = SPEC.replacen("readers: [hr] ", "readers: [hr, sales] ", 1);
+    assert!(matches!(
+        propose(&mut engine, 12, &widened),
+        Reply::Proposed { widens: true, .. }
+    ));
+    let stored = engine.stored_proposals();
+    assert_eq!(stored.len(), 2);
+    assert_eq!(stored[0].agent.as_deref(), Some("planner"));
+    assert!(!stored[0].widens);
+    assert_eq!(stored[1].agent, None);
+    assert!(stored[1].widens);
+    assert!(!stored[1].explanation.is_empty());
+
+    propose_and_activate(&mut engine, 13, &narrowed());
+    assert!(!engine.policy_from_genesis());
+    assert!(engine.pending_decisions(13).is_empty());
+    assert!(engine.live_approvals(13).is_empty());
+}

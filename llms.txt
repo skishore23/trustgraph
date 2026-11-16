@@ -6,6 +6,7 @@
 
 - [Writing policies (agent guide)](docs/agents/writing-policies.md): the file format, the check, test, explain and diff loop, every diagnostic code, and the rules for proposing changes.
 - [Starter policy](crates/trustgraph-policy/starter.policy.yaml): the commented file written by `trustgraph policy init`.
+- [trustgraph serve](docs/serve.md): the local HTTP API and MCP endpoint agents use to register what they read, record what they wrote and check right before they act; per-agent tokens, the operator page, limits and the threat model.
 
 ## Examples
 
@@ -15,4 +16,5 @@
 
 - Print the JSON Schema of the policy file: `trustgraph policy schema`
 - Validate, test, explain and compare: `trustgraph policy check FILE`, `trustgraph policy test FILE`, `trustgraph policy explain FILE`, `trustgraph policy diff OLD NEW` (add `--json` for machine output)
+- Serve the runtime to agents over HTTP and MCP (`http://127.0.0.1:8787/mcp`, `Authorization: Bearer <agent token>`): `trustgraph serve --policy FILE --operator PERSON`
 - Stress a policy on the real runtime with seeded random scenarios (agents, policy changes, crashes, approval expiry) and check the safety invariants: `trustgraph policy simulate FILE [--seed 0] [--count 64] [--steps 200] [--json]`
