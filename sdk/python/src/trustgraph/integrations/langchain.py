@@ -259,18 +259,22 @@ class Guard:
         return s
 
     def _check_history(self, s: Session, request: Any) -> None:
-        if s.carried:
-            return
-        recorded = self._recorded.get(s, set())
+        """Every mapped source result in the conversation must be one this session (or the
+        token it carries) recorded; a carried token does not excuse the check, since a
+        host-level write (``Overwrite``, ``update_state``) can replace it."""
+        recorded = self._recorded.get(s, set()) | set(s.results)
         # `request.state` is the state before this call, so it never holds this call's own result.
-        for m in _messages(request.state):
-            if isinstance(m, ToolMessage) and m.name in self.sources and m.tool_call_id not in recorded:
-                why = (
-                    f"this conversation already holds a result of `{m.name}` that this TrustGraph session did "
-                    "not record (a resumed or checkpointed thread with a new session)"
-                )
-                s.mark_broken(why)
-                raise TrustGraphError("unrecorded_history", why)
+        unknown = [
+            m for m in _messages(request.state)
+            if isinstance(m, ToolMessage) and m.name in self.sources and m.tool_call_id not in recorded
+        ]
+        if len(unknown) > s.unlisted:  # older results a long token only counts may be among them
+            why = (
+                f"this conversation already holds a result of `{unknown[-1].name}` that this TrustGraph session "
+                "did not record (a resumed or checkpointed thread with a new session, or a replaced token)"
+            )
+            s.mark_broken(why)
+            raise TrustGraphError("unrecorded_history", why)
 
     @staticmethod
     def _config(request: Any) -> Mapping[str, Any] | None:
@@ -295,6 +299,7 @@ class Guard:
             return None
         with self._lock:
             self._recorded.setdefault(s, set()).add(request.tool_call["id"])
+        s.record_result(request.tool_call["id"])  # kept in the token, for a later guard to check
         return s
 
     def _reply(self, request: Any, message: ToolMessage, s: Session | None) -> Any:

@@ -13,7 +13,7 @@ pytest.importorskip("langchain")
 from langchain.agents import create_agent  # noqa: E402
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel  # noqa: E402
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage  # noqa: E402
-from langchain_core.tools import tool  # noqa: E402
+from langchain_core.tools import InjectedToolCallId, tool  # noqa: E402
 from langgraph.checkpoint.memory import InMemorySaver  # noqa: E402
 from typing import Annotated  # noqa: E402
 
@@ -514,4 +514,49 @@ def test_guard_new_session_on_a_resumed_thread_is_refused(server: Server) -> Non
     with server.client("planner").session() as s:  # a new session for the same conversation
         s.read("roadmap", "Q3")
         msg = last(graph, calls(("post_message", {"text": "x"})), "a")
+    assert msg.status == "error" and "unrecorded_history" in msg.content and posted == []
+
+
+# -- a token replaced by a host-level write ---------------------------------
+
+
+@pytest.mark.parametrize("how", ["tool", "input"])
+def test_guard_overwritten_token_is_refused(server: Server, how: str) -> None:
+    """The third review's g3.py: `Overwrite` skips the reducer, so the token can be replaced by an
+    empty one; the history check still finds the salaries result the new token does not record."""
+    from langgraph.types import Command, Overwrite
+
+    from trustgraph._session import _token
+
+    @tool
+    def remember(value: str, tool_call_id: Annotated[str, InjectedToolCallId]) -> Any:
+        """Keep a value in state."""
+        return Command(update={"trustgraph": Overwrite(value), "messages": [ToolMessage("ok", tool_call_id=tool_call_id)]})
+
+    saver = InMemorySaver()
+    config = {"configurable": {"thread_id": how}}
+
+    def build(script: list[AIMessage]) -> Any:
+        steps = iter(script)
+        guard = guard_for(server)
+        g = StateGraph(GuardState)
+        g.add_node("model", lambda state: {"messages": [next(steps)]})
+        g.add_node("tools", ToolNode([read_salaries, read_roadmap, post_message, remember],
+                                     wrap_tool_call=guard.wrap_tool_call))
+        g.add_edge(START, "model")
+        g.add_conditional_edges("model", lambda s: "tools" if s["messages"][-1].tool_calls else END)
+        g.add_edge("tools", "model")
+        return g.compile(checkpointer=saver)
+
+    empty = _token([])
+    turn1 = [parallel("read_salaries", "read_roadmap")]
+    if how == "tool":
+        turn1.append(AIMessage("", tool_calls=[{"name": "remember", "args": {"value": empty}, "id": "m1"}]))
+    build([*turn1, AIMessage("done")]).invoke({"messages": [HumanMessage("read")]}, config)
+    second = build([parallel("read_roadmap", start=5), parallel("post_message", start=6), AIMessage("done")])
+    turn2: dict[str, Any] = {"messages": [HumanMessage("post")]}
+    if how == "input":
+        turn2["trustgraph"] = Overwrite(empty)
+    out = second.invoke(turn2, config)
+    msg = [m for m in out["messages"] if isinstance(m, ToolMessage)][-1]
     assert msg.status == "error" and "unrecorded_history" in msg.content and posted == []
