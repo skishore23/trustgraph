@@ -1,221 +1,246 @@
-<p align="center">
-  <img src="docs/assets/trustgraph.svg" alt="TrustGraph: new outputs, same obligations. Two sources combine into a quote whose audience is the intersection of its sources." width="1200" />
-</p>
-
-<p align="center">
-  <a href="https://trustgraph-demo.vercel.app/#lab">Try the dataflow lab</a> ·
-  <a href="https://trustgraph-demo.vercel.app/#simulator">Run the simulator</a> ·
-  <a href="docs/framework.md">Read the framework guide</a> ·
-  <a href="docs/verification.md">Inspect verification scope</a>
-</p>
-
 # TrustGraph
 
-**A Rust framework that keeps source permissions attached to transformed data.**
+**Policy-as-code for what AI agents produce.**
+Decide where your agent's output can go, based on what it read.
 
-A new report, quote or export doesn't arrive with a list of everything that went
-into it. TrustGraph records that list as a typed dependency graph, then checks the
-whole lineage before the output crosses a boundary.
+[Try the playground](https://trustgraph-demo.vercel.app) ·
+[Write a policy](docs/agents/writing-policies.md) ·
+[How we know it works](docs/verification.md)
 
-Not a graph database. Not an LLM judge. A deterministic permission check over
-recorded computation.
+## The problem
 
-## The useful part is what survives
+Permission systems decide what an agent may **read**. They lose track the
+moment the agent **writes** something new.
 
-```text
-Source data              Typed operation              Derived data
-───────────              ───────────────              ────────────
-Price sheet ─────┐
-                ├────── create_quote@1 ─────────────── Quote
-Contract ───────┘                                       │
-                                                       └── input to the next step
+An agent reads the HR salary file and the product roadmap. It writes a "Q3
+headcount plan" and posts it to the engineering channel. The plan is new text.
+It has no owner and no access list, so nothing stops it. The salary data just
+left HR.
+
+The restriction should have followed the data.
+
+## What TrustGraph does
+
+You write one small policy file. It says who may read anything derived from
+each source, and where each action sends output:
+
+```yaml
+version: 1
+
+groups:
+  hr: [nina]
+  engineering: [sam, ravi]
+  sales: [leo]
+  customers: [acme]
+
+agents: [planner, mailer]
+
+sources:
+  salaries:    { readers: [hr],                 agents: [planner] }
+  roadmap:     { readers: [hr, engineering],    agents: [planner] }
+  price_sheet: { readers: [sales, customers],   agents: [mailer] }
+
+actions:
+  post_to_slack:
+    agents: [planner]
+    audience: [engineering]
+  email_customer:
+    agents: [mailer]
+    audience: [customers]
+    approval: { reviewers: [sales], valid_for: 30m }
 ```
 
-An artifact is an exact data version. An operation declares named, typed ports.
-An execution records which artifacts connected to those ports. An output reused
-as the next input keeps the same identity. Follow those references backward and
-you reach its sources.
+For every output, TrustGraph answers **allow**, **needs approval** or **deny**,
+and says why:
 
-The permission rule is deliberately small:
-
-```text
-readers(output) = ∩ readers(inputs)
-recipients(action) ⊆ readers(output)
-```
-
-A price sheet readable by **Sales + Finance**, combined with a contract readable
-by **Finance**, produces a quote readable by **Finance**. Every output inherits
-all supplied inputs. A human approval can satisfy a review requirement; it cannot
-erase the source restrictions.
-
-| Build with it | Inspect it | Try to break it |
+| The agent read | It wants to | Answer |
 | --- | --- | --- |
-| Register typed operations and record their executions. | Follow exact inputs, outputs and permission decisions. | Change a permission, revoke an approval or lose an acknowledgment. |
-| [Rust SDK](crates/trustgraph-framework) | [Interactive graph](https://trustgraph-demo.vercel.app/#lab) | [Deterministic simulator](https://trustgraph-demo.vercel.app/#simulator) |
+| `salaries` + `roadmap` | `post_to_slack` | **Deny.** `salaries` is readable by hr only; engineering (ravi, sam) is not included |
+| `roadmap` | `post_to_slack` | **Allow** |
+| `price_sheet` | `email_customer` | **Needs approval** from sales, valid for 30 minutes |
 
-## Framework and applications
+The rule is small:
 
-The reusable SDK is `crates/trustgraph-framework`. It models immutable artifacts,
-versioned operation contracts, executions, source permissions and generic action
-checks. The existing GitHub gateway and guided hackathon demonstration remain
-available as applications; their specialized publication workflows have not
-been silently replaced with a new protocol.
-
-See [framework design and integration](docs/framework.md) for the API, trust
-boundary, data model and migration scope. The dependency graph is typed at
-runtime by records and port schema identities; this is **not** compile-time
-information-flow verification or semantic proof that an output contains no secret.
-
-### Run the framework examples
-
-Requires Rust 1.90 or newer. No credentials or database needed:
-
-```sh
-cargo run --locked -p trustgraph-framework --example document_flow
-cargo run --locked -p trustgraph-framework --example data_export
-cargo test --locked -p trustgraph-framework
+```text
+readers(output) = the people who may read every input
+an action is allowed only if everyone who receives it is one of those readers
 ```
 
-The first example links quote and email steps, checks an exact approval and
-changes a source restriction. The second runs an ordinary CSV sum with two
-outputs and no approval requirement. Neither sends, publishes or uploads data.
+Approval adds a requirement. It never widens who may read a source. Anything
+the policy does not name is denied.
 
-### HydraDB's role
+Decisions are deterministic. There is no model in the decision path.
 
-HydraDB is an evidence backend in the existing gateway. It stores connected
-records, which the gateway reads back and checks against recorded evidence.
-The Rust verifier applies the permission rules. A durable local journal tracks
-that gateway's runtime and publication outcomes. The in-process framework does
-not require HydraDB or make network calls. A graph store is not itself an
-execution sandbox or an enforcement point.
+## Quickstart
 
-### Integration boundary
-
-The application must route input disclosure and outgoing effects through trusted
-checks. The executor or model receiving an input is itself a recipient. Record
-all supplied context, not merely sources the model chooses to cite. Secret-bearing
-parameters must be governed artifact inputs, not unlabelled parameters JSON. Hashes detect
-changed content relative to trusted records; they do not prove honest execution
-or complete capture. A decision is not an atomic transaction with an external
-email, repository or other service.
-
-## Interactive typed-graph demo
-
-[Open the framework demo](https://trustgraph-demo.vercel.app). Inspect named ports,
-artifact identities and inherited readers, then try an incompatible schema, a
-restricted recipient, review, or a relevant/unrelated policy change. Verdicts
-come from the Rust SDK through `/api/framework`, not a browser-only simulation.
-All data is fictional; no external action occurs.
+Requires Rust 1.90 or newer.
 
 ```sh
-cargo run --locked --example framework_server
-# Open http://127.0.0.1:9082
+git clone https://github.com/skishore23/trustgraph && cd trustgraph
+cargo install --locked --path crates/trustgraph-cli
+
+trustgraph policy init                         # writes trustgraph.policy.yaml
+trustgraph policy check trustgraph.policy.yaml
+trustgraph policy test trustgraph.policy.yaml
 ```
 
-## Simulation and verification
+```text
+ok: 0 errors, 0 warnings
+PASS salary data never reaches engineering
+PASS roadmap summary can be posted
+2 passed, 0 failed
+```
 
-TrustGraph includes a simulator, not only an interactive graph. The new web
-**Simulator** section runs the existing journaled coordinator under seeded virtual
-time: ACL/revocation races, approval expiry, changed audiences/policies, lost
-provider acknowledgments and journal recovery. The trace shows the actual
-resolved order and local simulated publications. It does not send anything.
+A policy carries its own tests. Each one states what the agent read, what it
+tries to do and the answer you expect.
+
+Read a policy back in plain English, and see exactly who gains access when it
+changes:
 
 ```sh
-cargo run --locked -p trustgraph-cli -- simulate --seed 0 --count 64
-cargo run --locked -p trustgraph-cli -- check-model --depth 6
-cargo run --locked -p trustgraph-cli -- check-model --depth 6 --broken-rule
+trustgraph policy explain trustgraph.policy.yaml
+trustgraph policy diff old.policy.yaml new.policy.yaml
 ```
 
-These are distinct layers:
+```text
+salaries: output can reach hr (nina). Usable by agent planner.
+email_customer: mailer may send to customers (acme) after approval by sales (leo), valid 30m.
 
-- **Typed-dataflow lab:** actual generic SDK checks on bounded fictional graphs.
-- **Seeded simulator:** actual legacy coordinator with declared scheduling/fault
-  scenarios, not OS threads or real network/DB fault injection.
-- **Finite state exploration:** explores a declared authorization abstraction and
-  calls the production verifier; the deliberately broken rule supplies a useful
-  counterexample control.
-- **Kani harnesses:** bounded checks of production sorted-iterator permission kernels,
-  not a proof of the entire gateway, external integrations or input capture.
+WIDENS  source salaries: readers gained ravi, sam
+```
 
-See [verification scope and reproduction](docs/verification.md) for exact proof
-bounds and executed results. See [development checks](docs/development.md#local-checks)
-for saving and replaying simulation campaigns.
-
-## Existing guided demo
-
-[Try the previous gateway demo](https://trustgraph-demo.vercel.app/story.html), using fictional data
-and simulated releases. No sign-in required.
-
-### Run locally
-
-Requires Rust 1.90 or newer. Run commands from the repository root:
+Run your own policy through the simulator:
 
 ```sh
-cargo run --locked -p trustgraph-cli -- story
+trustgraph policy simulate trustgraph.policy.yaml
 ```
 
-Open [localhost:9081](http://127.0.0.1:9081/) and follow **Company → Policy →
-Simulator → Enforce → Revision**. The demo uses fictional data, a fixed clock
-and in-memory state. It needs no sign-in or external services and records
-releases locally. See the [demo walkthrough](docs/demo.md).
+```text
+64 runs, 12,936 events: 994 allow, 5,082 deny, 392 needs_approval — 0 violations
+```
 
-The same fictional story can be hosted on Vercel with the Rust policy engine.
-See [public demo deployment](docs/vercel.md) for setup and visitor-state behavior.
-Agents can also connect to the [public demo MCP endpoint](https://trustgraph-demo.vercel.app/mcp)
-for fictional workspace inspection and policy simulation, with no API key required.
+Every command takes `--json`. There are five worked policies in
+[examples/policies](examples/policies).
 
-## Existing gateway architecture
+## Let your agent write the policy
 
-TrustGraph combines three responsibilities:
+TrustGraph assumes an agent drafts the policy and a person approves it.
 
-1. **Capture inputs.** The live gateway starts a fresh Codex run and records its
-   supplied sources, instructions, output and actual Rust test results.
-2. **Check access and approval.** Rust follows the recorded dependencies,
-   intersects source reader sets and verifies human approval of the exact output,
-   destination and policy context.
-3. **Control publication.** The coordinator rechecks evidence, journals the
-   attempt and sends the checked files through the GitHub publisher.
+- **Errors an agent can act on.** Every problem is reported at once, with its
+  path, a code and a suggestion:
 
-HydraDB stores connected evidence. A durable local journal tracks runtime state
-and publication outcomes. Read the [architecture guide](docs/architecture.md)
-for Mermaid component, sequence, evidence-flow and recovery diagrams.
+  ```json
+  {
+    "code": "unknown_name",
+    "message": "`enginering` is not a group or person in this policy",
+    "path": "sources.salaries.readers[1]",
+    "severity": "error",
+    "suggestion": "did you mean `engineering`?"
+  }
+  ```
 
-## Run the live integration
+- **A loop it can run alone:** `init` → `check` → `test` → `simulate` →
+  `explain` → `diff`.
+- **A review a person can do in a minute:** the plain-English explanation and
+  a diff in which every widening of access is marked.
 
-For a native 8090 agent proposing a GitHub issue through human approval and
-Composio, see the [issue-action demo](examples/integrations/composio-github-issues/docs/8090-issue-actions.md). It has a preview
-mode and does not use a patch generator.
-For a short presentation with publication grant/revoke controls, follow the
-[live issue demo runbook](examples/integrations/composio-github-issues/docs/one-hour-issue-demo.md).
+Point your agent at [docs/agents/writing-policies.md](docs/agents/writing-policies.md)
+or [llms.txt](llms.txt). Agents propose; people approve. Protect the policy
+file with code review.
 
-The live gateway uses authenticated Codex, HydraDB and GitHub integrations,
-macOS for isolated Rust checks, and a dedicated private personal repository.
-Follow [live setup](docs/development.md#start-the-live-workspace) to configure
-[trustgraph.example.json](trustgraph.example.json), then run:
+## Use it in your system
+
+Today TrustGraph ships as Rust crates and the CLI.
+
+```rust
+use trustgraph_policy::{decide, parse, Query, Verdict};
+
+let policy = parse(&policy_yaml).policy.expect("valid policy");
+let outcome = decide(&policy, &Query {
+    output_from: ["salaries", "roadmap"].map(String::from).into(),
+    agent: "planner".into(),
+    action: "post_to_slack".into(),
+    recipients: None, // the action's whole audience
+});
+assert_eq!(outcome.verdict, Verdict::Deny);
+println!("{}", outcome.reason);
+```
 
 ```sh
-cargo build --locked -p trustgraph-cli
-./target/debug/trustgraph start
+cargo run -p trustgraph-policy --example decide
 ```
 
-Open the private operator launch file printed at startup. The operator reviews
-and approves the exact change before creating a **draft pull request**.
-See [agent integration](docs/agent-integration.md) for MCP and HTTP clients, and
-[scope](docs/architecture.md#scope) for the current execution boundary.
-
-## Repository layout
-
-| Path | Purpose |
+| Crate | Use it for |
 | --- | --- |
-| `crates/trustgraph-framework` | Generic typed dataflow SDK and permission-preserving execution records |
-| `crates/trustgraph-core` | Deterministic verification, lineage and approval binding |
-| `crates/trustgraph-runtime` | Policy compilation, coordination, journals and recovery |
-| `crates/trustgraph-live` | Codex execution, hosted Hydra evidence, HTTP API and GitHub publication |
-| `crates/trustgraph-cli` | Commands, restricted MCP adapter and guided demo server |
-| `crates/trustgraph-sim` | Bounded model checks and reproducible simulation campaigns |
-| `web` | Embedded guided-demo and live-workspace assets |
-| `examples` | Policy examples, simulation inputs and fictional bank source material |
-| `docs` | Architecture, setup and usage guides |
+| [`trustgraph-policy`](crates/trustgraph-policy) | Parse, validate, test, explain and diff policies. `decide` is a pure function. |
+| [`trustgraph-engine`](crates/trustgraph-engine) | A journaled runtime that records sources and outputs, tracks approvals and survives restarts. |
+
+**Coming next:** `trustgraph serve`, a local service over HTTP and MCP, so any
+agent stack can register what it read and ask before it acts. It is not built
+yet.
+
+## How we know it works
+
+- **One decision order.** The allow / needs-approval / deny ordering lives in
+  one small kernel that both the policy function and the runtime call.
+- **Bounded proofs of the core rules.** Ten [Kani](https://model-checking.github.io/kani/)
+  harnesses cover that kernel, the approval time window and the reader-set
+  rules. All ten pass in CI.
+- **A simulator that runs the real runtime.** Seeded runs drive the same code
+  through policy changes, crashes, torn journal writes and approval expiry,
+  and check five safety rules on every step against a check computed from the
+  policy text alone. Three deliberately broken builds of the runtime must be
+  caught, and are.
+
+The proofs are bounded and cover the core rules, not the whole system. The
+simulator shows the absence of violations in the runs it made, not in all
+possible runs. [Verification scope and reproduction](docs/verification.md)
+states exactly what each covers.
+
+## What it does not do
+
+- **It only knows what you tell it.** If your system does not report a source
+  the agent read, TrustGraph cannot account for it.
+- **It decides; it does not act.** Your system must ask right before it acts,
+  and act only on *allow*.
+- **The rule is strict.** One sensitive input restricts the whole output to
+  that input's readers. There is no "this summary is safe to share" exception
+  yet.
+- **Groups are lists in the file.** They are not synced from an identity
+  provider.
+
+## Where it fits
+
+Permission databases such as SpiceDB or OpenFGA decide what your agent may
+read. TrustGraph decides where what it wrote may go. Use both.
+
+## Repository
+
+| Path | What it is |
+| --- | --- |
+| `crates/trustgraph-policy` | The policy file: parsing, decisions, tests, explain, diff |
+| `crates/trustgraph-engine` | Deterministic runtime core, journal and replay |
+| `crates/trustgraph-core` | Proof-friendly kernels and their Kani harnesses |
+| `crates/trustgraph-sim` | The seeded simulator and its safety checks |
+| `crates/trustgraph-cli` | The `trustgraph` command |
+| `examples/policies` | Five worked policies |
+| `docs/agents` | The policy-writing guide for agents |
+
+### Reference applications
+
+Earlier work that TrustGraph grew out of. They use their own policy formats.
+
+- **Typed dataflow SDK** — `crates/trustgraph-framework`, the lineage graph the
+  runtime is built on. [Guide](docs/framework.md) ·
+  [interactive lab](https://trustgraph-demo.vercel.app/lab.html)
+- **Guided story demo** — a fictional company walkthrough.
+  [Demo](https://trustgraph-demo.vercel.app/story.html) ·
+  [walkthrough](docs/demo.md)
+- **Live coding gateway** — a fresh Codex run, isolated Rust checks, human
+  approval and a GitHub draft pull request. [Architecture](docs/architecture.md) ·
+  [setup](docs/development.md)
+- **Composio integration** — an agent proposes a GitHub issue; a person
+  approves it. [Example](examples/integrations/composio-github-issues)
 
 ## Development
 
@@ -225,17 +250,5 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-See [development checks](docs/development.md#local-checks) for model exploration
-and campaign replay. Local configuration, runtime state, credentials and build
-output are ignored by Git.
-
-## Documentation
-
-| Guide | What it explains |
-| --- | --- |
-| [Architecture](docs/architecture.md) | Components, captured evidence, inherited access, approval and recovery |
-| [Policies and simulation](docs/policy.md) | Company YAML, live JSON and hypothetical policy comparisons |
-| [Agent integration](docs/agent-integration.md) | Restricted MCP tools, HTTP requests and operator authority |
-| [Demo walkthrough](docs/demo.md) | The complete fictional dashboard scenario |
-| [Development and live setup](docs/development.md) | Configuration, checks and the real bank workbench |
-
+See [development checks](docs/development.md#local-checks) and
+[public demo deployment](docs/vercel.md).
