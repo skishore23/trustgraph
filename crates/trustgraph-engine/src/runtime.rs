@@ -1,12 +1,12 @@
 //! Journal-first runtime: every event is made durable before the engine sees
 //! it, and the engine is rebuilt by replay on open.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 use trustgraph_policy::{Diagnostic, Policy, Severity, lint, parse, run_tests};
 
-use crate::engine::Engine;
+use crate::engine::{Engine, ProposalOrigin};
 #[cfg(feature = "fault-injection")]
 use crate::event::Fault;
 use crate::event::{Event, Reply};
@@ -43,6 +43,8 @@ impl PolicySource {
 
 /// What `open` does with a policy file that differs from the active policy
 /// of a non-empty journal. On an empty journal the file is always applied.
+/// A file that fails validation on a non-empty journal is ignored under
+/// `Propose` and is an error under `Activate`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PolicyFile {
     /// Store it as a file proposal for the operator; the active policy stays.
@@ -60,13 +62,28 @@ pub enum FileOutcome {
     /// The file encodes the active policy.
     Unchanged,
     /// The file differs from the active policy but was applied or proposed
-    /// before with this digest, so nothing was written. `proposal` is true
-    /// when that proposal is still stored.
-    AlreadyRecorded { digest: String, proposal: bool },
+    /// before with this digest, so nothing was written. `stored` is who
+    /// holds a stored proposal with this digest now, if anyone does.
+    AlreadyRecorded {
+        digest: String,
+        stored: Option<ProposalOrigin>,
+    },
+    /// The journal is not empty and the file fails validation: it was
+    /// ignored, nothing was written, and the active policy stays.
+    Invalid { diagnostics: Vec<Diagnostic> },
     /// The file differs: it was stored as a file proposal (`id`).
     Proposed { id: String },
     /// `PolicyFile::Activate`: the file replaced `previous`.
     Activated { previous: Box<Policy> },
+}
+
+/// What the journal records that name one agent take.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AgentUsage {
+    /// Bytes of journal lines, newline included.
+    pub journal_bytes: u64,
+    /// Artifacts those records created.
+    pub artifacts: u64,
 }
 
 #[derive(Debug)]
@@ -77,6 +94,28 @@ pub struct Runtime<J: Journal> {
     last_hash: String,
     last_at: u64,
     file_outcome: FileOutcome,
+    usage: BTreeMap<String, AgentUsage>,
+}
+
+/// The agent a record is attributed to: `RecordOutput`, `Check` and an
+/// agent's `ProposePolicy` name one. `RegisterSource` names none.
+fn record_agent(event: &Event) -> Option<&str> {
+    match event {
+        Event::RecordOutput { agent, .. } | Event::Check { agent, .. } => Some(agent),
+        Event::ProposePolicy { agent, .. } => agent.as_deref(),
+        _ => None,
+    }
+}
+
+/// Charge `record` (which created `created` artifacts) to its agent.
+fn charge(usage: &mut BTreeMap<String, AgentUsage>, record: &Record, created: usize) {
+    let Some(agent) = record_agent(&record.event) else {
+        return;
+    };
+    let bytes = record.line_len().map_or(0, |n| n as u64 + 1);
+    let entry = usage.entry(agent.to_string()).or_default();
+    entry.journal_bytes = entry.journal_bytes.saturating_add(bytes);
+    entry.artifacts = entry.artifacts.saturating_add(created as u64);
 }
 
 /// Parse, lint and run the inline tests; the digest of a valid policy.
@@ -119,9 +158,11 @@ fn engine_rejected(message: String) -> OpenError {
 
 impl<J: Journal> Runtime<J> {
     /// Replay `journal`. On an empty journal `policy_yaml` becomes the first
-    /// policy. On a non-empty one it never takes effect by itself: when it
-    /// differs from the active policy and this digest was neither applied nor
-    /// proposed before, it is stored as a file proposal (`PolicyFile::Propose`).
+    /// policy, and an invalid one is an error. On a non-empty one it never
+    /// takes effect by itself: when it differs from the active policy and
+    /// this digest was neither applied nor proposed before, it is stored as
+    /// the file proposal (`PolicyFile::Propose`); when it is invalid it is
+    /// ignored (`FileOutcome::Invalid`).
     pub fn open(journal: J, policy_yaml: &str, at: u64) -> Result<Self, OpenError> {
         Self::open_with(journal, policy_yaml, at, PolicyFile::Propose)
     }
@@ -159,22 +200,79 @@ impl<J: Journal> Runtime<J> {
         mode: PolicyFile,
         new_engine: impl Fn() -> Engine,
     ) -> Result<Self, OpenError> {
-        let wanted = validate(policy_yaml)?;
+        let validated = validate(policy_yaml);
         let genesis = |policy_yaml: &str| Event::Genesis {
             policy: policy_yaml.to_string(),
         };
         let records = journal.load()?;
-        if records.is_empty() {
+        let empty = records.is_empty();
+        // The file must be valid wherever it would be applied: on an empty
+        // journal, or when the person at the terminal asked for it.
+        // Elsewhere an invalid file is ignored, so whoever can edit the file
+        // cannot keep a server with a policy from starting.
+        let wanted = match validated {
+            Ok(digest) => digest,
+            Err(OpenError::InvalidPolicy(diagnostics)) if !empty && mode == PolicyFile::Propose => {
+                let (mut runtime, _) = Self::replay(journal, records, new_engine)?;
+                runtime.file_outcome = FileOutcome::Invalid { diagnostics };
+                return Ok(runtime);
+            }
+            Err(error) => return Err(error),
+        };
+        if empty {
             // Nothing may be journaled that the engine would refuse.
             let reply = new_engine().apply(at, &genesis(policy_yaml));
             if let Reply::Rejected { code: _, message } = reply {
                 return Err(engine_rejected(message));
             }
         }
+        let (mut runtime, file_digests) = Self::replay(journal, records, new_engine)?;
+        let at = at.max(runtime.last_at);
+        let active = runtime.engine.policy().cloned();
+        runtime.file_outcome = match active {
+            _ if empty => {
+                runtime.apply_file(at, genesis(policy_yaml))?;
+                FileOutcome::Genesis
+            }
+            Some(active) if active.digest() == wanted => FileOutcome::Unchanged,
+            Some(active) if mode == PolicyFile::Activate => {
+                runtime.apply_file(at, genesis(policy_yaml))?;
+                FileOutcome::Activated {
+                    previous: Box::new(active),
+                }
+            }
+            _ if file_digests.contains(&wanted) => FileOutcome::AlreadyRecorded {
+                stored: runtime.engine.proposal_origin(&wanted).cloned(),
+                digest: wanted,
+            },
+            _ => {
+                let event = Event::ProposeFromFile {
+                    policy: policy_yaml.to_string(),
+                };
+                match runtime.apply_file(at, event)? {
+                    Reply::Proposed { id, .. } => FileOutcome::Proposed { id },
+                    other => {
+                        return Err(engine_rejected(format!(
+                            "the file proposal was not stored: {other:?}"
+                        )));
+                    }
+                }
+            }
+        };
+        Ok(runtime)
+    }
+
+    /// Rebuild the engine from `records`, with the digests the policy file
+    /// has had: every accepted Genesis and every file proposal.
+    fn replay(
+        journal: J,
+        records: Vec<Record>,
+        new_engine: impl Fn() -> Engine,
+    ) -> Result<(Self, BTreeSet<String>), OpenError> {
         let mut engine = new_engine();
         let mut previous_at = 0;
-        // Digests the policy file has had: every accepted Genesis and every
-        // file proposal. A file is proposed at most once per digest.
+        let mut usage = BTreeMap::new();
+        // A file is proposed at most once per digest.
         let mut file_digests: BTreeSet<String> = BTreeSet::new();
         for (index, record) in records.iter().enumerate() {
             let replay = |reason: String| OpenError::Replay {
@@ -193,7 +291,13 @@ impl<J: Journal> Runtime<J> {
                 )));
             }
             previous_at = record.at;
+            let artifacts = engine.artifact_count();
             let reply = engine.apply(record.at, &record.event);
+            charge(
+                &mut usage,
+                record,
+                engine.artifact_count().saturating_sub(artifacts),
+            );
             match (&reply, is_genesis) {
                 (Reply::Rejected { code, message }, true) if index == 0 => {
                     return Err(replay(format!("Genesis was rejected: {code}: {message}")));
@@ -210,48 +314,16 @@ impl<J: Journal> Runtime<J> {
         let (last_seq, last_hash) = records
             .last()
             .map_or((0, GENESIS_PREV.to_string()), |r| (r.seq, r.hash.clone()));
-        let empty = records.is_empty();
-        let mut runtime = Runtime {
+        let runtime = Runtime {
             journal,
             engine,
             last_seq,
             last_hash,
             last_at: previous_at,
             file_outcome: FileOutcome::Genesis,
+            usage,
         };
-        let at = at.max(runtime.last_at);
-        let active = runtime.engine.policy().cloned();
-        runtime.file_outcome = match active {
-            _ if empty => {
-                runtime.apply_file(at, genesis(policy_yaml))?;
-                FileOutcome::Genesis
-            }
-            Some(active) if active.digest() == wanted => FileOutcome::Unchanged,
-            Some(active) if mode == PolicyFile::Activate => {
-                runtime.apply_file(at, genesis(policy_yaml))?;
-                FileOutcome::Activated {
-                    previous: Box::new(active),
-                }
-            }
-            _ if file_digests.contains(&wanted) => FileOutcome::AlreadyRecorded {
-                proposal: runtime.engine.has_proposal(&wanted),
-                digest: wanted,
-            },
-            _ => {
-                let event = Event::ProposeFromFile {
-                    policy: policy_yaml.to_string(),
-                };
-                match runtime.apply_file(at, event)? {
-                    Reply::Proposed { id, .. } => FileOutcome::Proposed { id },
-                    other => {
-                        return Err(engine_rejected(format!(
-                            "the file proposal was not stored: {other:?}"
-                        )));
-                    }
-                }
-            }
-        };
-        Ok(runtime)
+        Ok((runtime, file_digests))
     }
 
     /// Journal and apply a system event for the policy file; a rejection
@@ -317,7 +389,19 @@ impl<J: Journal> Runtime<J> {
         self.last_seq = record.seq;
         self.last_hash = record.hash.clone();
         self.last_at = at;
-        Ok(self.engine.apply(at, &record.event))
+        let artifacts = self.engine.artifact_count();
+        let reply = self.engine.apply(at, &record.event);
+        let created = self.engine.artifact_count().saturating_sub(artifacts);
+        charge(&mut self.usage, &record, created);
+        Ok(reply)
+    }
+
+    /// What the journal records naming each agent take (`RecordOutput`,
+    /// `Check`, an agent's `ProposePolicy`), over the whole journal: rebuilt
+    /// by replay at open and kept up to date by `handle`. `RegisterSource`
+    /// names no agent, so it is in nobody's usage.
+    pub fn agent_usage(&self) -> &BTreeMap<String, AgentUsage> {
+        &self.usage
     }
 
     /// `seq` of the last durable record; it moves only when `handle`

@@ -17,8 +17,11 @@
 //! Growth: the journal grows without bound by design; there is no compaction
 //! yet. Artifacts, Graph operations and lineage also grow with every agent
 //! call (remembered pending decisions are capped at 64 per agent and 1,024 in
-//! all; stored proposals at 32 per class, operator or agent, and 8 per agent). A server that exposes this runtime to agents
-//! must add per-agent quotas, as `trustgraph serve` does.
+//! all; stored proposals at 32 for the operator, 32 for all agents with 8
+//! per agent, and one, the latest, from the policy file). A server that
+//! exposes this runtime to agents must add per-agent quotas, as
+//! `trustgraph serve` does; [`Runtime::agent_usage`] gives what each agent's
+//! journal records take, rebuilt at open.
 //!
 //! Errors: when [`Runtime::handle`] or [`Journal::append`] returns `Err`, the
 //! outcome is unknown. Drop the `Runtime` and [`Runtime::open`] it again.
@@ -42,4 +45,4 @@ pub use engine::{Engine, LiveApproval, PendingDecision, ProposalOrigin, StoredPr
 pub use event::Fault;
 pub use event::{Event, Reply};
 pub use journal::{FileJournal, Journal, JournalError, MemoryJournal, Record};
-pub use runtime::{FileOutcome, OpenError, PolicyFile, PolicySource, Runtime};
+pub use runtime::{AgentUsage, FileOutcome, OpenError, PolicyFile, PolicySource, Runtime};

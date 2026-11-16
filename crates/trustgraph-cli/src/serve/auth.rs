@@ -8,13 +8,15 @@
 //! to this origin, port included) and sends it as `X-TrustGraph-Operator`.
 //! Only one session is live at a time: a new exchange ends the previous one.
 //! Every exchange makes a fresh launch secret for the next sign-in.
+//! Expiry is measured on the server's own time (seconds, passed in by the
+//! caller), so sleep and clock rules are the same as for approvals.
 use axum::http::{HeaderMap, header};
 use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
     sync::Mutex,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 /// Default operator session lifetime.
@@ -80,8 +82,8 @@ pub enum Session {
 struct Inner {
     launch: String,
     launch_file: Option<PathBuf>,
-    /// `(id, expiry)` of the one live session.
-    session: Option<(String, Instant)>,
+    /// `(id, expiry)` of the one live session, in server seconds.
+    session: Option<(String, u64)>,
     /// The id the last sign-in replaced, to tell its page why it is out.
     replaced: Option<String>,
 }
@@ -103,10 +105,6 @@ impl OwnerSessions {
                 replaced: None,
             }),
         }
-    }
-
-    pub fn lifetime(&self) -> Duration {
-        self.lifetime
     }
 
     fn inner(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -137,30 +135,30 @@ impl OwnerSessions {
         Ok(())
     }
 
-    /// Exchange the launch secret. On success the secret is dead, a new one
-    /// replaces it (the caller writes the new launch file), the previous
-    /// session ends, and the new session id is returned.
-    pub fn exchange(&self, presented: &str) -> Option<String> {
+    /// Exchange the launch secret at server time `now`. On success the
+    /// secret is dead, a new one replaces it (the caller writes the new
+    /// launch file), the previous session ends, and the new session id and
+    /// its expiry are returned.
+    pub fn exchange(&self, presented: &str, now: u64) -> Option<(String, u64)> {
         let mut inner = self.inner();
         if !constant_time_eq(inner.launch.as_bytes(), presented.as_bytes()) {
             return None;
         }
         inner.launch = random_secret();
         let id = random_secret();
-        let previous = inner
-            .session
-            .replace((id.clone(), Instant::now() + self.lifetime));
+        let expiry = now.saturating_add(self.lifetime.as_secs());
+        let previous = inner.session.replace((id.clone(), expiry));
         inner.replaced = previous.map(|(old, _)| old);
-        Some(id)
+        Some((id, expiry))
     }
 
-    /// The operator session named by the request's `X-TrustGraph-Operator`.
-    pub fn check(&self, headers: &HeaderMap) -> Session {
+    /// The operator session named by the request's `X-TrustGraph-Operator`,
+    /// at server time `now`.
+    pub fn check(&self, headers: &HeaderMap, now: u64) -> Session {
         let Some(presented) = headers.get(OPERATOR_HEADER).and_then(|v| v.to_str().ok()) else {
             return Session::Invalid;
         };
         let inner = self.inner();
-        let now = Instant::now();
         let current = inner.session.as_ref().is_some_and(|(id, expiry)| {
             constant_time_eq(id.as_bytes(), presented.as_bytes()) & (*expiry > now)
         });
@@ -253,17 +251,17 @@ mod tests {
                 0o600
             );
         }
-        assert!(sessions.exchange(&"0".repeat(64)).is_none());
+        assert!(sessions.exchange(&"0".repeat(64), 0).is_none());
         assert_eq!(
             sessions.launch_secret(),
             launch,
             "a wrong guess must not burn the secret"
         );
-        let id = sessions.exchange(&launch).unwrap();
+        let (id, _) = sessions.exchange(&launch, 0).unwrap();
         assert_ne!(id, launch);
         assert_ne!(sessions.launch_secret(), launch, "a new secret replaces it");
         assert!(
-            sessions.exchange(&launch).is_none(),
+            sessions.exchange(&launch, 0).is_none(),
             "the old secret is dead"
         );
         let with = |name: &str, value: &str| {
@@ -272,43 +270,48 @@ mod tests {
                 value,
             )])
         };
-        assert_eq!(sessions.check(&with(OPERATOR_HEADER, &id)), Session::Valid);
-        assert_eq!(sessions.check(&HeaderMap::new()), Session::Invalid);
         assert_eq!(
-            sessions.check(&with("cookie", &format!("trustgraph_owner={id}"))),
+            sessions.check(&with(OPERATOR_HEADER, &id), 0),
+            Session::Valid
+        );
+        assert_eq!(sessions.check(&HeaderMap::new(), 0), Session::Invalid);
+        assert_eq!(
+            sessions.check(&with("cookie", &format!("trustgraph_owner={id}")), 0),
             Session::Invalid,
             "a cookie is never a session"
         );
         assert_eq!(
-            sessions.check(&with("authorization", &format!("Bearer {id}"))),
+            sessions.check(&with("authorization", &format!("Bearer {id}")), 0),
             Session::Invalid
         );
         assert_eq!(
-            sessions.check(&with(OPERATOR_HEADER, &launch)),
+            sessions.check(&with(OPERATOR_HEADER, &launch), 0),
             Session::Invalid
         );
 
         // A second sign-in ends the first session.
-        let second = sessions.exchange(&sessions.launch_secret()).unwrap();
+        let (second, _) = sessions.exchange(&sessions.launch_secret(), 0).unwrap();
         assert_eq!(
-            sessions.check(&with(OPERATOR_HEADER, &id)),
+            sessions.check(&with(OPERATOR_HEADER, &id), 0),
             Session::Replaced
         );
         assert_eq!(
-            sessions.check(&with(OPERATOR_HEADER, &second)),
+            sessions.check(&with(OPERATOR_HEADER, &second), 0),
             Session::Valid
         );
     }
 
     #[test]
-    fn sessions_expire() {
-        let sessions = OwnerSessions::new(Duration::from_millis(0));
-        let id = sessions.exchange(&sessions.launch_secret()).unwrap();
+    fn sessions_expire_on_the_time_they_are_given() {
+        let sessions = OwnerSessions::new(Duration::from_secs(10));
+        let (id, expiry) = sessions.exchange(&sessions.launch_secret(), 100).unwrap();
+        assert_eq!(expiry, 110);
         let h = headers(&[(
             header::HeaderName::from_static(OPERATOR_HEADER),
             id.as_str(),
         )]);
-        assert_eq!(sessions.check(&h), Session::Invalid);
+        assert_eq!(sessions.check(&h, 109), Session::Valid);
+        assert_eq!(sessions.check(&h, 110), Session::Invalid);
     }
 
     #[test]

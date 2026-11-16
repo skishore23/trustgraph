@@ -25,7 +25,8 @@ use crate::rules::{
     validate_policy,
 };
 
-/// Stored proposals per class (agent-proposed; operator- or file-proposed).
+/// Stored proposals per class (agent-proposed; operator-proposed). The
+/// policy file has a class of its own that holds only its latest version.
 const MAX_PROPOSALS_PER_CLASS: usize = 32;
 /// Stored proposals per proposing agent, within the agent class.
 const MAX_PROPOSALS_PER_AGENT: usize = 8;
@@ -56,8 +57,9 @@ struct Remembered {
     reason: String,
 }
 
-/// Who stored a proposal. `Operator` and `File` share the operator class;
-/// agents never push those out.
+/// Who stored a proposal. Each origin kind is its own class: agents share
+/// one (with a per-agent cap), the operator has one, and the policy file
+/// holds a single slot, so no class can push out another's entries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProposalOrigin {
@@ -67,12 +69,6 @@ pub enum ProposalOrigin {
     File,
     /// `ProposePolicy` from this agent.
     Agent(String),
-}
-
-impl ProposalOrigin {
-    fn operator_class(&self) -> bool {
-        !matches!(self, ProposalOrigin::Agent(_))
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -256,6 +252,14 @@ impl Engine {
     /// True when a proposal with this id (policy digest) is stored.
     pub fn has_proposal(&self, id: &str) -> bool {
         self.proposals.iter().any(|p| p.id == id)
+    }
+
+    /// Who stored the proposal with this id, when one is stored.
+    pub fn proposal_origin(&self, id: &str) -> Option<&ProposalOrigin> {
+        self.proposals
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| &p.origin)
     }
 
     /// Number of artifacts (sources and outputs) the engine holds.
@@ -916,10 +920,14 @@ impl Engine {
 
     /// Store a validated proposal and answer with its diff from the active
     /// policy. An agent re-proposing a stored digest changes nothing, so it
-    /// can neither take over nor move another origin's entry; the operator or
-    /// the file proposing an agent's digest moves it into the operator class.
-    /// Quotas: 32 per class, and 8 per agent within the agent class.
-    /// Eviction removes the proposer's own oldest entry first.
+    /// can neither take over nor move another origin's entry. The operator
+    /// proposing any stored digest makes it the operator's; the file
+    /// proposing an agent's digest makes it the file's, and leaves the
+    /// operator's own entry as it is.
+    /// Quotas: 32 for the operator, 32 for all agents and 8 per agent within
+    /// them, and ONE for the policy file: a newer file version replaces the
+    /// older file proposal. Eviction removes the proposer's own oldest entry
+    /// first.
     fn store_proposal(&mut self, origin: ProposalOrigin, proposed: Policy) -> Handled {
         let active = self.active()?;
         let id = proposed.digest();
@@ -930,10 +938,16 @@ impl Engine {
             changes: changes.changes,
             explanation: explain(&proposed),
         };
+        let from_file = origin == ProposalOrigin::File;
+        if from_file {
+            // The file's one slot: an older version goes.
+            self.proposals
+                .retain(|p| p.origin != ProposalOrigin::File || p.id == id);
+        }
         if let Some(existing) = self.proposals.iter().find(|p| p.id == id) {
             let keep = match (&origin, &existing.origin) {
                 (ProposalOrigin::Agent(_), _) => true,
-                (ProposalOrigin::File, e) => e.operator_class(),
+                (ProposalOrigin::File, e) => !matches!(e, ProposalOrigin::Agent(_)),
                 (ProposalOrigin::Operator, _) => false,
             };
             if keep {
@@ -946,37 +960,36 @@ impl Engine {
             policy: proposed,
             origin: origin.clone(),
         });
-        if let ProposalOrigin::Agent(agent) = &origin {
-            let own = |p: &Proposal| matches!(&p.origin, ProposalOrigin::Agent(a) if a == agent);
-            if self.proposals.iter().filter(|p| own(p)).count() > MAX_PROPOSALS_PER_AGENT
-                && let Some(oldest) = self.proposals.iter().position(own)
-            {
-                self.proposals.remove(oldest);
-            }
-            let agents = self
-                .proposals
-                .iter()
-                .filter(|p| !p.origin.operator_class())
-                .count();
-            if agents > MAX_PROPOSALS_PER_CLASS
-                && let Some(victim) = self.agent_proposal_victim()
-            {
-                self.proposals.remove(victim);
-            }
-        } else {
-            let operators = self
-                .proposals
-                .iter()
-                .filter(|p| p.origin.operator_class())
-                .count();
-            if operators > MAX_PROPOSALS_PER_CLASS
-                && let Some(oldest) = self
+        match &origin {
+            ProposalOrigin::Agent(agent) => {
+                let own =
+                    |p: &Proposal| matches!(&p.origin, ProposalOrigin::Agent(a) if a == agent);
+                if self.proposals.iter().filter(|p| own(p)).count() > MAX_PROPOSALS_PER_AGENT
+                    && let Some(oldest) = self.proposals.iter().position(own)
+                {
+                    self.proposals.remove(oldest);
+                }
+                let agents = self
                     .proposals
                     .iter()
-                    .position(|p| p.origin.operator_class())
-            {
-                self.proposals.remove(oldest);
+                    .filter(|p| matches!(p.origin, ProposalOrigin::Agent(_)))
+                    .count();
+                if agents > MAX_PROPOSALS_PER_CLASS
+                    && let Some(victim) = self.agent_proposal_victim()
+                {
+                    self.proposals.remove(victim);
+                }
             }
+            ProposalOrigin::Operator => {
+                let operator = |p: &Proposal| p.origin == ProposalOrigin::Operator;
+                if self.proposals.iter().filter(|p| operator(p)).count() > MAX_PROPOSALS_PER_CLASS
+                    && let Some(oldest) = self.proposals.iter().position(operator)
+                {
+                    self.proposals.remove(oldest);
+                }
+            }
+            // Older file versions were removed above.
+            ProposalOrigin::File => {}
         }
         Ok(reply)
     }

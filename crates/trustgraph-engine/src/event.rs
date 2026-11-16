@@ -49,8 +49,8 @@ pub enum Event {
         operator: String,
     },
     /// System only, written by `Runtime::open`: the policy file differs from
-    /// the active policy, so it is stored as an operator-class proposal
-    /// marked as coming from the file. It never changes the active policy.
+    /// the active policy, so it is stored as the file's one proposal,
+    /// replacing any older file proposal. It never changes the active policy.
     ProposeFromFile {
         policy: String,
     },

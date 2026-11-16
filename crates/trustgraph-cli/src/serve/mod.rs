@@ -17,7 +17,10 @@
 //! real work.
 //!
 //! Time: `now` is the larger of the wall clock and the last journaled time
-//! at start, plus monotonic time since; later wall-clock jumps are ignored.
+//! at start, plus the time elapsed since: the larger of monotonic and
+//! wall-clock elapsed time, never less than before. Sleep (which monotonic
+//! time skips) and forward wall-clock jumps make things expire sooner; a
+//! backward jump is ignored. Operator sessions use the same time.
 //!
 //! Every request must name the loopback `Host` with this server's port, and
 //! a browser `Origin`, when present, must be the same origin. A journal
@@ -60,9 +63,9 @@ pub const BODY_LIMIT: usize = 512 * 1024;
 const DRAIN_LIMIT: usize = 8 * 1024 * 1024;
 pub const DEFAULT_MAX_ARTIFACTS: usize = 100_000;
 pub const DEFAULT_MAX_JOURNAL_BYTES: u64 = 1 << 30;
-/// Journal bytes one agent may cause per process lifetime.
+/// Journal bytes one agent may cause over the state directory's lifetime.
 pub const DEFAULT_AGENT_JOURNAL_BYTES: u64 = 64 << 20;
-/// Artifacts one agent may create per process lifetime.
+/// Artifacts one agent may create over the state directory's lifetime.
 pub const DEFAULT_AGENT_ARTIFACTS: u64 = 10_000;
 /// How far the wall clock may be behind the journal at start before
 /// approvals are refused.
@@ -100,9 +103,10 @@ impl ServeJournal for MemoryJournal {
 pub struct Limits {
     pub max_artifacts: usize,
     pub max_journal_bytes: u64,
-    /// Journal bytes each agent may cause per process lifetime.
+    /// Journal bytes each agent may cause over the state directory's
+    /// lifetime (rebuilt from the journal at start).
     pub agent_journal_bytes: u64,
-    /// Artifacts each agent may create per process lifetime.
+    /// Artifacts each agent may create over the state directory's lifetime.
     pub agent_artifacts: u64,
     /// Sustained requests per second per agent.
     pub rate_per_second: f64,
@@ -278,11 +282,50 @@ enum Lane {
     Simulate,
 }
 
-/// What one agent has made the server store since this process started.
+/// What one agent has made the server store: its journaled records since
+/// the journal began (rebuilt at start), plus the sources it registered
+/// while this process ran.
 #[derive(Debug, Default, Clone, Copy)]
 struct Usage {
     journal_bytes: u64,
     artifacts: u64,
+}
+
+/// The server's time, in seconds: `base` plus the elapsed time since start,
+/// where elapsed is the largest of monotonic elapsed, wall-clock elapsed and
+/// any elapsed value seen before. Monotonic time stops during sleep on
+/// macOS and Linux, so wall time makes sleep count; the high-water mark
+/// keeps a backward wall jump from undoing a forward one.
+struct ServerTime {
+    clock: Arc<dyn Clock>,
+    base: u64,
+    start_monotonic: Duration,
+    start_wall: u64,
+    elapsed: AtomicU64,
+}
+
+impl ServerTime {
+    fn new(clock: Arc<dyn Clock>, base: u64) -> Self {
+        ServerTime {
+            base,
+            start_monotonic: clock.monotonic(),
+            start_wall: clock.wall(),
+            elapsed: AtomicU64::new(0),
+            clock,
+        }
+    }
+
+    fn now(&self) -> u64 {
+        let monotonic = self
+            .clock
+            .monotonic()
+            .saturating_sub(self.start_monotonic)
+            .as_secs();
+        let wall = self.clock.wall().saturating_sub(self.start_wall);
+        let seen = monotonic.max(wall);
+        let elapsed = self.elapsed.fetch_max(seen, Ordering::SeqCst).max(seen);
+        self.base.saturating_add(elapsed)
+    }
 }
 
 /// The server: one runtime behind one mutex, plus the identity tables.
@@ -296,9 +339,7 @@ pub struct Server<J: ServeJournal> {
     /// Per agent; only touched while the runtime lock is held.
     usage: Mutex<HashMap<String, Usage>>,
     clock: Arc<dyn Clock>,
-    /// `now` = `base` + monotonic time since `start`.
-    base: u64,
-    start: Duration,
+    time: ServerTime,
     /// When nonzero, the journal time the wall clock must reach before
     /// approvals are accepted again.
     behind_until: AtomicU64,
@@ -557,15 +598,26 @@ impl<J: ServeJournal> Server<J> {
         } else {
             0
         };
+        // Per-agent budgets are lifetime budgets for this state directory.
+        let usage = runtime
+            .agent_usage()
+            .iter()
+            .map(|(agent, u)| {
+                let usage = Usage {
+                    journal_bytes: u.journal_bytes,
+                    artifacts: u.artifacts,
+                };
+                (agent.clone(), usage)
+            })
+            .collect();
         Ok(Arc::new(Server {
             settings,
             runtime: Mutex::new(runtime),
             tokens: RwLock::new(tokens),
             sessions: auth::OwnerSessions::new(auth::SESSION_LIFETIME),
             buckets: Mutex::new(HashMap::new()),
-            usage: Mutex::new(HashMap::new()),
-            base: wall.max(journaled),
-            start: clock.monotonic(),
+            usage: Mutex::new(usage),
+            time: ServerTime::new(clock.clone(), wall.max(journaled)),
             clock,
             behind_until: AtomicU64::new(behind_until),
             report,
@@ -576,6 +628,17 @@ impl<J: ServeJournal> Server<J> {
     /// What `main` prints at start about the policy file.
     pub fn startup_report(&self) -> &[String] {
         &self.report
+    }
+
+    /// True when the policy in force is the policy file as it is now.
+    pub fn file_in_force(&self) -> bool {
+        self.lock().is_ok_and(|rt| {
+            rt.policy_source() == trustgraph_engine::PolicySource::File
+                && matches!(
+                    rt.file_outcome(),
+                    FileOutcome::Genesis | FileOutcome::Unchanged | FileOutcome::Activated { .. }
+                )
+        })
     }
 
     pub fn settings(&self) -> &Settings {
@@ -650,11 +713,10 @@ impl<J: ServeJournal> Server<J> {
         Ok(guard)
     }
 
-    /// Seconds: the start base plus monotonic time since, never before the
-    /// last journaled record. Wall-clock jumps after start do not move it.
+    /// Seconds: the server's time (see `ServerTime`), never before the last
+    /// journaled record.
     fn now(&self, rt: &Runtime<J>) -> u64 {
-        let elapsed = self.clock.monotonic().saturating_sub(self.start).as_secs();
-        self.base.saturating_add(elapsed).max(rt.last_at())
+        self.time.now().max(rt.last_at())
     }
 
     /// True while the wall clock is still behind the journal it found at start.
@@ -702,13 +764,13 @@ impl<J: ServeJournal> Server<J> {
         let usage = self.usage(agent);
         if usage.journal_bytes >= limits.agent_journal_bytes {
             return Err(ApiError::quota(format!(
-                "agent `{agent}` has written its limit of {} journal bytes since the server started",
+                "agent `{agent}` has written its limit of {} journal bytes in this state directory",
                 limits.agent_journal_bytes
             )));
         }
         if new_artifact && usage.artifacts >= limits.agent_artifacts {
             return Err(ApiError::quota(format!(
-                "agent `{agent}` has created its limit of {} artifacts since the server started",
+                "agent `{agent}` has created its limit of {} artifacts in this state directory",
                 limits.agent_artifacts
             )));
         }
@@ -861,7 +923,7 @@ impl<J: ServeJournal> Server<J> {
         if headers.contains_key(header::AUTHORIZATION) {
             return Err(required());
         }
-        match self.sessions.check(headers) {
+        match self.sessions.check(headers, self.time.now()) {
             auth::Session::Valid => Ok(()),
             auth::Session::Replaced => Err(ApiError::unauthorized(
                 "operator_session_replaced",
@@ -1404,17 +1466,16 @@ async fn post_policy_diff<J: ServeJournal>(State(s): Shared<J>, request: Request
 /// Exchange the launch secret for THE operator session (ending any other)
 /// and write a new single-use launch file for the next sign-in.
 async fn session<J: ServeJournal>(State(s): Shared<J>, headers: HeaderMap) -> Response {
-    let Some(id) = auth::bearer(&headers).and_then(|secret| s.sessions.exchange(secret)) else {
+    let now = s.time.now();
+    let Some((id, expires_at)) =
+        auth::bearer(&headers).and_then(|secret| s.sessions.exchange(secret, now))
+    else {
         return ApiError::unauthorized(
             "invalid_launch_secret",
             "this sign-in link is not valid or was already used. If you did not use it, stop the server: someone else holds the operator session",
         )
         .into_response();
     };
-    let expires_at = s
-        .clock
-        .wall()
-        .saturating_add(s.sessions.lifetime().as_secs());
     let server = s.clone();
     let written = tokio::task::spawn_blocking(move || server.write_launch_file()).await;
     match written {
@@ -1590,18 +1651,9 @@ fn default_state() -> Result<PathBuf, StartError> {
 /// the port the caller already bound.
 pub fn start(options: Options, port: u16) -> Result<Arc<Server<FileJournal>>, StartError> {
     let text = read_policy(&options.policy)?;
-    let parsed = parse(&text);
-    let Some(file_policy) = parsed.policy else {
-        let lines: Vec<String> = parsed
-            .diagnostics
-            .iter()
-            .map(|d| format!("{} {}: {}", d.code, d.path, d.message))
-            .collect();
-        return Err(start_error(
-            1,
-            format!("the policy file is invalid:\n{}", lines.join("\n")),
-        ));
-    };
+    // Validated by the runtime: an invalid file is an error only where it
+    // would be applied (an empty journal, or --activate-policy-file).
+    let file_policy = parse(&text).policy;
     let state = match options.state {
         Some(state) => state,
         None => default_state()?,
@@ -1632,16 +1684,13 @@ pub fn start(options: Options, port: u16) -> Result<Arc<Server<FileJournal>>, St
         PolicyFile::Propose
     };
     let runtime = Runtime::open_with(journal, &text, unix_now(), mode).map_err(|e| match e {
-        trustgraph_engine::OpenError::InvalidPolicy(diagnostics) => {
-            let lines: Vec<String> = diagnostics
-                .iter()
-                .map(|d| format!("{} {}: {}", d.code, d.path, d.message))
-                .collect();
-            start_error(
-                1,
-                format!("the policy file is invalid:\n{}", lines.join("\n")),
-            )
-        }
+        trustgraph_engine::OpenError::InvalidPolicy(diagnostics) => start_error(
+            1,
+            format!(
+                "the policy file is invalid:\n{}",
+                diagnostic_lines(&diagnostics).join("\n")
+            ),
+        ),
         other => start_error(2, format!("cannot open the journal: {other}")),
     })?;
     // The operator must be a person of the policy actually in force, which
@@ -1664,7 +1713,7 @@ pub fn start(options: Options, port: u16) -> Result<Arc<Server<FileJournal>>, St
             ),
         ));
     }
-    let mut report = file_report(runtime.file_outcome(), active, &file_policy);
+    let mut report = file_report(runtime.file_outcome(), active, file_policy.as_ref());
     if let Some(repository) = policy_repository {
         report.push(format!(
             "warning: the policy file is inside the Git repository {}; agents working there can edit it. Changes to it never apply without the operator.",
@@ -1704,25 +1753,60 @@ fn diff_lines(old: &Policy, new: &Policy) -> Vec<String> {
         .collect()
 }
 
-/// What to tell the person at the terminal about the policy file.
-fn file_report(outcome: &FileOutcome, active: &Policy, file: &Policy) -> Vec<String> {
+fn diagnostic_lines(diagnostics: &[trustgraph_policy::Diagnostic]) -> Vec<String> {
+    diagnostics
+        .iter()
+        .map(|d| format!("{} {}: {}", d.code, d.path, d.message))
+        .collect()
+}
+
+/// What to tell the person at the terminal about the policy file. `file`
+/// is the parsed file, `None` when it does not parse.
+fn file_report(outcome: &FileOutcome, active: &Policy, file: Option<&Policy>) -> Vec<String> {
     let how = "To apply it, activate it on the operator page, or restart once with --activate-policy-file.";
+    let changes = |from: &Policy| file.map(|file| diff_lines(from, file)).unwrap_or_default();
     let mut lines = Vec::new();
     match outcome {
         FileOutcome::Genesis | FileOutcome::Unchanged => {}
-        FileOutcome::Proposed { .. } | FileOutcome::AlreadyRecorded { proposal: true, .. } => {
-            lines.push("The policy file differs from the active policy. It was NOT applied; it is stored as a proposal from the file. Changes it would make:".into());
-            lines.extend(diff_lines(active, file));
+        FileOutcome::Proposed { .. } => {
+            lines.push("The policy file differs from the active policy. It was NOT applied; it is stored as the proposal from the file (replacing any older one). Changes it would make:".into());
+            lines.extend(changes(active));
             lines.push(how.into());
         }
-        FileOutcome::AlreadyRecorded { .. } => {
-            lines.push("The policy file differs from the active policy. It was applied or proposed before and is not proposed again. Changes it would make:".into());
-            lines.extend(diff_lines(active, file));
-            lines.push("To apply it, restart once with --activate-policy-file.".into());
+        FileOutcome::AlreadyRecorded { stored, .. } => {
+            let what = match stored {
+                Some(ProposalOrigin::File) => {
+                    "It was NOT applied; it is still stored as the proposal from the file, from an earlier start.".to_string()
+                }
+                Some(ProposalOrigin::Operator) => {
+                    "It was NOT applied; the same policy is stored as a proposal by the operator.".to_string()
+                }
+                Some(ProposalOrigin::Agent(agent)) => format!(
+                    "It was NOT applied; the same policy is stored as a proposal by agent `{agent}`."
+                ),
+                None => "It was NOT applied. It was applied or proposed at an earlier start, is no longer stored as a proposal, and is not proposed again.".to_string(),
+            };
+            lines.push(format!(
+                "The policy file differs from the active policy. {what} Changes it would make:"
+            ));
+            lines.extend(changes(active));
+            lines.push(if stored.is_some() {
+                how.into()
+            } else {
+                "To apply it, restart once with --activate-policy-file.".into()
+            });
         }
         FileOutcome::Activated { previous } => {
             lines.push("Applied the policy file (--activate-policy-file). Changes from the previous policy:".into());
-            lines.extend(diff_lines(previous, file));
+            lines.extend(changes(previous));
+        }
+        FileOutcome::Invalid { diagnostics } => {
+            lines.push("warning: the policy file is invalid, so it was ignored: the server runs on the active policy and nothing was proposed. Fix the file and restart, or propose a change on the operator page. Diagnostics:".into());
+            lines.extend(
+                diagnostic_lines(diagnostics)
+                    .into_iter()
+                    .map(|line| format!("  {line}")),
+            );
         }
     }
     lines
@@ -1768,14 +1852,10 @@ pub async fn main(options: Options, port: u16) -> i32 {
         "Policy in force: revision {revision} ({}), digest {short}",
         if source != "file" {
             "activated in service"
-        } else if server
-            .startup_report()
-            .first()
-            .is_some_and(|line| line.starts_with("The policy file differs"))
-        {
-            "from an earlier version of the policy file"
-        } else {
+        } else if server.file_in_force() {
             "from the policy file"
+        } else {
+            "from an earlier version of the policy file"
         }
     );
     println!("Operator: {}", server.settings().operator);

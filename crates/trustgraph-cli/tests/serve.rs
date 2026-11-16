@@ -1384,7 +1384,11 @@ async fn a_journal_from_the_future_refuses_approvals_until_the_clock_catches_up(
     assert_eq!(status, 409, "{reply}");
     assert_eq!(reply["error"]["code"], "clock_behind");
 
+    // The wall clock jumping forward to the journal's time also counts as
+    // elapsed time, so the old session has expired: sign in again.
     clock.wall.store(future, Ordering::SeqCst);
+    assert_eq!(h.op_get("/v1/operator/state", &session).await.0, 401);
+    let session = h.login().await;
     let (status, reply) = h.op_post("/v1/operator/approve", &session, body).await;
     assert_eq!(status, 200, "{reply}");
     assert_eq!(h.op_state(&session).await["clock_behind"], false);
@@ -1703,4 +1707,233 @@ async fn mcp_is_rate_limited_and_helpers_have_their_own_lower_limit() {
         assert_eq!(h.mcp(Some(&mailer), "tools/list", json!({})).await.0, 200);
     }
     assert_eq!(h.mcp(Some(&mailer), "tools/list", json!({})).await.0, 429);
+}
+
+#[tokio::test]
+async fn sleep_counts_toward_approvals_and_the_operator_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(TestClock::default());
+    let start = 1_000_000;
+    clock.wall.store(start, Ordering::SeqCst);
+    let h = clocked(dir.path(), 0, clock.clone()).await;
+    let mailer = h.token("mailer");
+    let sheet = h.source(&mailer, "price_sheet", "prices").await;
+    let email = h.output(&mailer, &[&sheet], "quote").await;
+    let decision = h.check(&mailer, &email, "email_customer").await["decision"].clone();
+    let secret = h.server.launch_secret().unwrap();
+    let (status, signed_in) = h.login_with(&secret).await;
+    assert_eq!(status, 200, "{signed_in}");
+    assert_eq!(
+        signed_in["expires_at"],
+        start + 8 * 3600,
+        "the server's own time"
+    );
+    let session = signed_in["session"].as_str().unwrap().to_string();
+    let (status, approved) = h
+        .op_post(
+            "/v1/operator/approve",
+            &session,
+            json!({"decision": decision}),
+        )
+        .await;
+    assert_eq!(status, 200, "{approved}");
+    assert_eq!(
+        h.check(&mailer, &email, "email_customer").await["verdict"],
+        "allow"
+    );
+
+    // The laptop sleeps: monotonic time stands still, the wall clock moves.
+    clock.wall.store(start + 30 * 60 + 1, Ordering::SeqCst);
+    assert_eq!(
+        h.check(&mailer, &email, "email_customer").await["verdict"],
+        "needs_approval",
+        "the approval expired during sleep"
+    );
+    h.op_state(&session).await;
+    clock.wall.store(start + 8 * 3600 + 1, Ordering::SeqCst);
+    let (status, body) = h.op_get("/v1/operator/state", &session).await;
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(body["error"]["code"], "operator_session_required");
+
+    // Setting the wall clock back afterwards extends nothing.
+    clock.wall.store(start, Ordering::SeqCst);
+    let (status, _) = h.op_get("/v1/operator/state", &session).await;
+    assert_eq!(status, 401, "the session stays expired");
+    assert_eq!(
+        h.check(&mailer, &email, "email_customer").await["verdict"],
+        "needs_approval"
+    );
+}
+
+impl<J: ServeJournal> Harness<J> {
+    /// How many checks succeed before the agent's budget answers 507.
+    async fn checks_until_refused(&self, token: &str, check: &Value) -> usize {
+        for n in 0..100 {
+            if self.post("/v1/check", Some(token), check.clone()).await.0 == 507 {
+                return n;
+            }
+        }
+        panic!("the budget never bit");
+    }
+}
+
+fn journal_bytes(state: &Path) -> u64 {
+    std::fs::metadata(state.join("journal.jsonl"))
+        .unwrap()
+        .len()
+}
+
+#[tokio::test]
+async fn an_invalid_policy_file_does_not_stop_a_server_that_has_a_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = dir.path().join("trustgraph.policy.yaml");
+    let state = dir.path().join("state");
+    std::fs::write(&policy, STARTER).unwrap();
+    let h =
+        launch(|port| serve::start(restart_options(&policy, &state, false), port).unwrap()).await;
+    h.stop().await;
+    let size = journal_bytes(&state);
+
+    let failing = STARTER.replacen("expect: deny", "expect: allow", 1);
+    assert_ne!(failing, STARTER);
+    for broken in ["version: 1\nnot: [valid", failing.as_str()] {
+        std::fs::write(&policy, broken).unwrap();
+        let h = launch(|port| serve::start(restart_options(&policy, &state, false), port).unwrap())
+            .await;
+        let report = h.server.startup_report().join("\n");
+        assert!(report.contains("invalid, so it was ignored"), "{report}");
+        assert!(report.contains("  "), "diagnostics are printed: {report}");
+        let session = h.login().await;
+        let op = h.op_state(&session).await;
+        assert_eq!(op["policy"]["revision"], 1);
+        assert_eq!(op["proposals"], json!([]));
+        let (_, active) = h.get("/v1/policy", Some(&h.token("mailer"))).await;
+        assert_eq!(
+            active["digest"],
+            trustgraph_policy::parse(STARTER).policy.unwrap().digest()
+        );
+        h.stop().await;
+        assert_eq!(journal_bytes(&state), size, "nothing was written");
+
+        // Asking for it to be applied cannot be honoured.
+        let error = serve::start(restart_options(&policy, &state, true), 1)
+            .err()
+            .unwrap();
+        assert_eq!(error.code, 1);
+        assert!(error.message.contains("invalid"), "{}", error.message);
+        // On an empty journal it is still an error.
+        let fresh = dir.path().join(format!("fresh-{}", broken.len()));
+        let error = serve::start(restart_options(&policy, &fresh, false), 1)
+            .err()
+            .unwrap();
+        assert_eq!(error.code, 1);
+        assert!(error.message.contains("invalid"), "{}", error.message);
+    }
+}
+
+#[tokio::test]
+async fn the_policy_file_keeps_one_proposal_and_leaves_the_operators_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = dir.path().join("trustgraph.policy.yaml");
+    let state = dir.path().join("state");
+    std::fs::write(&policy, STARTER).unwrap();
+    let start = || {
+        let (policy, state) = (policy.clone(), state.clone());
+        move |port| serve::start(restart_options(&policy, &state, false), port).unwrap()
+    };
+    let h = launch(start()).await;
+    let session = h.login().await;
+    let (status, mine) = h
+        .op_post("/v1/operator/propose", &session, json!({"policy": NEXT}))
+        .await;
+    assert_eq!(status, 200, "{mine}");
+    h.stop().await;
+
+    let first = STARTER.replace("customers: [acme]", "customers: [acme, beta]");
+    let second = STARTER.replace("customers: [acme]", "customers: [acme, gamma]");
+    let mut ids = Vec::new();
+    for edit in [&first, &second] {
+        std::fs::write(&policy, edit).unwrap();
+        let h = launch(start()).await;
+        let session = h.login().await;
+        let proposals = h.op_state(&session).await["proposals"].clone();
+        let files: Vec<&Value> = proposals
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["origin"] == "file")
+            .collect();
+        assert_eq!(files.len(), 1, "{proposals}");
+        ids.push(files[0]["proposal"].clone());
+        let operator: Vec<&Value> = proposals
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["origin"] == "operator")
+            .collect();
+        assert_eq!(operator.len(), 1, "{proposals}");
+        assert_eq!(operator[0]["proposal"], mine["proposal"]);
+        h.stop().await;
+    }
+    assert_ne!(ids[0], ids[1], "the latest file version replaced the older");
+
+    // The first version again: recorded before, no longer stored, and the
+    // message says so.
+    std::fs::write(&policy, &first).unwrap();
+    let h = launch(start()).await;
+    let report = h.server.startup_report().join("\n");
+    assert!(
+        report.contains("no longer stored as a proposal"),
+        "{report}"
+    );
+    assert!(!report.contains("still stored"), "{report}");
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn per_agent_budgets_survive_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = dir.path().join("trustgraph.policy.yaml");
+    let state = dir.path().join("state");
+    std::fs::write(&policy, STARTER).unwrap();
+    let start = || {
+        let (policy, state) = (policy.clone(), state.clone());
+        move |port| {
+            let mut options = restart_options(&policy, &state, false);
+            options.limits.agent_journal_bytes = 4_000;
+            serve::start(options, port).unwrap()
+        }
+    };
+    let h = launch(start()).await;
+    let mailer = h.token("mailer");
+    let sheet = h.source(&mailer, "price_sheet", "prices").await;
+    let email = h.output(&mailer, &[&sheet], "quote").await;
+    let check = json!({"artifact": email, "action": "email_customer"});
+    let first = h.checks_until_refused(&mailer, &check).await;
+    assert!(first >= 5, "{first}");
+    h.stop().await;
+
+    // After a restart the agent's journaled records still count. Only the
+    // source it registered (a record that names no agent) is not attributed,
+    // which leaves room for at most one more check.
+    let h = launch(start()).await;
+    let again = h.checks_until_refused(&mailer, &check).await;
+    assert!(again <= 1, "still spent after a restart: {again}");
+    let (status, body) = h.post("/v1/check", Some(&mailer), check).await;
+    assert_eq!(status, 507);
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("in this state directory")
+    );
+    // Another agent's budget is its own.
+    let planner = h.token("planner");
+    let roadmap = h.source(&planner, "roadmap", "q3").await;
+    let only = h.output(&planner, &[&roadmap], "summary").await;
+    assert_eq!(
+        h.check(&planner, &only, "post_to_slack").await["verdict"],
+        "allow"
+    );
+    h.stop().await;
 }

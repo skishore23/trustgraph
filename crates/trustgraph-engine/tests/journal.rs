@@ -2,8 +2,8 @@ use std::fs;
 use std::path::Path;
 
 use trustgraph_engine::{
-    Event, FileJournal, FileOutcome, Journal, JournalError, MemoryJournal, OpenError, PolicyFile,
-    ProposalOrigin, Record, Reply, Runtime,
+    AgentUsage, Event, FileJournal, FileOutcome, Journal, JournalError, MemoryJournal, OpenError,
+    PolicyFile, ProposalOrigin, Record, Reply, Runtime,
 };
 use trustgraph_policy::Verdict;
 
@@ -152,7 +152,7 @@ fn a_changed_policy_file_is_only_proposed() {
         rt.file_outcome(),
         &FileOutcome::AlreadyRecorded {
             digest: id.clone(),
-            proposal: true
+            stored: Some(ProposalOrigin::File)
         }
     );
     assert_eq!(text(dir.path()), before);
@@ -875,4 +875,112 @@ fn memory_journal_size_matches_the_file() {
         file.journal().len_bytes().unwrap(),
         memory.journal().len_bytes()
     );
+}
+
+#[test]
+fn an_invalid_file_is_ignored_once_the_journal_has_a_policy() {
+    let mut rt = Runtime::open(MemoryJournal::new(), SPEC, 0).unwrap();
+    rt.handle(1, register_roadmap()).unwrap();
+    let digest = rt.engine().state_digest();
+    let journal = rt.into_journal();
+    let len = journal.records().len();
+    let failing = SPEC.replace("expect: deny", "expect: allow");
+    for broken in ["version: 1\nnot: [valid", failing.as_str()] {
+        let rt = Runtime::open(journal.clone(), broken, 50).unwrap();
+        let FileOutcome::Invalid { diagnostics } = rt.file_outcome() else {
+            panic!("{:?}", rt.file_outcome());
+        };
+        assert!(!diagnostics.is_empty());
+        assert_eq!(rt.engine().state_digest(), digest, "nothing changed");
+        assert!(
+            rt.engine().stored_proposals().is_empty(),
+            "nothing proposed"
+        );
+        assert_eq!(rt.into_journal().records().len(), len, "nothing written");
+        // An explicit request to apply it cannot be honoured.
+        match Runtime::open_with(journal.clone(), broken, 50, PolicyFile::Activate) {
+            Err(OpenError::InvalidPolicy(d)) => assert!(!d.is_empty()),
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+#[test]
+fn the_file_keeps_one_proposal_and_never_evicts_the_operators() {
+    let mut rt = Runtime::open(MemoryJournal::new(), SPEC, 0).unwrap();
+    let mine = match rt
+        .handle(
+            1,
+            Event::ProposePolicy {
+                agent: None,
+                policy: narrowed(),
+            },
+        )
+        .unwrap()
+    {
+        Reply::Proposed { id, .. } => id,
+        other => panic!("{other:?}"),
+    };
+    let mut journal = rt.into_journal();
+    let mut latest = String::new();
+    for n in 0..40 {
+        let edit = SPEC.replace("valid_for: 30m", &format!("valid_for: {}s", 100 + n));
+        let rt = Runtime::open(journal, &edit, 10 + n).unwrap();
+        let FileOutcome::Proposed { id } = rt.file_outcome().clone() else {
+            panic!("{:?}", rt.file_outcome());
+        };
+        latest = id;
+        journal = rt.into_journal();
+    }
+    let rt = Runtime::open(journal.clone(), SPEC, 100).unwrap();
+    let stored = rt.engine().stored_proposals();
+    let files: Vec<_> = stored
+        .iter()
+        .filter(|p| p.origin == ProposalOrigin::File)
+        .collect();
+    assert_eq!(files.len(), 1, "{stored:?}");
+    assert_eq!(files[0].proposal, latest, "the latest file version");
+    assert_eq!(
+        rt.engine().proposal_origin(&mine),
+        Some(&ProposalOrigin::Operator)
+    );
+    let digest = rt.engine().state_digest();
+    assert_eq!(
+        Runtime::open(journal, SPEC, 100)
+            .unwrap()
+            .engine()
+            .state_digest(),
+        digest,
+        "replay is exact"
+    );
+}
+
+#[test]
+fn agent_usage_is_rebuilt_from_the_journal() {
+    let mut rt = Runtime::open(MemoryJournal::new(), SPEC, 0).unwrap();
+    let roadmap = artifact(rt.handle(1, register_roadmap()).unwrap());
+    let only = artifact(
+        rt.handle(
+            2,
+            Event::RecordOutput {
+                agent: "planner".into(),
+                step: "summary".into(),
+                inputs: vec![roadmap],
+                sha256: sha(9),
+            },
+        )
+        .unwrap(),
+    );
+    rt.handle(3, check_event(&only)).unwrap();
+    let live = rt.agent_usage().clone();
+    let planner = live["planner"];
+    assert_eq!(planner.artifacts, 1, "sources are nobody's");
+    let lines: u64 = rt.journal().records()[2..]
+        .iter()
+        .map(|r| serde_json::to_vec(r).unwrap().len() as u64 + 1)
+        .sum();
+    assert_eq!(planner.journal_bytes, lines);
+    let rt = Runtime::open(rt.into_journal(), SPEC, 10).unwrap();
+    assert_eq!(rt.agent_usage(), &live);
+    assert_eq!(rt.agent_usage().get("mailer"), None::<&AgentUsage>);
 }
