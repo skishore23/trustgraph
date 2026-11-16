@@ -844,3 +844,172 @@ async fn journal_failure_stops_serving_with_503() {
         assert_eq!(body["error"]["code"], "restart_required");
     }
 }
+
+impl<J: ServeJournal> Harness<J> {
+    /// One JSON-RPC request to `/mcp`; the status and the decoded reply.
+    async fn mcp(&self, token: Option<&str>, method: &str, params: Value) -> (u16, Value) {
+        let mut request = self
+            .client
+            .post(format!("{}/mcp", self.base))
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2025-06-18")
+            .json(&json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}));
+        if let Some(t) = token {
+            request = request.bearer_auth(t);
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap();
+        // A JSON body, or the last `data:` line of an event stream.
+        let body = serde_json::from_str(&text).unwrap_or_else(|_| {
+            text.lines()
+                .filter_map(|l| l.strip_prefix("data:"))
+                .filter_map(|d| serde_json::from_str::<Value>(d.trim()).ok())
+                .next_back()
+                .unwrap_or(Value::Null)
+        });
+        (status, body)
+    }
+
+    async fn tool(&self, token: &str, name: &str, arguments: Value) -> Value {
+        let (status, reply) = self
+            .mcp(
+                Some(token),
+                "tools/call",
+                json!({"name": name, "arguments": arguments}),
+            )
+            .await;
+        assert_eq!(status, 200, "{reply}");
+        reply["result"].clone()
+    }
+}
+
+#[tokio::test]
+async fn mcp_tools_share_the_api_and_its_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = memory(dir.path(), Limits::default()).await;
+    let mailer = h.token("mailer");
+
+    let (status, init) = h
+        .mcp(
+            Some(&mailer),
+            "initialize",
+            json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "0"},
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "{init}");
+    assert_eq!(init["result"]["serverInfo"]["name"], "trustgraph");
+    assert!(
+        init["result"]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("act only on allow")
+    );
+    let (status, listed) = h.mcp(Some(&mailer), "tools/list", json!({})).await;
+    assert_eq!(status, 200, "{listed}");
+    let names: Vec<&str> = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, serve::mcp::TOOLS);
+
+    // Without a token, or with a wrong one, nothing reaches the tools.
+    for token in [None, Some("0".repeat(64))] {
+        let (status, _) = h.mcp(token.as_deref(), "tools/list", json!({})).await;
+        assert_eq!(status, 401);
+    }
+
+    let sheet = h
+        .tool(
+            &mailer,
+            "register_source",
+            json!({"source": "price_sheet", "content": "prices"}),
+        )
+        .await;
+    assert_eq!(sheet["isError"], false, "{sheet}");
+    let sheet = sheet["structuredContent"]["artifact"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let output = h
+        .tool(
+            &mailer,
+            "record_output",
+            json!({"inputs": [sheet], "step": "draft", "content": "quote"}),
+        )
+        .await;
+    let output = output["structuredContent"]["artifact"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let via_mcp = h
+        .tool(
+            &mailer,
+            "check",
+            json!({"artifact": output, "action": "email_customer"}),
+        )
+        .await;
+    let via_http = h.check(&mailer, &output, "email_customer").await;
+    assert_eq!(via_mcp["structuredContent"], via_http, "same decision");
+    assert_eq!(via_http["verdict"], "needs_approval");
+
+    // No argument can name another agent, and no tool approves.
+    let spoof = h
+        .tool(
+            &mailer,
+            "check",
+            json!({"artifact": output, "action": "email_customer", "agent": "planner"}),
+        )
+        .await;
+    assert_eq!(spoof["isError"], true);
+    assert_eq!(
+        spoof["structuredContent"]["error"]["code"],
+        "invalid_request"
+    );
+    for name in ["approve", "revoke", "activate", "policy_activate"] {
+        let reply = h
+            .tool(&mailer, name, json!({"decision": via_http["decision"]}))
+            .await;
+        assert_eq!(reply["isError"], true, "{name}");
+    }
+    let still = h.check(&mailer, &output, "email_customer").await;
+    assert_eq!(still["verdict"], "needs_approval");
+
+    // The planner's tools act as the planner.
+    let planner = h.token("planner");
+    let denied = h
+        .tool(
+            &planner,
+            "register_source",
+            json!({"source": "price_sheet", "content": "p"}),
+        )
+        .await;
+    assert_eq!(
+        denied["structuredContent"]["error"]["code"],
+        "agent_cannot_use_source"
+    );
+
+    let proposed = h
+        .tool(&planner, "policy_propose", json!({"policy": NEXT}))
+        .await;
+    assert_eq!(proposed["isError"], false, "{proposed}");
+    let cookie = h.login().await;
+    assert_eq!(h.op_state(&cookie).await["proposals"][0]["from"], "planner");
+    let (_, policy) = h.get("/v1/policy", Some(&planner)).await;
+    assert_eq!(policy["revision"], 1);
+
+    let simulated = h
+        .tool(
+            &planner,
+            "policy_simulate",
+            json!({"policy": STARTER, "count": 1, "steps": 20}),
+        )
+        .await;
+    assert_eq!(simulated["structuredContent"]["ok"], true, "{simulated}");
+}
