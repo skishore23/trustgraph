@@ -12,6 +12,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo run --locked -p trustgraph-cli -- check-model --depth 6
 cargo run --locked -p trustgraph-cli -- simulate --seed 0 --count 64
+cargo run --locked -p trustgraph-cli -- policy check|test|simulate examples/policies/slack-digest.policy.yaml
 ```
 
 The suite exercises access inheritance, exact approval, expiry/revocation,

@@ -16,6 +16,7 @@ use trustgraph_policy::{
     ChangeKind, Diagnostic, MAX_BYTES, Policy, STARTER, Severity, diff, explain, lint, parse,
     run_tests, schema,
 };
+use trustgraph_sim::policy_sim::{Campaign, campaign};
 
 #[derive(Subcommand)]
 pub enum PolicyCommand {
@@ -59,6 +60,21 @@ pub enum PolicyCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Run the policy through seeded random scenarios and check the safety invariants.
+    Simulate {
+        file: PathBuf,
+        /// First seed; runs use seed, seed+1, ...
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+        /// Number of runs (1-10000).
+        #[arg(long, default_value_t = 64)]
+        count: u64,
+        /// Steps per run (1-5000).
+        #[arg(long, default_value_t = 200)]
+        steps: u32,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 macro_rules! out {
@@ -97,6 +113,13 @@ fn dispatch(out: &mut String, command: PolicyCommand) -> i32 {
         PolicyCommand::Test { file, json } => test(out, &file, json),
         PolicyCommand::Explain { file, json } => explain_cmd(out, &file, json),
         PolicyCommand::Diff { old, new, json } => diff_cmd(out, &old, &new, json),
+        PolicyCommand::Simulate {
+            file,
+            seed,
+            count,
+            steps,
+            json,
+        } => simulate_cmd(out, &file, seed, count, steps, json),
     }
 }
 
@@ -209,6 +232,29 @@ fn has_errors(diagnostics: &[Diagnostic]) -> bool {
 /// the `too_large` diagnostic rather than read; anything else that goes wrong
 /// is an I/O error message.
 fn load(file: &Path) -> Result<Loaded, String> {
+    let text = match read_text(file)? {
+        Ok(text) => text,
+        Err(diagnostic) => {
+            return Ok(Loaded {
+                policy: None,
+                diagnostics: vec![diagnostic],
+            });
+        }
+    };
+    let parsed = parse(&text);
+    let mut diagnostics = parsed.diagnostics;
+    if let Some(policy) = &parsed.policy {
+        diagnostics.extend(lint(policy));
+    }
+    Ok(Loaded {
+        policy: parsed.policy,
+        diagnostics,
+    })
+}
+
+/// The safe-read half of `load`: the file's text, or the `too_large`
+/// diagnostic, or an I/O error message.
+fn read_text(file: &Path) -> Result<Result<String, Diagnostic>, String> {
     let io = |e: &dyn std::fmt::Display| format!("cannot read {}: {e}", file.display());
     // Check before opening: opening a FIFO would block until a writer shows up.
     let before = std::fs::metadata(file).map_err(|e| io(&e))?;
@@ -228,27 +274,17 @@ fn load(file: &Path) -> Result<Loaded, String> {
         .map_err(|e| io(&e))?;
     if bytes.len() > MAX_BYTES {
         let size = (meta.len() as usize).max(bytes.len());
-        return Ok(Loaded {
-            policy: None,
-            diagnostics: vec![Diagnostic {
-                severity: Severity::Error,
-                path: String::new(),
-                code: "too_large",
-                message: format!("policy file is {size} bytes; the limit is {MAX_BYTES}"),
-                suggestion: None,
-            }],
-        });
+        return Ok(Err(Diagnostic {
+            severity: Severity::Error,
+            path: String::new(),
+            code: "too_large",
+            message: format!("policy file is {size} bytes; the limit is {MAX_BYTES}"),
+            suggestion: None,
+        }));
     }
-    let text = String::from_utf8(bytes).map_err(|_| io(&"file is not valid UTF-8"))?;
-    let parsed = parse(&text);
-    let mut diagnostics = parsed.diagnostics;
-    if let Some(policy) = &parsed.policy {
-        diagnostics.extend(lint(policy));
-    }
-    Ok(Loaded {
-        policy: parsed.policy,
-        diagnostics,
-    })
+    String::from_utf8(bytes)
+        .map(Ok)
+        .map_err(|_| io(&"file is not valid UTF-8"))
 }
 
 fn plural(n: usize, word: &str) -> String {
@@ -432,4 +468,202 @@ fn diff_cmd(out: &mut String, old: &Path, new: &Path, json: bool) -> i32 {
         }
     }
     0
+}
+
+const MAX_COUNT: u64 = 10_000;
+const MAX_STEPS: u32 = 5_000;
+/// Violations printed in human mode before the rest are summarised.
+const PRINTED_VIOLATIONS: usize = 20;
+
+fn simulate_cmd(
+    out: &mut String,
+    file: &Path,
+    seed: u64,
+    count: u64,
+    steps: u32,
+    json: bool,
+) -> i32 {
+    if !(1..=MAX_COUNT).contains(&count) {
+        let m = format!("--count must be between 1 and {MAX_COUNT}");
+        return fail(out, json, "usage", m);
+    }
+    if !(1..=MAX_STEPS).contains(&steps) {
+        let m = format!("--steps must be between 1 and {MAX_STEPS}");
+        return fail(out, json, "usage", m);
+    }
+    let text = match read_text(file) {
+        Ok(Ok(text)) => text,
+        Ok(Err(diagnostic)) => {
+            let loaded = Loaded {
+                policy: None,
+                diagnostics: vec![diagnostic],
+            };
+            return report_invalid(out, &loaded, json, None, false);
+        }
+        Err(m) => return fail(out, json, "io", m),
+    };
+    match campaign(&text, seed, count, steps) {
+        Ok(c) => {
+            let (text, code) = render_simulation(&file.display().to_string(), &c, json);
+            out.push_str(&text);
+            code
+        }
+        Err(diagnostics) => {
+            let loaded = Loaded {
+                policy: None,
+                diagnostics,
+            };
+            report_invalid(out, &loaded, json, None, false)
+        }
+    }
+}
+
+/// `12800` -> `12,800`.
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut s = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            s.push(',');
+        }
+        s.push(c);
+    }
+    s
+}
+
+/// Render a finished campaign: the output text and the exit code.
+fn render_simulation(file: &str, c: &Campaign, json: bool) -> (String, i32) {
+    let mut out = String::new();
+    let ok = c.violations.is_empty();
+    let decision = |k: &str| c.decisions.get(k).copied().unwrap_or(0);
+    if json {
+        let violations: Vec<Value> = c
+            .violations
+            .iter()
+            .map(|(seed, v)| {
+                json!({"seed": seed, "invariant": v.invariant, "step": v.step, "detail": v.detail})
+            })
+            .collect();
+        outln!(
+            out,
+            "{}",
+            pretty(&json!({
+                "ok": ok,
+                "first_seed": c.first_seed,
+                "count": c.count,
+                "steps": c.steps,
+                "events": c.events,
+                "decisions": {
+                    "allow": decision("allow"),
+                    "deny": decision("deny"),
+                    "needs_approval": decision("needs_approval"),
+                },
+                "violations": violations,
+                "digest": c.digest,
+            }))
+        );
+        return (out, i32::from(!ok));
+    }
+    outln!(
+        out,
+        "{} runs, {} events: {} allow, {} deny, {} needs_approval \u{2014} {}",
+        thousands(c.count),
+        thousands(c.events),
+        thousands(decision("allow")),
+        thousands(decision("deny")),
+        thousands(decision("needs_approval")),
+        plural(c.violations.len(), "violation"),
+    );
+    for (seed, v) in c.violations.iter().take(PRINTED_VIOLATIONS) {
+        outln!(
+            out,
+            "VIOLATION {} seed={seed} step={}: {}",
+            v.invariant,
+            v.step,
+            v.detail
+        );
+        outln!(
+            out,
+            "replay: trustgraph policy simulate {file} --seed {seed} --count 1 --steps {}",
+            c.steps
+        );
+    }
+    if c.violations.len() > PRINTED_VIOLATIONS {
+        outln!(
+            out,
+            "\u{2026} and {} more",
+            c.violations.len() - PRINTED_VIOLATIONS
+        );
+    }
+    (out, i32::from(!ok))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use trustgraph_sim::policy_sim::Violation;
+
+    fn campaign_with(n: u64) -> Campaign {
+        Campaign {
+            first_seed: 0,
+            count: 64,
+            steps: 200,
+            events: 12_800,
+            decisions: BTreeMap::from([
+                ("allow".to_string(), 3_912),
+                ("deny".to_string(), 7_204),
+                ("needs_approval".to_string(), 1_684),
+            ]),
+            violations: (0..n)
+                .map(|i| {
+                    (
+                        100 + i,
+                        Violation {
+                            invariant: "no_leak",
+                            step: 93,
+                            detail: format!("detail {i}"),
+                        },
+                    )
+                })
+                .collect(),
+            digest: "d".to_string(),
+        }
+    }
+
+    #[test]
+    fn clean_campaign_summary_line() {
+        let (text, code) = render_simulation("p.yaml", &campaign_with(0), false);
+        assert_eq!(code, 0);
+        assert_eq!(
+            text,
+            "64 runs, 12,800 events: 3,912 allow, 7,204 deny, 1,684 needs_approval \u{2014} 0 violations\n"
+        );
+    }
+
+    #[test]
+    fn human_output_caps_violations_and_shows_replay() {
+        let (text, code) = render_simulation("p.yaml", &campaign_with(25), false);
+        assert_eq!(code, 1);
+        assert!(text.contains("\u{2014} 25 violations\n"));
+        assert_eq!(text.matches("VIOLATION ").count(), 20);
+        assert!(text.contains("VIOLATION no_leak seed=100 step=93: detail 0\n"));
+        assert!(text.contains(
+            "replay: trustgraph policy simulate p.yaml --seed 100 --count 1 --steps 200\n"
+        ));
+        assert!(text.ends_with("\u{2026} and 5 more\n"));
+        assert!(!text.contains("detail 20\n"));
+    }
+
+    #[test]
+    fn json_output_lists_every_violation() {
+        let (text, code) = render_simulation("p.yaml", &campaign_with(25), true);
+        assert_eq!(code, 1);
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["violations"].as_array().unwrap().len(), 25);
+        assert_eq!(v["violations"][24]["seed"], 124);
+        assert_eq!(v["violations"][0]["invariant"], "no_leak");
+        assert_eq!(v["decisions"]["needs_approval"], 1_684);
+    }
 }

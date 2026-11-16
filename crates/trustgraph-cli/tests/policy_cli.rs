@@ -371,3 +371,77 @@ mod unix {
         }
     }
 }
+
+const EXAMPLE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../examples/policies/slack-digest.policy.yaml"
+);
+
+fn sim(args: &[&str]) -> Output {
+    let dir = std::env::temp_dir();
+    let mut all = vec!["simulate", EXAMPLE];
+    all.extend_from_slice(args);
+    tg(&dir, &all)
+}
+
+#[test]
+fn simulate_passes_on_an_example() {
+    let o = sim(&["--count", "4", "--steps", "60", "--json"]);
+    assert_eq!(code(&o), 0, "{}", stdout(&o));
+    let v = json(&o);
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["violations"].as_array().unwrap().len(), 0);
+    assert_eq!(v["count"], 4);
+    assert_eq!(v["steps"], 60);
+    assert!(v["decisions"]["allow"].is_u64());
+    let o = sim(&["--count", "4", "--steps", "60"]);
+    assert_eq!(code(&o), 0);
+    assert!(stdout(&o).starts_with("4 runs, "), "{}", stdout(&o));
+    assert!(stdout(&o).contains("— 0 violations"), "{}", stdout(&o));
+}
+
+#[test]
+fn simulate_is_reproducible() {
+    let a = json(&sim(&[
+        "--seed", "3", "--count", "4", "--steps", "60", "--json",
+    ]));
+    let b = json(&sim(&[
+        "--seed", "3", "--count", "4", "--steps", "60", "--json",
+    ]));
+    assert!(a["digest"].is_string());
+    assert_eq!(a["digest"], b["digest"]);
+    assert_eq!(a["first_seed"], 3);
+}
+
+#[test]
+fn simulate_rejects_bad_limits() {
+    for args in [
+        &["--count", "0"][..],
+        &["--count", "10001"],
+        &["--steps", "0"],
+        &["--steps", "5001"],
+    ] {
+        let o = sim(args);
+        assert_eq!(code(&o), 2, "{args:?}");
+    }
+    let o = sim(&["--count", "0", "--json"]);
+    assert_eq!(code(&o), 2);
+    let v = json(&o);
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "usage");
+    assert_eq!(v["error"]["message"], "--count must be between 1 and 10000");
+}
+
+#[test]
+fn simulate_reports_parse_errors() {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("p.yaml"), "version: 2\n").unwrap();
+    let o = tg(d.path(), &["simulate", "p.yaml", "--json"]);
+    assert_eq!(code(&o), 1);
+    let v = json(&o);
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["diagnostics"][0]["code"], "unsupported_version");
+    let o = tg(d.path(), &["simulate", "p.yaml"]);
+    assert_eq!(code(&o), 1);
+    assert!(stdout(&o).contains("unsupported_version"));
+}

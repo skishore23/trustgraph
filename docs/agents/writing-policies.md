@@ -102,7 +102,29 @@ Work in this order. Do not skip steps.
    ```
 
    The top level also has `diagnostics` and `ok`. `blocking` names the sources that hold the output back and the people they exclude. Plain output looks like `PASS <name>` or `FAIL <name>: expected deny, got allow — allowed`, then `5 passed, 0 failed`.
-5. **explain**: `trustgraph policy explain FILE` prints one plain-English line per source and action:
+5. **simulate**: `trustgraph policy simulate FILE [--seed 0] [--count 64] [--steps 200] [--json]` runs the policy through seeded random scenarios on the real runtime (random agents, policy changes, crashes, approval expiry) and checks the safety invariants. Limits: `--count` 1-10000, `--steps` 1-5000, else exit 2. It exits 1 on any violation or if the file has errors. A clean run prints:
+
+   ```text
+   64 runs, 13,260 events: 2,426 allow, 3,410 deny, 666 needs_approval — 0 violations
+   ```
+
+   `--json` (here with `--count 2 --steps 30`) returns:
+
+   ```json
+   {
+     "count": 2,
+     "decisions": { "allow": 12, "deny": 16, "needs_approval": 0 },
+     "digest": "4f891bcffe6a8e7b0dc74ae297bbbaf7f384c1d7eb488294f2309ad6aa045f9e",
+     "events": 64,
+     "first_seed": 0,
+     "ok": true,
+     "steps": 30,
+     "violations": []
+   }
+   ```
+
+   Each violation has `seed`, `invariant`, `step` and `detail`; human output adds a `replay:` line with the exact command to reproduce it. A violation means a bug in TrustGraph or an unsafe interaction worth reporting. Do not loosen the policy to make it go away. The same seed and options always give the same `digest`.
+6. **explain**: `trustgraph policy explain FILE` prints one plain-English line per source and action:
 
    ```text
    comp_review: output can reach hr (nina), leadership (maya, omar). Usable by agent digest_bot.
@@ -110,14 +132,14 @@ Work in this order. Do not skip steps.
    ```
 
    With `--json` it returns `{"ok": true, "text": "..."}`.
-6. **diff**: `trustgraph policy diff OLD NEW` compares two files. With no change it prints `No changes.` A change that gives more people access prints a `WIDENS` line:
+7. **diff**: `trustgraph policy diff OLD NEW` compares two files. With no change it prints `No changes.` A change that gives more people access prints a `WIDENS` line:
 
    ```text
    WIDENS  action post_eng_channel: audience gained maya, nina, omar
    ```
 
    `--json` returns `{"ok": true, "widens": true, "changes": [{"kind": "widens", "subject": "action post_eng_channel", "gained": ["maya","nina","omar"], "lost": [], "summary": "audience gained maya, nina, omar"}]}`. Use `git show HEAD:trustgraph.policy.yaml > old.yaml` to get OLD.
-7. **Hand to a human**: give the file, the `explain` output and the `diff` output. Say which lines say `WIDENS`.
+8. **Hand to a human**: give the file, the `explain` output and the `diff` output. Say which lines say `WIDENS`.
 
 `trustgraph policy schema` prints the JSON Schema of the file (it is JSON already; `--json` is accepted).
 
