@@ -197,7 +197,7 @@ impl Shared {
     fn block(&self, session: &str) {
         let mut blocked = lock(&self.blocked);
         if blocked.insert(session.to_string()) {
-            save_blocked(&self.blocked_path, &blocked);
+            save_blocked_or_warn(&self.blocked_path, &blocked);
         }
     }
 
@@ -205,7 +205,7 @@ impl Shared {
         let mut blocked = lock(&self.blocked);
         let was = blocked.remove(session);
         if was {
-            save_blocked(&self.blocked_path, &blocked);
+            save_blocked_or_warn(&self.blocked_path, &blocked);
         }
         was
     }
@@ -242,34 +242,80 @@ impl Shared {
     }
 }
 
-fn load_blocked(path: &Path, mode: SessionMode) -> BTreeSet<String> {
-    let set: BTreeSet<String> = std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default();
-    // Connection sessions end with the process; agent sessions survive it.
-    set.into_iter()
-        .filter(|s| mode == SessionMode::Agent && s.starts_with("agent:"))
-        .collect()
+/// Largest `gateway.blocked` read.
+const MAX_BLOCKED_BYTES: u64 = 4 << 20;
+
+/// The blocked set kept across restarts: `agent:` entries (an agent-mode
+/// session, or, in connection mode, an agent blocked as a whole).
+/// Connection sessions end with the process. A missing file is an empty
+/// set; any other problem (unreadable, a link, not a regular file, not a
+/// JSON list of strings) is an error: starting anyway would unblock.
+pub fn load_blocked(path: &Path) -> Result<BTreeSet<String>, String> {
+    use std::io::Read;
+    let fail = |why: &dyn std::fmt::Display| {
+        format!(
+            "cannot read {}: {why}; the gateway does not start, because ignoring it would unblock every session it blocks. Fix the file, or remove it to unblock them all",
+            path.display()
+        )
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(e) => return Err(fail(&e)),
+    };
+    let metadata = file.metadata().map_err(|e| fail(&e))?;
+    if !metadata.is_file() || metadata.len() > MAX_BLOCKED_BYTES {
+        return Err(fail(&"not a regular file under 4 MiB"));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_BLOCKED_BYTES)
+        .read_to_end(&mut bytes)
+        .map_err(|e| fail(&e))?;
+    let set: BTreeSet<String> = serde_json::from_slice(&bytes)
+        .map_err(|e| fail(&format!("not a JSON list of session ids ({e})")))?;
+    Ok(set
+        .into_iter()
+        .filter(|s| s.starts_with("agent:"))
+        .collect())
 }
 
-fn save_blocked(path: &Path, blocked: &BTreeSet<String>) {
-    let text = serde_json::to_vec(blocked).unwrap_or_default();
-    let tmp = path.with_extension("tmp");
-    let written = std::fs::write(&tmp, text).and_then(|()| {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-        }
-        std::fs::rename(&tmp, path)
-    });
-    if let Err(e) = written {
+/// Write the blocked set atomically: a new 0600 temp file (never through a
+/// link), synced, then renamed over the old one.
+pub fn save_blocked(path: &Path, blocked: &BTreeSet<String>) -> std::io::Result<()> {
+    use std::io::Write;
+    let text = serde_json::to_vec(blocked).map_err(std::io::Error::other)?;
+    let tmp = path.with_extension("blocked.tmp");
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut file = crate::serve::auth::private_create(&tmp)?;
+    file.write_all(&text)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path)
+}
+
+fn save_blocked_or_warn(path: &Path, blocked: &BTreeSet<String>) {
+    if let Err(e) = save_blocked(path, blocked) {
         eprintln!(
             "trustgraph gateway: cannot write {}: {e}; a blocked session is still blocked until this process ends",
             path.display()
         );
     }
+}
+
+/// The blocked-set key of an agent as a whole.
+fn agent_key(agent: &str) -> String {
+    format!("agent:{agent}")
 }
 
 /// An argument value as the operator sees it: its text when it is a
@@ -369,6 +415,10 @@ impl GatewayView for Shared {
             }
             None => false,
         }
+    }
+
+    fn blocked(&self) -> Vec<String> {
+        lock(&self.blocked).iter().cloned().collect()
     }
 
     fn held_call(&self, decision: &str) -> Option<Value> {
@@ -539,8 +589,13 @@ pub fn attach<J: ServeJournal>(
         manager.session_config.keep_alive = None;
     }
     let blocked_path = server.settings.state_dir.join(BLOCKED_FILE);
-    let blocked = load_blocked(&blocked_path, config.session);
-    save_blocked(&blocked_path, &blocked);
+    let blocked = load_blocked(&blocked_path).map_err(|e| vec![e])?;
+    save_blocked(&blocked_path, &blocked).map_err(|e| {
+        vec![format!(
+            "cannot write {}: {e}; the gateway does not start without a place to keep blocked sessions",
+            blocked_path.display()
+        )]
+    })?;
     let shared = Arc::new(Shared {
         config,
         conns: Mutex::new(Connections::default()),
@@ -769,13 +824,20 @@ impl<J: ServeJournal> Gateway<J> {
                     };
                     let shared = self.shared.clone();
                     let receiver = session.clone();
+                    let whole = agent_key(&agent);
                     let value = self
                         .blocking(move |g| g.receive(&agent, &session, &token))
                         .await
                         .inspect_err(|_| {
                             // Refusing a hand-off must never leave the
-                            // receiver freer than accepting it.
+                            // receiver freer than accepting it. In
+                            // connection mode a new connection is a new
+                            // session, so the agent as a whole is blocked
+                            // too, until the operator clears it.
                             shared.block(&receiver);
+                            if receiver != whole {
+                                shared.block(&whole);
+                            }
                         })?;
                     Ok(structured(value))
                 }
@@ -1064,6 +1126,12 @@ impl<J: ServeJournal> Gateway<J> {
             return Err(ToolFail::new(
                 "session_blocked",
                 "this session was handed a token it refused, so it may not act; the operator must end the session on the operator page",
+            ));
+        }
+        if self.shared.is_blocked(&agent_key(agent)) {
+            return Err(ToolFail::new(
+                "agent_blocked",
+                "this agent was handed a token it refused, so none of its connections may act; the operator must clear the block on the operator page",
             ));
         }
         let carried = {

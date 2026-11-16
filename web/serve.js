@@ -90,7 +90,26 @@
     gatewayConnections(state).forEach(function (c) {
       keys.push('close:' + c.connection);
     });
+    blockedEntries(state).forEach(function (b) {
+      if (b.clearable) keys.push('clear:' + b.id);
+    });
     return keys;
+  }
+
+  // Sessions and agents that refused a hand-off and may not act. One that
+  // is a listed session is ended there; the rest (in connection mode, an
+  // agent blocked as a whole) get their own Clear.
+  function blockedEntries(state) {
+    var gateway = state.gateway;
+    if (!gateway || !gateway.blocked) return [];
+    var listed = gatewaySessions(state).map(function (s) { return s.session; });
+    return gateway.blocked.map(function (id) {
+      var agent = id.indexOf('agent:') === 0 ? id.slice(6) : null;
+      var text = agent && gateway.mode === 'connection'
+        ? 'Agent ' + agent + ' refused a hand-off: none of its connections, current or new, may act until you clear this.'
+        : 'Session ' + id + ' refused a hand-off and may not act until it is ended.';
+      return { id: id, text: text, clearable: listed.indexOf(id) === -1 };
+    });
   }
 
   function gatewayConnections(state) {
@@ -169,6 +188,7 @@
     approvalSummary: approvalSummary,
     callLines: callLines,
     capNotice: capNotice,
+    blockedEntries: blockedEntries,
     neutralise: neutralise,
     confirmableKeys: confirmableKeys,
     endSummary: endSummary,
@@ -380,6 +400,24 @@
     });
     var cap = capNotice(state);
     if (cap) problems.appendChild(el('p', cap, 'warn'));
+    blockedEntries(state).forEach(function (b) {
+      var key = 'clear:' + b.id;
+      var item = el('div', null, 'item');
+      item.appendChild(el('p', b.text, 'warn'));
+      if (!b.clearable) {
+        item.appendChild(el('p', 'End its session below to clear it.', 'muted'));
+      } else if (confirming === key) {
+        confirmStep(item, key, 'Clear this block? It may act again.', 'Clear now', function () {
+          act('/v1/operator/end-session', { session: b.id }, 'Cleared the block on ' + b.id + '.');
+        });
+      } else {
+        item.appendChild(button('Clear block', key, false, function () {
+          confirming = key;
+          load(true, 'yes:' + key);
+        }));
+      }
+      problems.appendChild(item);
+    });
     renderConnections(state);
     var box = $('sessions');
     box.replaceChildren();

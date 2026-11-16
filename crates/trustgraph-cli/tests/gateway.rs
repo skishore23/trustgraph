@@ -2453,6 +2453,138 @@ async fn a_refused_hand_off_leaves_the_receiver_unable_to_act() {
 }
 
 #[tokio::test]
+async fn m2_in_connection_mode_a_refused_hand_off_blocks_the_whole_agent_until_cleared() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = memory(dir.path(), "connection").await;
+    let operator = h.login().await;
+    let planner = h.connect("planner").await;
+    ok(&h.read(&planner, "Product/roadmap.md").await);
+    let refused = h
+        .call(&planner, gateway::RECEIVE_TOOL, json!({"token": "garbage"}))
+        .await;
+    assert_eq!(error_code(&refused), "invalid_handoff");
+    // A new connection is a new session, but the agent is blocked.
+    let fresh = h.connect("planner").await;
+    ok(&h.read(&fresh, "Product/roadmap.md").await);
+    let post = h.post(&fresh, "#engineering", "roadmap only").await;
+    assert_eq!(error_code(&post), "agent_blocked", "{post}");
+    assert!(slack_calls(&h).is_empty());
+    // Another agent is not affected.
+    let scout = h.connect("scout").await;
+    ok(&h.read(&scout, "Public/benchmarks.md").await);
+    ok(&h.post(&scout, "#engineering", "bench").await);
+    let state = h.op_state(&operator).await;
+    let blocked: Vec<&str> = state["gateway"]["blocked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(blocked.contains(&"agent:planner"), "{blocked:?}");
+    // Kept across a restart.
+    let saved = gateway::load_blocked(&h.state.join("gateway.blocked")).unwrap();
+    assert!(saved.contains("agent:planner"), "{saved:?}");
+    // The operator clears it; the fresh connection may act, the refusing
+    // connection's own session stays blocked.
+    let (status, body) = h
+        .op_post(
+            "/v1/operator/end-session",
+            &operator,
+            json!({"session": "agent:planner"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    ok(&h.post(&fresh, "#engineering", "roadmap only").await);
+    let post = h.post(&planner, "#engineering", "roadmap").await;
+    assert_eq!(error_code(&post), "session_blocked", "{post}");
+}
+
+fn bare_server(state: &Path) -> Arc<Server<MemoryJournal>> {
+    let runtime = Runtime::open(MemoryJournal::new(), POLICY, 0).unwrap();
+    Server::new(runtime, settings(1, state, Limits::default())).unwrap()
+}
+
+#[tokio::test]
+async fn m1_a_corrupt_or_unreadable_blocked_file_stops_the_gateway() {
+    let dir = tempfile::tempdir().unwrap();
+    let drive = drive(dir.path()).await;
+    let text = config_text(&drive.url, &dir.path().join("s.log"), "agent");
+    let state = dir.path().join("state");
+    let blocked = state.join("gateway.blocked");
+    for bad in [
+        "",
+        "not json",
+        "[\"agent:planner\"",
+        "{\"agent:planner\": true}",
+        "[1]",
+    ] {
+        let server = bare_server(&state);
+        std::fs::write(&blocked, bad).unwrap();
+        let problems = gateway::attach(server, config::parse(&text).unwrap(), &env)
+            .err()
+            .unwrap_or_else(|| panic!("started with {bad:?}"));
+        assert!(
+            problems.iter().any(|p| p.contains("gateway.blocked")),
+            "{problems:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&blocked).unwrap(),
+            bad,
+            "kept as is"
+        );
+    }
+    // A directory or a link where the file should be is refused too.
+    std::fs::remove_file(&blocked).unwrap();
+    std::fs::create_dir(&blocked).unwrap();
+    assert!(gateway::attach(bare_server(&state), config::parse(&text).unwrap(), &env).is_err());
+    std::fs::remove_dir(&blocked).unwrap();
+    #[cfg(unix)]
+    {
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, "[]").unwrap();
+        std::os::unix::fs::symlink(&target, &blocked).unwrap();
+        assert!(gateway::attach(bare_server(&state), config::parse(&text).unwrap(), &env).is_err());
+        std::fs::remove_file(&blocked).unwrap();
+    }
+    // A missing file is an empty set; a good one is kept.
+    std::fs::write(&blocked, r#"["agent:planner","conn:x"]"#).unwrap();
+    let server = bare_server(&state);
+    assert!(gateway::attach(server, config::parse(&text).unwrap(), &env).is_ok());
+    assert_eq!(
+        std::fs::read_to_string(&blocked).unwrap(),
+        r#"["agent:planner"]"#
+    );
+}
+
+#[test]
+fn m1_the_blocked_file_is_written_atomically_and_never_through_a_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gateway.blocked");
+    let set: std::collections::BTreeSet<String> = ["agent:planner".to_string()].into();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let target = dir.path().join("target");
+        std::fs::write(&target, "untouched").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("gateway.blocked.tmp")).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        gateway::save_blocked(&path, &set).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert!(metadata.is_file(), "the link was replaced by a file");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    }
+    gateway::save_blocked(&path, &set).unwrap();
+    assert_eq!(gateway::load_blocked(&path).unwrap(), set);
+    assert!(!dir.path().join("gateway.blocked.tmp").exists());
+    assert!(
+        gateway::load_blocked(&dir.path().join("missing"))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn a_connection_ended_mid_call_leaves_no_session_behind() {
     let dir = tempfile::tempdir().unwrap();
     let h = memory(dir.path(), "connection").await;

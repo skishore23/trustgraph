@@ -413,6 +413,25 @@ Every agent sees two more tools:
   refused with `session_blocked` until the operator ends the session.
   Refusing a hand-off never leaves the receiver freer than accepting it.
 
+What a refusal blocks depends on the session mode:
+
+- **`session: agent`.** The session is the agent's, so the agent may not act
+  on any connection until the operator ends its session.
+- **`session: connection`.** A session is one connection, so blocking only
+  it would let the agent act freely from a new connection. The gateway
+  therefore also blocks the agent as a whole: none of its connections,
+  current or new, may act (`agent_blocked`) until the operator clears the
+  block with **Clear block** on the operator page. The refusing connection's
+  own session stays blocked until it is ended. Use `session: agent` when
+  agents hand off: there the block and what was read both follow the agent.
+
+Blocks on agents (and agent-mode sessions) are kept in
+`<state>/gateway.blocked`, written atomically (a new 0600 file, never
+through a link, renamed into place), so they survive a restart. The gateway
+does not start if that file exists but cannot be read or is not a JSON list
+of session ids: ignoring it would unblock. Fix it, or remove it to unblock
+everything it held.
+
 The gateway makes and checks tokens with an HMAC key kept 0600 in
 `<state>/gateway.secret`. A token names the agent that issued it and the
 journal position, and it expires after 24 hours. An agent cannot forge or

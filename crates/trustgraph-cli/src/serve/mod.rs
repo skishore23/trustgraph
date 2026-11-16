@@ -371,6 +371,9 @@ pub(crate) trait GatewayView: Send + Sync {
     /// the tool and its forwarded arguments, from memory. `None` when the
     /// gateway no longer has it (it restarted, or dropped it).
     fn held_call(&self, decision: &str) -> Option<Value>;
+    /// Sessions, and (`agent:<name>`) agents, that refused a hand-off and
+    /// may not act until the operator ends or clears them.
+    fn blocked(&self) -> Vec<String>;
 }
 
 /// One live MCP connection to the gateway, as the operator page shows it.
@@ -1326,6 +1329,7 @@ impl<J: ServeJournal> Server<J> {
                 "connections": connections,
                 "max_connections_per_agent": gateway::MAX_CONNECTIONS_PER_AGENT,
                 "at_cap": g.at_cap(),
+                "blocked": g.blocked(),
             })
         });
         Ok(json!({
