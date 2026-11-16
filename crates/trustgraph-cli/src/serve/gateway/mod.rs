@@ -1192,10 +1192,49 @@ impl<J: ServeJournal> Gateway<J> {
             self.blocking(move |g| g.authorize_read(&agent, &tool, &source))
                 .await?;
         }
-        let (result, bytes) = self.forward(&tool, arguments).await?;
+        let (mut result, bytes) = self.forward(&tool, arguments).await?;
         let sha = sha256_hex(&bytes);
         let named = source.clone();
-        self.blocking(move |g| g.record_read(&agent, &session, &named, sha))
+        let schema = tool.schema.clone();
+        let transform = tool.transform.clone();
+        let transform_step = format!("gateway:transform:{}", tool.exposed);
+        if transform.is_some() {
+            // This trusted implementation reads only text. It changes the value,
+            // never the inherited permissions, and is not an LLM summarizer.
+            if result.is_error == Some(true) || result.content.len() != 1 {
+                return Err(ToolFail::new(
+                    "invalid_transform_input",
+                    "first_line_v1 requires one successful text content item; result withheld",
+                ));
+            }
+            let text = result.content[0].as_text().ok_or_else(|| {
+                ToolFail::new(
+                    "invalid_transform_input",
+                    "first_line_v1 requires text; result withheld",
+                )
+            })?;
+            result = CallToolResult::success(vec![ContentBlock::text(
+                text.text.lines().next().unwrap_or_default(),
+            )]);
+        }
+        let output_sha = sha256_hex(
+            &serde_json::to_vec(&result)
+                .map_err(|_| ToolFail::new("internal", "cannot encode transform output"))?,
+        );
+        let evidence = self.blocking(move |g| {
+            let mut artifact = g.record_read(&agent, &named, sha, schema)?;
+            if let Some(contract) = transform {
+                let output = g.server.record_output_typed(&agent, OutputRequest {
+                    inputs: vec![artifact],
+                    step: transform_step,
+                    sha256: Some(output_sha),
+                    content: None,
+                }, Some(contract))?;
+                artifact = output["artifact"].as_str().ok_or_else(|| ToolFail::new("internal", "no transform artifact"))?.to_string();
+            }
+            g.carry(&agent, &session, vec![artifact.clone()])?;
+            g.server.explain_artifact(&agent, &artifact).map_err(Into::into)
+        })
             .await
             .map_err(|fail| {
                 ToolFail::new(
@@ -1206,6 +1245,12 @@ impl<J: ServeJournal> Gateway<J> {
                     ),
                 )
             })?;
+        if tool.schema.is_some() {
+            result
+                .meta
+                .get_or_insert_with(Default::default)
+                .insert("trustgraph".into(), evidence);
+        }
         Ok(result)
     }
 
@@ -1251,23 +1296,24 @@ impl<J: ServeJournal> Gateway<J> {
     fn record_read(
         &self,
         agent: &str,
-        session: &str,
         source: &str,
         sha256: String,
-    ) -> Result<(), ToolFail> {
-        let artifact = self.server.register_source(
+        schema: Option<trustgraph_framework::SchemaId>,
+    ) -> Result<String, ToolFail> {
+        let artifact = self.server.register_source_typed(
             agent,
             SourceRequest {
                 source: source.to_string(),
                 sha256: Some(sha256),
                 content: None,
             },
+            schema,
         )?;
         let artifact = artifact["artifact"]
             .as_str()
             .ok_or_else(|| ToolFail::new("internal", "no artifact id"))?
             .to_string();
-        self.carry(agent, session, vec![artifact])
+        Ok(artifact)
     }
 
     /// Add `artifacts` to the session, skipping any whose sources it
@@ -1396,7 +1442,9 @@ impl<J: ServeJournal> Gateway<J> {
             .unwrap_or_default()
             .to_string();
         let reason = decision["reason"].as_str().unwrap_or_default().to_string();
-        let extra = Some(json!({"decision": id, "verdict": decision["verdict"].clone()}));
+        let extra = Some(
+            json!({"decision": id, "verdict": decision["verdict"].clone(), "lineage": decision["lineage"].clone()}),
+        );
         match decision["verdict"].as_str() {
             Some("allow") => Ok(Forward::Checked(
                 (decision["consumed"] == true).then_some((id, before)),

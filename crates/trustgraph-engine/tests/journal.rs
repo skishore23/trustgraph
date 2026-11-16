@@ -63,6 +63,7 @@ fn ten_events<J: Journal>(rt: &mut Runtime<J>) -> String {
     let roadmap = artifact(send(
         rt,
         Event::RegisterSource {
+            schema: None,
             source: "roadmap".into(),
             sha256: sha(2),
         },
@@ -70,11 +71,13 @@ fn ten_events<J: Journal>(rt: &mut Runtime<J>) -> String {
     let salaries = artifact(send(
         rt,
         Event::RegisterSource {
+            schema: None,
             source: "salaries".into(),
             sha256: sha(1),
         },
     ));
     let output = |inputs: Vec<String>, n| Event::RecordOutput {
+        contract: None,
         agent: "planner".into(),
         step: "summarize".into(),
         inputs,
@@ -124,6 +127,7 @@ fn output_steps_are_indexed_and_rebuilt_on_replay() {
         rt.handle(
             50,
             Event::RegisterSource {
+                schema: None,
                 source: "roadmap".into(),
                 sha256: sha(2),
             },
@@ -137,6 +141,7 @@ fn output_steps_are_indexed_and_rebuilt_on_replay() {
             rt.handle(
                 51,
                 Event::RecordOutput {
+                    contract: None,
                     agent: "planner".into(),
                     step: step.clone(),
                     inputs: vec![roadmap.clone()],
@@ -226,6 +231,7 @@ fn a_changed_policy_file_is_only_proposed() {
 
 fn register_roadmap() -> Event {
     Event::RegisterSource {
+        schema: None,
         source: "roadmap".into(),
         sha256: sha(2),
     }
@@ -295,6 +301,7 @@ fn corrupt_middle_fails_closed() {
         rt.handle(
             n + 1,
             Event::RegisterSource {
+                schema: None,
                 source: "roadmap".into(),
                 sha256: sha(n as u32 + 2),
             },
@@ -400,6 +407,7 @@ fn rejected_and_check_events_are_journaled_and_replayed() {
         rt.handle(
             1,
             Event::RegisterSource {
+                schema: None,
                 source: "price_sheet".into(),
                 sha256: sha(3),
             },
@@ -410,6 +418,7 @@ fn rejected_and_check_events_are_journaled_and_replayed() {
         rt.handle(
             2,
             Event::RecordOutput {
+                contract: None,
                 agent: "mailer".into(),
                 step: "draft".into(),
                 inputs: vec![sheet],
@@ -642,6 +651,7 @@ fn restart_keeps_an_in_band_activation() {
         rt.handle(
             2,
             Event::RegisterSource {
+                schema: None,
                 source: "price_sheet".into(),
                 sha256: sha(3),
             },
@@ -652,6 +662,7 @@ fn restart_keeps_an_in_band_activation() {
         rt.handle(
             3,
             Event::RecordOutput {
+                contract: None,
                 agent: "mailer".into(),
                 step: "draft".into(),
                 inputs: vec![sheet],
@@ -770,6 +781,7 @@ fn shape_rejected_events_are_not_journaled() {
         ),
         (
             Event::RecordOutput {
+                contract: None,
                 agent: "planner".into(),
                 step: "summarize".into(),
                 inputs: vec![roadmap.clone(); 65],
@@ -788,6 +800,7 @@ fn shape_rejected_events_are_not_journaled() {
         ),
         (
             Event::RegisterSource {
+                schema: None,
                 source: "roadmap".into(),
                 sha256: "not hex".into(),
             },
@@ -1015,6 +1028,7 @@ fn agent_usage_is_rebuilt_from_the_journal() {
         rt.handle(
             2,
             Event::RecordOutput {
+                contract: None,
                 agent: "planner".into(),
                 step: "summary".into(),
                 inputs: vec![roadmap],

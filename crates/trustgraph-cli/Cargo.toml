@@ -15,6 +15,7 @@ trustgraph-sim = { path = "../trustgraph-sim" }
 trustgraph-policy = { path = "../trustgraph-policy" }
 # No features: the shipped CLI never links the engine's fault injection.
 trustgraph-engine = { path = "../trustgraph-engine" }
+trustgraph-framework = { path = "../trustgraph-framework" }
 sha2.workspace = true
 getrandom = "0.4"
 http-body-util = "0.1"

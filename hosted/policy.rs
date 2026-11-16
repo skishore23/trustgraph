@@ -567,6 +567,7 @@ fn op_run(req: RunReq) -> Result<Value, Rejection> {
                     match engine.apply(
                         0,
                         &Event::RegisterSource {
+                            schema: None,
                             source: name.clone(),
                             sha256: sha,
                         },
@@ -590,6 +591,7 @@ fn op_run(req: RunReq) -> Result<Value, Rejection> {
         if refusal.is_none() {
             let sha = synthetic_sha256(&["step", &index.to_string(), &step.writes]);
             let event = Event::RecordOutput {
+                contract: None,
                 agent: step.agent.clone(),
                 step: step.writes.clone(),
                 inputs,

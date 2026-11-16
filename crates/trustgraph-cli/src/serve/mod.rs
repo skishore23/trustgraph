@@ -999,13 +999,28 @@ impl<J: ServeJournal> Server<J> {
     // ----- agent operations (HTTP and MCP share these) -----
 
     pub fn register_source(&self, agent: &str, request: SourceRequest) -> ApiResult {
+        self.register_source_typed(agent, request, None)
+    }
+
+    fn register_source_typed(
+        &self,
+        agent: &str,
+        request: SourceRequest,
+        schema: Option<trustgraph_framework::SchemaId>,
+    ) -> ApiResult {
         let sha = digest_of(request.sha256, request.content)?;
         let event = Event::RegisterSource {
+            schema,
             source: request.source,
             sha256: sha,
         };
         shape(&event)?;
-        let Event::RegisterSource { source, sha256 } = &event else {
+        let Event::RegisterSource {
+            source,
+            sha256,
+            schema,
+        } = &event
+        else {
             return Err(ApiError::internal("unexpected event"));
         };
         let mut rt = self.lock()?;
@@ -1026,7 +1041,10 @@ impl<J: ServeJournal> Server<J> {
             ));
         }
         // Already registered: the same answer, nothing journaled or charged.
-        if let Some(id) = rt.engine().source_artifact(source, sha256) {
+        if let Some(id) = rt
+            .engine()
+            .source_artifact_typed(source, sha256, schema.as_ref())
+        {
             return Ok(json!({"artifact": id}));
         }
         self.agent_quota(&rt, agent, true)?;
@@ -1035,8 +1053,18 @@ impl<J: ServeJournal> Server<J> {
     }
 
     pub fn record_output(&self, agent: &str, request: OutputRequest) -> ApiResult {
+        self.record_output_typed(agent, request, None)
+    }
+
+    fn record_output_typed(
+        &self,
+        agent: &str,
+        request: OutputRequest,
+        contract: Option<trustgraph_engine::OutputContract>,
+    ) -> ApiResult {
         let sha = digest_of(request.sha256, request.content)?;
         let event = Event::RecordOutput {
+            contract,
             agent: agent.into(),
             step: request.step,
             inputs: request.inputs,
@@ -1047,6 +1075,7 @@ impl<J: ServeJournal> Server<J> {
             step,
             inputs,
             sha256,
+            contract,
             ..
         } = &event
         else {
@@ -1065,7 +1094,9 @@ impl<J: ServeJournal> Server<J> {
         if !visible {
             return Err(ApiError::unknown_artifact());
         }
-        if let Some(id) = engine.output_artifact(agent, step, inputs, sha256) {
+        if let Some(id) =
+            engine.output_artifact_typed(agent, step, inputs, sha256, contract.as_ref())
+        {
             return Ok(json!({"artifact": id}));
         }
         self.agent_quota(&rt, agent, true)?;
@@ -1131,9 +1162,12 @@ impl<J: ServeJournal> Server<J> {
             .policy()
             .ok_or_else(|| ApiError::internal("no active policy"))?;
         Self::visible_sources(engine, policy, agent, artifact)?;
+        let lineage = engine.typed_lineage(artifact);
         self.agent_quota(rt, agent, false)?;
         let reply = self.agent_handle(rt, agent, event)?;
-        reply_value(reply)
+        let mut value = reply_value(reply)?;
+        value["lineage"] = json!(lineage);
+        Ok(value)
     }
 
     pub fn explain_artifact(&self, agent: &str, artifact: &str) -> ApiResult {
@@ -1147,6 +1181,7 @@ impl<J: ServeJournal> Server<J> {
             "artifact": artifact,
             "readers": readers(policy, &sources),
             "sources": sources,
+            "lineage": engine.typed_lineage(artifact),
         }))
     }
 

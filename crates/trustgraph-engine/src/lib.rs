@@ -46,6 +46,6 @@ pub use engine::{
 };
 #[cfg(feature = "fault-injection")]
 pub use event::Fault;
-pub use event::{Event, Reply};
+pub use event::{Event, OutputContract, Reply, validate_schema};
 pub use journal::{FileJournal, Journal, JournalError, MemoryJournal, Record};
 pub use runtime::{AgentUsage, FileOutcome, OpenError, PolicyFile, PolicySource, Runtime};

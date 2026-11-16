@@ -19,7 +19,7 @@ use trustgraph_policy::{Policy, Query, Verdict, decide, diff, explain};
 
 #[cfg(feature = "fault-injection")]
 use crate::event::Fault;
-use crate::event::{Event, Reply};
+use crate::event::{Event, OutputContract, Reply};
 use crate::rules::{
     action_rule, clip, decision_reply, echo, graph_error, graph_readers, principals, reject,
     validate_policy,
@@ -34,7 +34,7 @@ const MAX_PROPOSALS_PER_AGENT: usize = 8;
 const MAX_DECISIONS: usize = 1024;
 /// Remembered `NeedsApproval` decisions per agent, within `MAX_DECISIONS`.
 const MAX_DECISIONS_PER_AGENT: usize = 64;
-/// The engine never sees content, so every port carries the same nominal type.
+/// Backward-compatible nominal type for events without adapter metadata.
 const SCHEMA: &str = "any";
 const OUTPUT_PORT: &str = "out";
 const RECEIPT: &str = "trustgraph-engine";
@@ -160,7 +160,7 @@ struct Activation {
 }
 
 /// Key of a recorded output: `(agent, step, inputs, sha256)`.
-type OutputKey = (String, String, Vec<String>, String);
+type OutputKey = (String, String, Vec<String>, String, Option<OutputContract>);
 
 /// The deterministic runtime core. See the crate docs.
 #[derive(Debug, Default)]
@@ -175,7 +175,7 @@ pub struct Engine {
     /// Source artifact id -> source name.
     sources: BTreeMap<String, String>,
     /// `(source name, sha256)` -> artifact id.
-    source_ids: BTreeMap<(String, String), String>,
+    source_ids: BTreeMap<(String, String, SchemaId), String>,
     outputs: BTreeMap<OutputKey, String>,
     /// Output artifact id -> the step that recorded it: an index over
     /// `outputs`, filled where it is (so replay rebuilds it) and never part
@@ -220,13 +220,18 @@ impl Engine {
             Event::Genesis { policy } => {
                 validate_policy(policy).and_then(|policy| self.activate(policy, None, at))
             }
-            Event::RegisterSource { source, sha256 } => self.register_source(source, sha256),
+            Event::RegisterSource {
+                source,
+                sha256,
+                schema,
+            } => self.register_source(source, sha256, schema.as_ref()),
             Event::RecordOutput {
                 agent,
                 step,
                 inputs,
                 sha256,
-            } => self.record_output(agent, step, inputs, sha256),
+                contract,
+            } => self.record_output(agent, step, inputs, sha256, contract.as_ref()),
             Event::Check {
                 agent,
                 artifact,
@@ -269,8 +274,21 @@ impl Engine {
 
     /// The artifact id of an already registered `(source, sha256)`.
     pub fn source_artifact(&self, source: &str, sha256: &str) -> Option<&str> {
+        self.source_artifact_typed(source, sha256, None)
+    }
+
+    pub fn source_artifact_typed(
+        &self,
+        source: &str,
+        sha256: &str,
+        schema: Option<&SchemaId>,
+    ) -> Option<&str> {
         self.source_ids
-            .get(&(source.to_string(), sha256.to_string()))
+            .get(&(
+                source.to_string(),
+                sha256.to_string(),
+                schema.cloned().unwrap_or_else(|| SchemaId(SCHEMA.into())),
+            ))
             .map(String::as_str)
     }
 
@@ -282,8 +300,59 @@ impl Engine {
         inputs: &[String],
         sha256: &str,
     ) -> Option<&str> {
-        let key: OutputKey = (agent.into(), step.into(), inputs.to_vec(), sha256.into());
+        self.output_artifact_typed(agent, step, inputs, sha256, None)
+    }
+
+    pub fn output_artifact_typed(
+        &self,
+        agent: &str,
+        step: &str,
+        inputs: &[String],
+        sha256: &str,
+        contract: Option<&OutputContract>,
+    ) -> Option<&str> {
+        let key: OutputKey = (
+            agent.into(),
+            step.into(),
+            inputs.to_vec(),
+            sha256.into(),
+            contract.cloned(),
+        );
         self.outputs.get(&key).map(String::as_str)
+    }
+
+    /// Evidence from the existing graph; no parallel provenance store.
+    pub fn graph(&self) -> &Graph {
+        &self.graph
+    }
+
+    /// Bounded typed ancestry, including producer contracts and input edges.
+    pub fn typed_lineage(&self, artifact: &str) -> Option<serde_json::Value> {
+        self.source_names(artifact).ok()?;
+        let mut pending = vec![ArtifactId(artifact.into())];
+        let mut nodes = BTreeMap::new();
+        while let Some(id) = pending.pop() {
+            if nodes.contains_key(&id.0) {
+                continue;
+            }
+            if nodes.len() >= 256 {
+                return None;
+            }
+            let value = self.graph.artifacts().get(&id)?;
+            let producer = match &value.origin {
+                trustgraph_framework::Origin::Source => None,
+                trustgraph_framework::Origin::Output { execution, .. } => {
+                    let execution = self.graph.executions().get(execution)?;
+                    let operation = self.graph.operations().get(&execution.operation)?;
+                    pending.extend(execution.inputs.values().cloned());
+                    Some(
+                        serde_json::json!({"operation": operation, "inputs": execution.inputs, "receipt": execution.receipt}),
+                    )
+                }
+            };
+            nodes.insert(id.0, serde_json::json!({"schema": value.schema, "name": value.logical_id, "producer": producer}));
+        }
+        Some(serde_json::json!({"artifact": artifact, "nodes": nodes}))
     }
 
     /// The step that recorded the output artifact `id`, when it is one.
@@ -426,8 +495,9 @@ impl Engine {
             artifacts: &'a BTreeMap<ArtifactId, trustgraph_framework::Artifact>,
             executions:
                 &'a BTreeMap<trustgraph_framework::ExecutionId, trustgraph_framework::Execution>,
+            operations: &'a BTreeMap<trustgraph_framework::OperationId, OperationDefinition>,
             permissions: BTreeMap<&'a String, Option<trustgraph_framework::SourcePermission>>,
-            sources: Vec<(&'a String, &'a String, &'a String)>,
+            sources: Vec<(&'a String, &'a String, &'a SchemaId, &'a String)>,
             outputs: Vec<(&'a OutputKey, &'a String)>,
             rules: &'a BTreeSet<String>,
             decisions: &'a BTreeMap<String, Remembered>,
@@ -456,11 +526,12 @@ impl Engine {
             activation: &self.activation,
             artifacts: self.graph.artifacts(),
             executions: self.graph.executions(),
+            operations: self.graph.operations(),
             permissions,
             sources: self
                 .source_ids
                 .iter()
-                .map(|((name, sha), id)| (name, sha, id))
+                .map(|((name, sha, schema), id)| (name, sha, schema, id))
                 .collect(),
             outputs: self.outputs.iter().collect(),
             rules: &self.rule_names,
@@ -619,7 +690,7 @@ impl Engine {
         Ok(Reply::Activated { revision, digest })
     }
 
-    fn register_source(&mut self, source: &str, sha: &str) -> Handled {
+    fn register_source(&mut self, source: &str, sha: &str, schema: Option<&SchemaId>) -> Handled {
         let policy = self.active()?;
         if !policy.sources.contains_key(source) {
             return Err(reject(
@@ -627,19 +698,15 @@ impl Engine {
                 format!("`{}` is not a source in the active policy", clip(source)),
             ));
         }
-        let key = (source.to_string(), sha.to_string());
+        let schema = schema.cloned().unwrap_or_else(|| SchemaId(SCHEMA.into()));
+        let key = (source.to_string(), sha.to_string(), schema.clone());
         if let Some(id) = self.source_ids.get(&key) {
             return Ok(Reply::Artifact { id: id.clone() });
         }
         let readers = graph_readers(policy, source);
         let id = self
             .graph
-            .register_source(
-                source,
-                SchemaId(SCHEMA.into()),
-                sha.as_bytes().to_vec(),
-                readers,
-            )
+            .register_source(source, schema, sha.as_bytes().to_vec(), readers)
             .map_err(graph_error)?
             .0;
         self.sources.insert(id.clone(), source.to_string());
@@ -647,25 +714,65 @@ impl Engine {
         Ok(Reply::Artifact { id })
     }
 
-    fn record_output(&mut self, agent: &str, step: &str, inputs: &[String], sha: &str) -> Handled {
+    fn record_output(
+        &mut self,
+        agent: &str,
+        step: &str,
+        inputs: &[String],
+        sha: &str,
+        contract: Option<&OutputContract>,
+    ) -> Handled {
         self.agent_may_use(agent, inputs)?;
 
-        let key: OutputKey = (agent.into(), step.into(), inputs.to_vec(), sha.into());
+        let key: OutputKey = (
+            agent.into(),
+            step.into(),
+            inputs.to_vec(),
+            sha.into(),
+            contract.cloned(),
+        );
         if let Some(id) = self.outputs.get(&key) {
             return Ok(Reply::Artifact { id: id.clone() });
         }
-        let ports = (0..inputs.len())
-            .map(|i| (format!("in{i}"), SchemaId(SCHEMA.into())))
+        let schemas: Vec<_> = inputs
+            .iter()
+            .map(|id| {
+                self.graph.artifacts()[&ArtifactId(id.clone())]
+                    .schema
+                    .clone()
+            })
             .collect();
+        if contract.is_some_and(|c| c.inputs != schemas) {
+            return Err(reject(
+                "schema_mismatch",
+                "input schemas do not match the registered adapter contract",
+            ));
+        }
+        let ports = schemas
+            .iter()
+            .enumerate()
+            .map(|(i, schema)| (format!("in{i}"), schema.clone()))
+            .collect();
+        let version = match contract {
+            Some(c) => format!("typed/{}/{agent}", c.version),
+            None if schemas.iter().all(|s| s.0 == SCHEMA) => format!("{}/{agent}", inputs.len()),
+            None => format!(
+                "inferred/{}/{agent}",
+                digest::structured("runtime-input-schemas-v1", &schemas).0
+            ),
+        };
         let operation = self
             .graph
             .register_operation(OperationDefinition {
                 name: step.into(),
                 // One contract per (step, input count, agent), so contracts never collide.
-                version: format!("{}/{agent}", inputs.len()),
+                version,
                 executor: PrincipalId(agent.into()),
                 inputs: ports,
-                outputs: BTreeMap::from([(OUTPUT_PORT.into(), SchemaId(SCHEMA.into()))]),
+                outputs: BTreeMap::from([(
+                    OUTPUT_PORT.into(),
+                    contract.map_or_else(|| SchemaId(SCHEMA.into()), |c| c.output.clone()),
+                )]),
             })
             .map_err(graph_error)?;
         let bound = inputs
@@ -1239,6 +1346,7 @@ mod tests {
         let sheet = engine.apply(
             1,
             &Event::RegisterSource {
+                schema: None,
                 source: "price_sheet".into(),
                 sha256: "a".repeat(64),
             },

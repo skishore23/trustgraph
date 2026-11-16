@@ -69,6 +69,7 @@ fn register(engine: &mut Engine, at: u64, source: &str, n: u32) -> String {
     artifact(engine.apply(
         at,
         &Event::RegisterSource {
+            schema: None,
             source: source.into(),
             sha256: sha(n),
         },
@@ -79,6 +80,7 @@ fn record(engine: &mut Engine, at: u64, agent: &str, inputs: &[&String], n: u32)
     artifact(engine.apply(
         at,
         &Event::RecordOutput {
+            contract: None,
             agent: agent.into(),
             step: "summarize".into(),
             inputs: inputs.iter().map(|s| s.to_string()).collect(),
@@ -333,6 +335,7 @@ fn removed_source_denies() {
     let again = engine.apply(
         5,
         &Event::RegisterSource {
+            schema: None,
             source: "roadmap".into(),
             sha256: sha(2),
         },
@@ -341,6 +344,7 @@ fn removed_source_denies() {
     let derived = engine.apply(
         6,
         &Event::RecordOutput {
+            contract: None,
             agent: "planner".into(),
             step: "again".into(),
             inputs: vec![roadmap],
@@ -482,10 +486,12 @@ fn only_genesis_before_policy() {
     let mut engine = Engine::new();
     let events = [
         Event::RegisterSource {
+            schema: None,
             source: "salaries".into(),
             sha256: sha(1),
         },
         Event::RecordOutput {
+            contract: None,
             agent: "planner".into(),
             step: "s".into(),
             inputs: vec![sha(1)],
@@ -537,6 +543,7 @@ fn clock_regression_is_rejected_without_state_change() {
     let reply = engine.apply(
         99,
         &Event::RecordOutput {
+            contract: None,
             agent: "planner".into(),
             step: "s".into(),
             inputs: vec![roadmap.clone()],
@@ -556,10 +563,12 @@ fn agent_callable_classification() {
     let all = [
         Event::Genesis { policy: s() },
         Event::RegisterSource {
+            schema: None,
             source: s(),
             sha256: s(),
         },
         Event::RecordOutput {
+            contract: None,
             agent: s(),
             step: s(),
             inputs: vec![],
@@ -609,6 +618,7 @@ fn script() -> Vec<(u64, Event)> {
         (
             1,
             Event::RegisterSource {
+                schema: None,
                 source: "salaries".into(),
                 sha256: sha(1),
             },
@@ -616,6 +626,7 @@ fn script() -> Vec<(u64, Event)> {
         (
             1,
             Event::RegisterSource {
+                schema: None,
                 source: "roadmap".into(),
                 sha256: sha(2),
             },
@@ -623,6 +634,7 @@ fn script() -> Vec<(u64, Event)> {
         (
             1,
             Event::RegisterSource {
+                schema: None,
                 source: "price_sheet".into(),
                 sha256: sha(3),
             },
@@ -630,6 +642,7 @@ fn script() -> Vec<(u64, Event)> {
         (
             2,
             Event::RecordOutput {
+                contract: None,
                 agent: "planner".into(),
                 step: "summarize".into(),
                 inputs: vec![salaries, roadmap.clone()],
@@ -639,6 +652,7 @@ fn script() -> Vec<(u64, Event)> {
         (
             2,
             Event::RecordOutput {
+                contract: None,
                 agent: "mailer".into(),
                 step: "summarize".into(),
                 inputs: vec![sheet],
@@ -673,6 +687,7 @@ fn script() -> Vec<(u64, Event)> {
         (
             8,
             Event::RecordOutput {
+                contract: None,
                 agent: "planner".into(),
                 step: "again".into(),
                 inputs: vec![roadmap],
@@ -721,10 +736,12 @@ fn garbage_never_panics() {
         let events = [
             Event::Genesis { policy: s() },
             Event::RegisterSource {
+                schema: None,
                 source: s(),
                 sha256: s(),
             },
             Event::RecordOutput {
+                contract: None,
                 agent: s(),
                 step: s(),
                 inputs: vec![s()],
@@ -776,6 +793,7 @@ fn record_output_checks_in_order() {
     let mut engine = genesis(SPEC);
     let salaries = register(&mut engine, 1, "salaries", 1);
     let rec = |agent: &str, inputs: Vec<String>, sha256: String| Event::RecordOutput {
+        contract: None,
         agent: agent.into(),
         step: "s".into(),
         inputs,
@@ -981,6 +999,7 @@ fn rejection_messages_echo_at_most_64_characters_in_total() {
     let reply = engine.apply(
         2,
         &Event::RecordOutput {
+            contract: None,
             agent: agent.clone(),
             step: "s".into(),
             inputs: vec![input],
@@ -1250,6 +1269,7 @@ fn too_deep_lineage_is_lineage_limit() {
         match engine.apply(
             2,
             &Event::RecordOutput {
+                contract: None,
                 agent: "planner".into(),
                 step: "s".into(),
                 inputs: vec![last.clone()],
@@ -1367,6 +1387,7 @@ fn shape_rejection_leaves_the_clock_alone() {
     let reply = engine.apply(
         50,
         &Event::RecordOutput {
+            contract: None,
             agent: "planner".into(),
             step: "summarize".into(),
             inputs: Vec::new(),

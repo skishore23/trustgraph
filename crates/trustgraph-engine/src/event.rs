@@ -3,9 +3,44 @@
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
+use trustgraph_framework::SchemaId;
 use trustgraph_policy::{Blocking, Change, MAX_BYTES, Verdict};
 
 use crate::rules::{MAX_INPUTS, MAX_RECIPIENTS, field, reject, sha256};
+
+/// Nominal adapter contract. It never grants permission or declassifies data.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutputContract {
+    pub version: String,
+    pub inputs: Vec<SchemaId>,
+    pub output: SchemaId,
+}
+
+/// Versioned nominal schemas use `Name@version`; old records use `any`.
+pub fn validate_schema(schema: &SchemaId) -> Result<(), Reply> {
+    field("schema", &schema.0)?;
+    if schema.0 == "any" {
+        return Ok(());
+    }
+    let valid = schema.0.rsplit_once('@').is_some_and(|(name, version)| {
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"._-/".contains(&c))
+            && !version.is_empty()
+            && version.bytes().all(|c| c.is_ascii_digit())
+            && version.parse::<u32>().is_ok_and(|v| v > 0)
+    });
+    if valid {
+        Ok(())
+    } else {
+        Err(reject(
+            "invalid_schema",
+            "use `Name@version` with a positive integer version, or `any`",
+        ))
+    }
+}
 
 /// One input to the engine. Only the four agent-callable variants may come
 /// from an agent; the rest come from the system or the operator.
@@ -19,12 +54,16 @@ pub enum Event {
     RegisterSource {
         source: String,
         sha256: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        schema: Option<SchemaId>,
     },
     RecordOutput {
         agent: String,
         step: String,
         inputs: Vec<String>,
         sha256: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        contract: Option<OutputContract>,
     },
     Check {
         agent: String,
@@ -97,8 +136,12 @@ impl Event {
             Event::RegisterSource {
                 source,
                 sha256: sha,
+                schema,
             } => {
                 field("source", source)?;
+                if let Some(schema) = schema {
+                    validate_schema(schema)?;
+                }
                 sha256(sha)
             }
             Event::RecordOutput {
@@ -106,10 +149,22 @@ impl Event {
                 step,
                 inputs,
                 sha256: sha,
+                contract,
             } => {
                 field("agent", agent)?;
                 field("step", step)?;
                 sha256(sha)?;
+                if let Some(contract) = contract {
+                    field("contract.version", &contract.version)?;
+                    if contract.inputs.len() != inputs.len() {
+                        return Err(reject(
+                            "invalid_contract",
+                            "contract must describe every input",
+                        ));
+                    }
+                    contract.inputs.iter().try_for_each(validate_schema)?;
+                    validate_schema(&contract.output)?;
+                }
                 if inputs.is_empty() || inputs.len() > MAX_INPUTS {
                     return Err(reject(
                         "invalid_inputs",

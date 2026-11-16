@@ -506,6 +506,7 @@ impl Sim {
 
     fn register(&mut self, source: String, sha256: String) {
         let event = Event::RegisterSource {
+            schema: None,
             source: source.clone(),
             sha256,
         };
@@ -536,6 +537,7 @@ impl Sim {
         }
         let expected = self.shadow.lineage_of(&inputs);
         let event = Event::RecordOutput {
+            contract: None,
             agent,
             step: format!("step{}", self.rng.below(4)),
             inputs,

@@ -21,6 +21,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use serde_yaml::{Mapping, Value};
+use trustgraph_engine::{OutputContract, validate_schema};
+use trustgraph_framework::SchemaId;
 use trustgraph_policy::Policy;
 
 /// Default cap on one upstream tool result, serialized, in bytes.
@@ -215,6 +217,10 @@ pub struct Tool {
     pub kind: Kind,
     /// The only argument names a call may carry.
     pub arguments: BTreeSet<String>,
+    /// Trusted adapter's nominal result type. Missing means `any`.
+    pub schema: Option<SchemaId>,
+    /// A local deterministic text projection; retains every input restriction.
+    pub transform: Option<OutputContract>,
 }
 
 #[derive(Debug, Clone)]
@@ -727,9 +733,60 @@ pub fn parse(text: &str) -> Result<Config, Vec<Problem>> {
                         );
                         continue;
                     }
-                    let Some((kind, arguments)) = tool_kind(&mut cx, value, &path, session) else {
+                    let mut spec = value.clone();
+                    let mut schema = None;
+                    let mut transform = None;
+                    if let Value::Mapping(ref mut map) = spec {
+                        if let Some(value) = map.remove(Value::String("schema".into())) {
+                            schema = cx.string(&value, &join(&path, "schema")).map(SchemaId);
+                            if let Some(s) = &schema
+                                && let Err(error) = validate_schema(s)
+                            {
+                                cx.error(&join(&path, "schema"), format!("{error:?}"));
+                            }
+                        }
+                        if let Some(value) = map.remove(Value::String("transform".into())) {
+                            let here = join(&path, "transform");
+                            if let Some(m) = cx.map(&value, &here) {
+                                let keys = cx.entries(
+                                    m,
+                                    &here,
+                                    Some(&["implementation", "input", "output"]),
+                                );
+                                let implementation =
+                                    keys.get("implementation").and_then(|v| cx.string(v, &here));
+                                let input = keys
+                                    .get("input")
+                                    .and_then(|v| cx.string(v, &here))
+                                    .map(SchemaId);
+                                let output = keys
+                                    .get("output")
+                                    .and_then(|v| cx.string(v, &here))
+                                    .map(SchemaId);
+                                match (implementation, input, output) {
+                                    (Some(implementation), Some(input), Some(output)) if implementation == "first_line_v1" => {
+                                        for s in [&input, &output] {
+                                            if let Err(error) = validate_schema(s) { cx.error(&here, format!("{error:?}")); }
+                                        }
+                                        if schema.as_ref() != Some(&input) { cx.error(&here, "transform input must match the tool's explicit schema"); }
+                                        transform = Some(OutputContract { version: implementation, inputs: vec![input], output });
+                                    }
+                                    _ => cx.error(&here, "requires implementation: first_line_v1, input: Name@version, output: Name@version"),
+                                }
+                            }
+                        }
+                    }
+                    let Some((kind, arguments)) = tool_kind(&mut cx, &spec, &path, session) else {
                         continue;
                     };
+                    if (schema.is_some() || transform.is_some())
+                        && !matches!(kind, Kind::Reads { .. })
+                    {
+                        cx.error(
+                            &path,
+                            "schema and transform are supported only on reads tools",
+                        );
+                    }
                     tools.insert(
                         exposed.clone(),
                         Tool {
@@ -739,6 +796,8 @@ pub fn parse(text: &str) -> Result<Config, Vec<Problem>> {
                             exposed,
                             kind,
                             arguments,
+                            schema,
+                            transform,
                         },
                     );
                 }
