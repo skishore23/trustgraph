@@ -32,14 +32,21 @@ def source(name: str, *, content: Callable[[Any], Any] | None = None, require_se
     """Register the function's return value as source ``name`` in the current session.
 
     ``content`` picks what to hash from the return value (default: the value
-    itself). With ``require_session=False`` and no active session the function
-    runs untracked.
+    itself, which must be text, bytes or JSON; anything else raises
+    ``InvalidContent`` and the value is not returned). A generator function
+    needs ``content``. With ``require_session=False`` and no active session the
+    function runs untracked.
     """
 
     def pick(result: Any) -> Any:
         return result if content is None else content(result)
 
     def decorate(fn: F) -> F:
+        if content is None and (inspect.isgeneratorfunction(fn) or inspect.isasyncgenfunction(fn)):
+            raise TypeError(
+                f"@source({name!r}) cannot register what a generator yields; "
+                "pass `content=` to pick what to hash, or return the value"
+            )
         if inspect.iscoroutinefunction(fn):
 
             @functools.wraps(fn)
@@ -84,7 +91,8 @@ def action(
 
     ``content(args, kwargs)`` picks what is recorded as the output (default:
     all arguments). ``recipients`` is a list, or a function of ``(args,
-    kwargs)``; ``None`` means the action's whole audience. Raises ``Denied``,
+    kwargs)``; a ``str`` is one name, and ``None`` means the action's whole
+    audience. Raises ``Denied``,
     ``NeedsApproval`` or ``TrustGraphError`` instead of running. There is no
     way to run it without a session.
     """

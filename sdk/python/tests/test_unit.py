@@ -290,3 +290,137 @@ def test_default_client() -> None:
         assert trustgraph.session().client is c
     finally:
         trustgraph.set_default_client(None)
+
+
+# -- the HTTP client: redirects, plain http, the token ----------------------
+
+
+def test_redirect_is_refused_and_the_token_stays_home() -> None:
+    """A redirect would carry the bearer token to whatever host it names."""
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    other_host: list[tuple[str, str | None]] = []
+
+    class Other(BaseHTTPRequestHandler):
+        def log_message(self, *args: Any) -> None:
+            pass
+
+        def do_GET(self) -> None:
+            other_host.append((self.path, self.headers.get("Authorization")))
+            body = json.dumps({"decision": "d" * 64, "verdict": "allow", "code": "allowed", "reason": "ok",
+                               "blocking": [], "expires_at": None}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_POST = do_GET
+
+    class Redirect(BaseHTTPRequestHandler):
+        def log_message(self, *args: Any) -> None:
+            pass
+
+        def do_POST(self) -> None:
+            self.send_response(302)
+            self.send_header("Location", f"http://localhost:{other.server_port}/x")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        do_GET = do_POST
+
+    other = HTTPServer(("127.0.0.1", 0), Other)
+    redirect = HTTPServer(("127.0.0.1", 0), Redirect)
+    for srv in (other, redirect):
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        c = Client(f"http://127.0.0.1:{redirect.server_port}", token="SECRET-TOKEN")
+        with pytest.raises(TrustGraphError) as e:
+            c.check(ID, "post_to_slack")
+        assert (e.value.code, e.value.status) == ("redirect_refused", 302)
+        assert other_host == []
+        assert "SECRET-TOKEN" not in str(e.value)
+    finally:
+        other.shutdown()
+        redirect.shutdown()
+
+
+@pytest.mark.parametrize("url", ["http://10.0.0.5:8787", "http://trustgraph.example.com", "http://[2001:db8::1]:80"])
+def test_plain_http_to_another_host_is_refused(url: str) -> None:
+    with pytest.raises(ValueError, match="allow_insecure"):
+        Client(url, token="t")
+    assert Client(url, token="t", allow_insecure=True).url == url
+
+
+@pytest.mark.parametrize("url", ["http://127.0.0.1:8787", "http://localhost:1", "http://[::1]:8787",
+                                 "https://trustgraph.example.com"])
+def test_loopback_http_and_any_https_are_accepted(url: str) -> None:
+    assert Client(url, token="t").url == url
+
+
+@pytest.mark.parametrize("url", ["ftp://127.0.0.1", "127.0.0.1:8787", "http://user:pw@127.0.0.1:8787"])
+def test_other_urls_are_refused(url: str) -> None:
+    with pytest.raises(ValueError):
+        Client(url, token="t")
+
+
+def test_the_token_never_appears_in_errors() -> None:
+    fake = Fake()
+    fake.fail = OSError("proxy said: Authorization: Bearer secret-token")
+    with pytest.raises(TrustGraphError) as e:
+        client(fake).register_source("s", "x")
+    assert "secret-token" not in str(e.value) and "[token]" in str(e.value)
+    fake.fail = None
+    fake.status = (401, b'{"error":{"code":"unauthorized","message":"bad token secret-token"}}')
+    with pytest.raises(TrustGraphError) as e:
+        client(fake).register_source("s", "x")
+    assert "secret-token" not in str(e.value)
+
+
+# -- content that cannot be hashed ------------------------------------------
+
+
+@pytest.mark.parametrize("value", [None, object(), (i for i in range(3)), {1, 2}, float("nan")])
+def test_unhashable_content_raises_invalid_content(value: Any) -> None:
+    fake = Fake()
+    s = client(fake).session()
+    with pytest.raises(trustgraph.InvalidContent) as e:
+        s.read("salaries", value)
+    assert e.value.code == "invalid_content" and isinstance(e.value, TrustGraphError)
+    s.read("roadmap", "Q3")
+    with pytest.raises(trustgraph.InvalidContent):
+        s.act("post", value)
+    assert fake.bodies("/v1/check") == []
+
+
+def test_source_on_a_generator_needs_content() -> None:
+    with pytest.raises(TypeError, match="content="):
+        @trustgraph.source("salaries")
+        def rows():  # type: ignore[no-untyped-def]
+            yield "nina: 120k"
+
+    @trustgraph.source("salaries")
+    def returns_a_generator():  # type: ignore[no-untyped-def]
+        return (r for r in ["nina: 120k"])
+
+    @trustgraph.source("salaries", content=lambda r: r["text"])
+    def picked() -> dict[str, Any]:
+        return {"text": "nina: 120k", "handle": object()}
+
+    with client(Fake()).session():
+        with pytest.raises(trustgraph.InvalidContent):
+            returns_a_generator()
+        assert picked()["text"] == "nina: 120k"
+
+
+def test_a_str_recipient_is_one_name() -> None:
+    fake = Fake()
+
+    @trustgraph.action("post", recipients=lambda a, k: k["to"])
+    def post(text: str, to: str) -> None:
+        pass
+
+    with client(fake).session() as s:
+        s.read("roadmap", "Q3")
+        s.act("post", "x", "sam")
+        post("y", to="ravi")
+    assert [b["recipients"] for b in fake.bodies("/v1/check")] == [["sam"], ["ravi"]]

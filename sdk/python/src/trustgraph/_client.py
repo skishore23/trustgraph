@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Any
 
-from ._errors import TrustGraphError
+from ._errors import InvalidContent, TrustGraphError
 from ._types import Artifact, Decision, sha256_hex
 
 if TYPE_CHECKING:
@@ -23,11 +25,18 @@ Transport = Callable[[str, str, dict[str, str], "bytes | None", float], "tuple[i
 _ID = re.compile(r"^[0-9a-f]{64}$")
 
 
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect: following one would send the token to another URL."""
+
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
+        raise urllib.error.HTTPError(req.full_url, code, "redirect refused", headers, fp)
+
+
 def _urllib_transport(
     method: str, url: str, headers: dict[str, str], body: bytes | None, timeout: float
 ) -> tuple[int, bytes]:
-    # The server is local: never send the token through a proxy.
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    # Never send the token through a proxy, and never follow a redirect.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _RefuseRedirects())
     request = urllib.request.Request(url, data=body, method=method, headers=headers)
     try:
         with opener.open(request, timeout=timeout) as response:
@@ -37,11 +46,35 @@ def _urllib_transport(
             return e.code, e.read()
 
 
+def _is_loopback(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _check_url(url: str, allow_insecure: bool) -> str:
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ValueError(f"not an http(s) URL: {url!r}")
+    if parts.username is not None or parts.password is not None:
+        raise ValueError("the URL must not carry credentials; pass `token` or `token_file`")
+    if parts.scheme == "http" and not allow_insecure and not _is_loopback(parts.hostname):
+        raise ValueError(
+            f"refusing plain http to {parts.hostname}: the token would travel unencrypted; "
+            "use https, or pass allow_insecure=True"
+        )
+    return url.rstrip("/")
+
+
 class Client:
     """One agent's connection. The server knows the agent only by its token.
 
     Content is hashed here (SHA-256) and only the hash is sent, unless
-    ``send_content=True``.
+    ``send_content=True``. ``url`` is https, or http to a loopback address
+    unless ``allow_insecure=True``. Redirects are never followed.
     """
 
     def __init__(
@@ -53,6 +86,7 @@ class Client:
         send_content: bool = False,
         timeout: float = 30.0,
         transport: Transport | None = None,
+        allow_insecure: bool = False,
     ) -> None:
         if (token is None) == (token_file is None):
             raise ValueError("pass exactly one of `token` or `token_file`")
@@ -63,7 +97,7 @@ class Client:
         self._token = token.strip()
         if not self._token:
             raise ValueError("the token is empty")
-        self.url = url.rstrip("/")
+        self.url = _check_url(url, allow_insecure)
         self.send_content = send_content
         self.timeout = timeout
         self._transport = transport or _urllib_transport
@@ -72,6 +106,9 @@ class Client:
         return f"Client(url={self.url!r})"
 
     # -- transport -------------------------------------------------------
+
+    def _redact(self, text: str) -> str:
+        return text.replace(self._token, "[token]")
 
     def _call(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
         headers = {"Authorization": "Bearer " + self._token}
@@ -82,7 +119,9 @@ class Client:
         try:
             status, raw = self._transport(method, self.url + path, headers, data, self.timeout)
         except Exception as e:  # any transport failure: the check did not happen
-            raise TrustGraphError("unreachable", f"cannot reach {self.url}: {e}") from None
+            raise TrustGraphError("unreachable", self._redact(f"cannot reach {self.url}: {e}")) from None
+        if 300 <= status < 400:
+            raise TrustGraphError("redirect_refused", "the server answered with a redirect, which is never followed", status)
         try:
             answer = json.loads(raw) if raw else None
         except ValueError:
@@ -94,12 +133,14 @@ class Client:
         error = answer.get("error") if isinstance(answer, dict) else None
         error = error if isinstance(error, dict) else {}
         raise TrustGraphError(
-            str(error.get("code", "http_error")), str(error.get("message", "request failed")), status
+            self._redact(str(error.get("code", "http_error"))),
+            self._redact(str(error.get("message", "request failed"))),
+            status,
         )
 
     def _digest(self, body: dict[str, Any], content: Any, sha256: str | None) -> dict[str, Any]:
         if (content is None) == (sha256 is None):
-            raise ValueError("pass exactly one of `content` or `sha256`")
+            raise InvalidContent("pass exactly one of `content` (not None) or `sha256`")
         if sha256 is not None:
             body["sha256"] = sha256
         elif self.send_content and isinstance(content, str):
@@ -136,8 +177,8 @@ class Client:
         self, artifact: Artifact | str, action: str, recipients: Iterable[str] | None = None
     ) -> Decision:
         """Ask right before acting. This returns every verdict; it raises only when
-        the check could not be completed."""
-        names = None if recipients is None else tuple(recipients)
+        the check could not be completed. A ``str`` is one recipient."""
+        names = None if recipients is None else (recipients,) if isinstance(recipients, str) else tuple(recipients)
         body = {"artifact": str(artifact), "action": action, "recipients": None if names is None else list(names)}
         answer = self._call("POST", "/v1/check", body)
         return Decision._from_json(answer, str(artifact), action, names, self)

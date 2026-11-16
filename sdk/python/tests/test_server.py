@@ -180,3 +180,15 @@ def test_explain_and_policy(server: Server) -> None:
     assert planner.explain(notes)["sources"] == ["salaries"]
     assert planner.policy()["revision"] == 1
     assert planner.policy_check(planner.policy()["policy"])["ok"] is True
+
+
+def test_recipients_forms(handoff_server: Server) -> None:
+    """A str is one recipient (not its characters); [] is no audience at all and is denied."""
+    with handoff_server.client("planner").session() as s:
+        s.read("roadmap", "Q3")
+        assert s.act("post_to_engineering", "x", "sam").allowed
+        assert s.act("post_to_engineering", "x", ["sam"]).allowed
+        for recipients in ([], "nina"):
+            with pytest.raises(Denied) as e:
+                s.act("post_to_engineering", "x", recipients)
+            assert e.value.decision.code == "recipients_outside_audience"

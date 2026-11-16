@@ -7,7 +7,7 @@ import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from ._errors import Denied, NeedsApproval, TrustGraphError
+from ._errors import Denied, InvalidContent, NeedsApproval, TrustGraphError
 
 if TYPE_CHECKING:
     from ._client import Client
@@ -96,12 +96,25 @@ class Decision:
 
 def to_bytes(content: Any) -> bytes:
     """The bytes that stand for ``content``: text as UTF-8, bytes as they are,
-    anything else as compact JSON with sorted keys."""
-    if isinstance(content, bytes):
-        return content
+    anything else as compact JSON with sorted keys.
+
+    Raises ``InvalidContent`` for ``None`` and for values that are not JSON
+    (generators, arbitrary objects): hashing their ``repr()`` would register
+    something other than what was read.
+    """
+    if content is None:
+        raise InvalidContent("the content is None; pass the value that was read or written")
+    if isinstance(content, (bytes, bytearray)):
+        return bytes(content)
     if isinstance(content, str):
         return content.encode()
-    text = json.dumps(content, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+    try:
+        text = json.dumps(content, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError) as e:
+        raise InvalidContent(
+            f"cannot hash a {type(content).__name__} value: it is not text, bytes or JSON ({e}); "
+            "pass `content=` to pick what to hash"
+        ) from None
     return text.encode()
 
 

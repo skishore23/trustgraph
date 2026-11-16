@@ -47,6 +47,7 @@ class Session:
         self._seen: list[str] = []
         self._lock = threading.Lock()
         self._broken: str | None = None
+        self.carried = False  # True once a hand-off token was received
         self._tokens: list[contextvars.Token[Session | None]] = []
         if carry is not None:
             self.receive(carry)
@@ -84,6 +85,16 @@ class Session:
     def _usable(self) -> None:
         if self._broken is not None:
             raise TrustGraphError("session_broken", self._broken)
+
+    @property
+    def broken(self) -> str | None:
+        """Why this session refuses every read, output, check and hand-off, or ``None``."""
+        return self._broken
+
+    def mark_broken(self, reason: str) -> None:
+        """Refuse every later read, output, check and hand-off of this session. It cannot be undone."""
+        if self._broken is None:
+            self._broken = reason
 
     # -- reading and writing --------------------------------------------
 
@@ -137,8 +148,7 @@ class Session:
     def handoff(self) -> str:
         """An opaque token carrying what this session has seen, for another agent's session."""
         self._usable()
-        payload = json.dumps({"artifacts": list(self.seen)}, separators=(",", ":")).encode()
-        return _PREFIX + base64.urlsafe_b64encode(payload).decode().rstrip("=")
+        return _token(self.seen)
 
     def receive(self, token: str) -> None:
         """Carry what another agent's session had seen.
@@ -152,10 +162,16 @@ class Session:
             for artifact in ids:
                 self.client.explain(artifact)
         except TrustGraphError as e:
-            self._broken = f"a hand-off could not be received ({e.code}); start a new session"
+            self.mark_broken(f"a hand-off could not be received ({e.code}); start a new session")
             raise
         for artifact in ids:
             self._add(Artifact(artifact))
+        self.carried = True
+
+
+def _token(ids: Iterable[str]) -> str:
+    payload = json.dumps({"artifacts": list(ids)}, separators=(",", ":")).encode()
+    return _PREFIX + base64.urlsafe_b64encode(payload).decode().rstrip("=")
 
 
 def _parse(token: str) -> list[str]:

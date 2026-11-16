@@ -14,7 +14,8 @@ class TrustGraphError(Exception):
     ``status`` is the HTTP status (``None`` when the server was not reached or
     the SDK refused before sending); ``code`` is the server's error code or one
     of the SDK's own (``unreachable``, ``invalid_response``, ``no_session``,
-    ``nothing_read``, ``session_broken``, ``invalid_handoff``).
+    ``nothing_read``, ``session_broken``, ``invalid_handoff``,
+    ``invalid_content``, ``redirect_refused``).
     """
 
     def __init__(self, code: str, message: str, status: int | None = None) -> None:
@@ -42,3 +43,11 @@ class NeedsApproval(TrustGraphError):
     @property
     def decision_id(self) -> str:
         return self.decision.id
+
+
+class InvalidContent(TrustGraphError):
+    """The content to register or record cannot be hashed (``None``, or not
+    text, bytes or JSON). Nothing was sent."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__("invalid_content", message)
