@@ -613,3 +613,105 @@ fn restart_keeps_an_in_band_activation() {
     assert_eq!(rt.engine().policy_revision(), 3);
     assert_eq!(rt.into_journal().records().len(), len + 1);
 }
+
+fn rejected_code(reply: &Reply) -> &str {
+    match reply {
+        Reply::Rejected { code, .. } => code,
+        other => panic!("expected a rejection, got {other:?}"),
+    }
+}
+
+/// Agent input that breaks a field bound is refused before the journal sees
+/// it: nothing is written, the clock does not move and the state is unchanged.
+#[test]
+fn shape_rejected_events_are_not_journaled() {
+    let mut rt = Runtime::open(MemoryJournal::new(), SPEC, 0).unwrap();
+    let roadmap = artifact(rt.handle(1, register_roadmap()).unwrap());
+    let digest = rt.engine().state_digest();
+    let bad = [
+        (
+            Event::ProposePolicy {
+                agent: Some("planner".into()),
+                policy: format!("{SPEC}#{}", "x".repeat(trustgraph_policy::MAX_BYTES)),
+            },
+            "invalid_policy",
+        ),
+        (
+            Event::RecordOutput {
+                agent: "planner".into(),
+                step: "summarize".into(),
+                inputs: vec![roadmap.clone(); 65],
+                sha256: sha(10),
+            },
+            "invalid_inputs",
+        ),
+        (
+            Event::Check {
+                agent: "a".repeat(10_000),
+                artifact: roadmap.clone(),
+                action: "post_to_slack".into(),
+                recipients: None,
+            },
+            "invalid_field",
+        ),
+        (
+            Event::RegisterSource {
+                source: "roadmap".into(),
+                sha256: "not hex".into(),
+            },
+            "invalid_digest",
+        ),
+    ];
+    for (at, (event, code)) in (100..).zip(bad) {
+        let reply = rt
+            .handle(at, event)
+            .expect("a bad shape is not an I/O error");
+        assert_eq!(rejected_code(&reply), code);
+        assert_eq!(rt.engine().state_digest(), digest, "{code}");
+    }
+    // The clock did not move: an event at time 2 is still accepted.
+    assert!(matches!(
+        rt.handle(2, register_roadmap()),
+        Ok(Reply::Artifact { .. })
+    ));
+    let journal = rt.into_journal();
+    assert_eq!(journal.records().len(), 3, "genesis + two registrations");
+}
+
+/// A policy of escaped control characters just under the size limit encodes
+/// to a journal line past the line cap. That is bad input, so the runtime
+/// answers `Rejected` (or accepts it whole), never an I/O error.
+#[test]
+fn control_character_policy_near_the_limit_never_errors() {
+    let filler = trustgraph_policy::MAX_BYTES - SPEC.len() - 1;
+    let policy = format!("{SPEC}#{}", "\u{1}".repeat(filler));
+    assert_eq!(policy.len(), trustgraph_policy::MAX_BYTES);
+    let event = Event::ProposePolicy {
+        agent: Some("planner".into()),
+        policy,
+    };
+
+    let mut rt = Runtime::open(MemoryJournal::new(), SPEC, 0).unwrap();
+    let digest = rt.engine().state_digest();
+    let reply = rt.handle(1, event.clone()).expect("never an I/O error");
+    let journaled = rt.into_journal().records().len();
+    match reply {
+        Reply::Rejected { .. } => {
+            assert_eq!(journaled, 1, "a rejected oversize record is not written")
+        }
+        Reply::Proposed { .. } => assert_eq!(journaled, 2),
+        other => panic!("{other:?}"),
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = Runtime::open(file_journal(dir.path()), SPEC, 0).unwrap();
+    let reply = rt.handle(1, event).expect("never an I/O error");
+    if matches!(reply, Reply::Rejected { .. }) {
+        assert_eq!(rt.engine().state_digest(), digest);
+    }
+    // The runtime is still healthy afterwards.
+    assert!(matches!(
+        rt.handle(2, register_roadmap()),
+        Ok(Reply::Artifact { .. })
+    ));
+}

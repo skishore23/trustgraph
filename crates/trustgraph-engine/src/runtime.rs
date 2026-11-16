@@ -157,11 +157,19 @@ impl<J: Journal> Runtime<J> {
         Ok(runtime)
     }
 
-    /// Journal `event`, then apply it. Rejected events are journaled too: the
-    /// engine's clock moves even when it refuses an event, and replay must
-    /// reach the same state. Two cases are refused without journaling:
-    /// time going backwards (it would make the journal unreplayable) and
-    /// `Genesis` (written only by `open`).
+    /// Journal `event`, then apply it. Events the engine rejects on its state
+    /// are journaled too: the engine's clock moves even when it refuses an
+    /// event, and replay must reach the same state. These are refused without
+    /// journaling and change nothing, not even the clock: `Genesis` (written
+    /// only by `open`), time going backwards (it would make the journal
+    /// unreplayable), an event that fails `Event::validate_shape`, and an
+    /// event whose record would exceed the journal's line cap.
+    ///
+    /// On `Err` the outcome is UNKNOWN: the record may or may not be durable.
+    /// The caller must drop this `Runtime` and call `open` again, which
+    /// replays the record if it is durable; the event's reply is learned only
+    /// by asking again. A poisoned `FileJournal` makes every later `handle`
+    /// fail until the runtime is reopened.
     pub fn handle(&mut self, at: u64, event: Event) -> Result<Reply, JournalError> {
         if matches!(event, Event::Genesis { .. }) {
             return Ok(Reply::Rejected {
@@ -175,16 +183,34 @@ impl<J: Journal> Runtime<J> {
                 message: format!("time {at} is before the previous event at {}", self.last_at),
             });
         }
+        if let Err(rejected) = event.validate_shape() {
+            return Ok(rejected);
+        }
         self.append_and_apply(at, event)
     }
 
     fn append_and_apply(&mut self, at: u64, event: Event) -> Result<Reply, JournalError> {
         let record = Record::seal(self.last_seq + 1, at, event, &self.last_hash);
+        if let Err(len) = record.line_len() {
+            return Ok(Reply::Rejected {
+                code: "record_too_large".into(),
+                message: format!(
+                    "the event encodes to {len} bytes; the journal limit is {}",
+                    Record::MAX_LINE
+                ),
+            });
+        }
         self.journal.append(&record)?;
         self.last_seq = record.seq;
         self.last_hash = record.hash.clone();
         self.last_at = at;
         Ok(self.engine.apply(at, &record.event))
+    }
+
+    /// `seq` of the last durable record; it moves only when `handle`
+    /// journals an event.
+    pub fn last_seq(&self) -> u64 {
+        self.last_seq
     }
 
     pub fn engine(&self) -> &Engine {

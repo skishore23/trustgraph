@@ -1246,3 +1246,50 @@ fn revoke_without_approval_is_no_approval() {
     );
     assert_eq!(rejected_code(&reply), "no_approval");
 }
+
+/// Direct engine use matches the runtime: a shape rejection moves nothing,
+/// not even the clock, so replaying a journal without it gives the same state.
+#[test]
+fn shape_rejection_leaves_the_clock_alone() {
+    let mut engine = genesis(SPEC);
+    let digest = engine.state_digest();
+    let reply = engine.apply(
+        50,
+        &Event::RecordOutput {
+            agent: "planner".into(),
+            step: "summarize".into(),
+            inputs: Vec::new(),
+            sha256: sha(1),
+        },
+    );
+    assert!(matches!(&reply, Reply::Rejected { code, .. } if code == "invalid_inputs"));
+    assert_eq!(engine.state_digest(), digest);
+    for event in [
+        Event::Approve {
+            decision: String::new(),
+            reviewer: "leo".into(),
+        },
+        Event::ActivatePolicy {
+            proposal: "p".into(),
+            operator: "o".repeat(257),
+        },
+        Event::ProposePolicy {
+            agent: Some("  ".into()),
+            policy: SPEC.into(),
+        },
+    ] {
+        assert!(event.validate_shape().is_err(), "{event:?}");
+        assert!(matches!(engine.apply(60, &event), Reply::Rejected { .. }));
+        assert_eq!(engine.state_digest(), digest, "{event:?}");
+    }
+    assert!(
+        Event::Check {
+            agent: "planner".into(),
+            artifact: "x".into(),
+            action: "post_to_slack".into(),
+            recipients: Some(set(&["nina"])),
+        }
+        .validate_shape()
+        .is_ok()
+    );
+}

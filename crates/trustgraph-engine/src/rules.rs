@@ -3,7 +3,7 @@
 
 use trustgraph_core::digest;
 use trustgraph_framework::{ActionRule, ApprovalRequirement, Error, PrincipalId, Readers};
-use trustgraph_policy::{MAX_BYTES, Outcome, Policy, Severity, lint, parse, run_tests};
+use trustgraph_policy::{Outcome, Policy, Severity, lint, parse, run_tests};
 
 use crate::event::Reply;
 
@@ -112,13 +112,8 @@ pub(crate) fn action_rule(policy: &Policy, name: &str) -> ActionRule {
 }
 
 /// Parse, lint and test a policy text; any failure is `invalid_policy`.
+/// The size bound is `Event::validate_shape`'s (and `parse` enforces it too).
 pub(crate) fn validate_policy(text: &str) -> Result<Policy, Reply> {
-    if text.len() > MAX_BYTES {
-        return Err(reject(
-            "invalid_policy",
-            format!("policy is {} bytes; the limit is {MAX_BYTES}", text.len()),
-        ));
-    }
     let parsed = parse(text);
     let Some(policy) = parsed.policy else {
         let first = parsed

@@ -370,11 +370,15 @@ impl Sim {
         );
         let runtime = self.runtime.as_mut().expect("the runtime is open");
         let before = policy_state(runtime.engine());
+        let seq = runtime.last_seq();
         let snapshot = self
             .keep_snapshot
             .then(|| (self.shadow.clone(), runtime.engine().state_digest()));
         let result = runtime.handle(self.now, event.clone());
         let after = policy_state(runtime.engine());
+        // Refused before the journal (bad shape, too large): it never happened,
+        // so the snapshot before the last journaled record stays as it was.
+        let journaled = runtime.last_seq() != seq;
         let activated = matches!(event, Event::ActivatePolicy { .. })
             && matches!(result, Ok(Reply::Activated { .. }));
         if before != after && !activated {
@@ -387,7 +391,9 @@ impl Sim {
             )]);
         }
         if let Ok(reply) = &result {
-            self.before_last = snapshot;
+            if journaled {
+                self.before_last = snapshot;
+            }
             self.out.events.push((self.now, event));
             self.out.replies.push(reply.clone());
             if activated {

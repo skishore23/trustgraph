@@ -1,5 +1,6 @@
 //! The state machine. Every handler validates before it mutates, so a
-//! `Rejected` reply leaves the state as it was (apart from the clock).
+//! `Rejected` reply leaves the state as it was apart from the clock. An event
+//! that fails `Event::validate_shape` does not even move the clock.
 //!
 //! Two deciders must agree before anything is allowed: the pure
 //! `trustgraph_policy::decide` and the framework `Graph`, which tracks lineage
@@ -20,8 +21,8 @@ use trustgraph_policy::{Policy, Query, Verdict, decide, diff, explain};
 use crate::event::Fault;
 use crate::event::{Event, Reply};
 use crate::rules::{
-    MAX_INPUTS, MAX_RECIPIENTS, action_rule, clip, decision_reply, echo, field, graph_error,
-    graph_readers, principals, reject, sha256, validate_policy,
+    action_rule, clip, decision_reply, echo, graph_error, graph_readers, principals, reject,
+    validate_policy,
 };
 
 /// Stored proposals per class (agent-proposed, operator-proposed).
@@ -115,6 +116,9 @@ impl Engine {
                 "clock_regressed",
                 format!("time {at} is before the previous event at {}", self.last_at),
             );
+        }
+        if let Err(rejected) = event.validate_shape() {
+            return rejected;
         }
         self.last_at = at;
         if self.policy.is_none() && !matches!(event, Event::Genesis { .. }) {
@@ -361,8 +365,6 @@ impl Engine {
     }
 
     fn register_source(&mut self, source: &str, sha: &str) -> Handled {
-        field("source", source)?;
-        sha256(sha)?;
         let policy = self.active()?;
         if !policy.sources.contains_key(source) {
             return Err(reject(
@@ -391,9 +393,6 @@ impl Engine {
     }
 
     fn record_output(&mut self, agent: &str, step: &str, inputs: &[String], sha: &str) -> Handled {
-        field("agent", agent)?;
-        field("step", step)?;
-        sha256(sha)?;
         let policy = self.active()?;
         if !policy.agents.contains(agent) {
             return Err(reject(
@@ -401,17 +400,7 @@ impl Engine {
                 format!("`{}` is not an agent in the active policy", clip(agent)),
             ));
         }
-        if inputs.is_empty() || inputs.len() > MAX_INPUTS {
-            return Err(reject(
-                "invalid_inputs",
-                format!(
-                    "an output needs 1 to {MAX_INPUTS} inputs, not {}",
-                    inputs.len()
-                ),
-            ));
-        }
         for input in inputs {
-            field("inputs", input)?;
             if !self
                 .graph
                 .artifacts()
@@ -499,20 +488,6 @@ impl Engine {
         action: &str,
         recipients: Option<&BTreeSet<String>>,
     ) -> Handled {
-        field("agent", agent)?;
-        field("artifact", artifact)?;
-        field("action", action)?;
-        if let Some(names) = recipients {
-            if names.len() > MAX_RECIPIENTS {
-                return Err(reject(
-                    "invalid_field",
-                    format!("at most {MAX_RECIPIENTS} recipients"),
-                ));
-            }
-            for name in names {
-                field("recipients", name)?;
-            }
-        }
         let output_from = self.source_names(artifact)?;
         let policy = self.active()?;
         let outcome = decide(
@@ -651,8 +626,6 @@ impl Engine {
     }
 
     fn approve(&mut self, at: u64, decision: &str, reviewer: &str) -> Handled {
-        field("decision", decision)?;
-        field("reviewer", reviewer)?;
         let (remembered, reviewers, valid_for) = self.pending(decision)?;
         let policy = self.active()?;
         let output_from = self.source_names(&remembered.artifact)?;
@@ -721,8 +694,6 @@ impl Engine {
     }
 
     fn revoke(&mut self, decision: &str, reviewer: &str) -> Handled {
-        field("decision", decision)?;
-        field("reviewer", reviewer)?;
         let (_, reviewers, _) = self.pending(decision)?;
         if !reviewers.contains(reviewer) {
             return Err(reject(
@@ -743,14 +714,13 @@ impl Engine {
 
     fn propose(&mut self, agent: Option<&str>, text: &str) -> Handled {
         let active = self.active()?;
-        if let Some(agent) = agent {
-            field("agent", agent)?;
-            if !active.agents.contains(agent) {
-                return Err(reject(
-                    "unknown_agent",
-                    format!("`{}` is not an agent in the active policy", clip(agent)),
-                ));
-            }
+        if let Some(agent) = agent
+            && !active.agents.contains(agent)
+        {
+            return Err(reject(
+                "unknown_agent",
+                format!("`{}` is not an agent in the active policy", clip(agent)),
+            ));
         }
         let proposed = validate_policy(text)?;
         let id = proposed.digest();
@@ -810,8 +780,6 @@ impl Engine {
     }
 
     fn activate_proposal(&mut self, at: u64, proposal: &str, operator: &str) -> Handled {
-        field("proposal", proposal)?;
-        field("operator", operator)?;
         let policy = self
             .proposals
             .iter()

@@ -69,6 +69,19 @@ impl Record {
         .0
     }
 
+    /// The encoded length when it fits the journal's line cap, else the
+    /// length as an error. The runtime checks this before appending, so an
+    /// event too big to journal is refused as bad input, not as an I/O error.
+    pub(crate) fn line_len(&self) -> Result<usize, usize> {
+        match serde_json::to_vec(self) {
+            Ok(line) if line.len() <= MAX_LINE => Ok(line.len()),
+            Ok(line) => Err(line.len()),
+            Err(_) => Err(usize::MAX),
+        }
+    }
+
+    pub(crate) const MAX_LINE: usize = MAX_LINE;
+
     fn encode(&self) -> Result<Vec<u8>, JournalError> {
         let mut line =
             serde_json::to_vec(self).map_err(|e| JournalError::Io(format!("encode: {e}")))?;
@@ -101,6 +114,13 @@ pub trait Journal {
     /// Every durable record, in order, verified.
     fn load(&mut self) -> Result<Vec<Record>, JournalError>;
     /// Make `record` durable. It must continue the chain.
+    ///
+    /// On `Err` the outcome is UNKNOWN: the record may or may not be durable
+    /// (a write can land and its sync fail). The caller must not retry on the
+    /// same handle; it drops the `Runtime` and calls `Runtime::open` again,
+    /// which replays the record if it is durable. When `FileJournal` cannot
+    /// undo a failed write it poisons itself, and every later `append` fails
+    /// until it is reloaded.
     fn append(&mut self, record: &Record) -> Result<(), JournalError>;
 }
 
