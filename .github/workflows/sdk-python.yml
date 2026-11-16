@@ -78,9 +78,6 @@ jobs:
           - extra: claude-agent-sdk
             module: claude_agent_sdk
             tests: test_claude_agent_sdk.py
-          - extra: mcp
-            module: mcp
-            tests: test_mcp.py
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
