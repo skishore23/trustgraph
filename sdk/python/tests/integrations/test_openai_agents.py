@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from typing import Any
 
 import pytest
 
@@ -16,6 +18,7 @@ from trustgraph import TrustGraphError  # noqa: E402
 from trustgraph.integrations.openai_agents import Action, Guard, as_action, as_source  # noqa: E402
 
 from ..conftest import Server  # noqa: E402
+from ..test_server import recording  # noqa: E402
 
 set_tracing_disabled(True)  # nothing leaves the machine
 posted: list[str] = []
@@ -76,9 +79,11 @@ def test_wrapped_tools_deny_and_allow(server: Server) -> None:
              as_action(post_message, Action("post_to_slack", content=lambda a: a["text"]))]
     agent = Agent(name="planner", tools=tools,
                   model=script(call("read_salaries"), call("read_roadmap"), call("post_message", {"text": "Q3 plan"})))
-    with server.client("planner").session():
+    planner, bodies = recording(server, "planner")
+    with planner.session():
         result = Runner.run_sync(agent, "post the plan")
     out = outputs(result)
+    assert bodies and "nina" not in json.dumps(bodies) and "Q3 plan" not in json.dumps(bodies)  # hashes only
     assert out["read_salaries"] == "nina: 120k, sam: 95k"
     assert out["post_message"].startswith("TrustGraph blocked `post_to_slack`: denied:") and "salaries" in out["post_message"]
     assert posted == []
@@ -157,3 +162,112 @@ def test_unmapped_agent_is_refused(server: Server) -> None:
     guard.protect(agent)
     out = outputs(guard.run_sync(agent, "go"))
     assert "no TrustGraph client for agent `stranger`" in out["post_message"] and posted == []
+
+
+# -- tools from Agent.mcp_servers -------------------------------------------
+
+
+class FakeMCP:
+    """An in-process MCP server (the SDK's MCPServer interface), no subprocess."""
+
+    def __new__(cls) -> Any:
+        from agents.mcp import MCPServer
+        from mcp.types import CallToolResult, TextContent, Tool
+
+        class Server(MCPServer):
+            async def connect(self) -> None:
+                pass
+
+            @property
+            def name(self) -> str:
+                return "drive"
+
+            async def cleanup(self) -> None:
+                pass
+
+            async def list_tools(self, run_context: Any = None, agent: Any = None) -> list[Any]:
+                return [Tool(name="mcp_salaries", inputSchema={"type": "object", "properties": {}}),
+                        Tool(name="mcp_post", inputSchema={"type": "object",
+                                                           "properties": {"text": {"type": "string"}}})]
+
+            async def call_tool(self, tool_name: str, arguments: Any, meta: Any = None) -> Any:
+                if tool_name == "mcp_post":
+                    posted.append(arguments["text"])
+                    return CallToolResult(content=[TextContent(type="text", text="posted")])
+                return CallToolResult(content=[TextContent(type="text", text="nina: 120k, sam: 95k")])
+
+            async def list_prompts(self) -> Any:
+                raise NotImplementedError
+
+            async def get_prompt(self, name: str, arguments: Any = None) -> Any:
+                raise NotImplementedError
+
+        return Server()
+
+
+def test_mcp_server_tools_are_guarded(server: Server) -> None:
+    guard = Guard(clients={"planner": server.client("planner")},
+                  sources={"mcp_salaries": "salaries"}, actions={"mcp_post": "post_to_slack"})
+    agent = Agent(name="planner", mcp_servers=[FakeMCP()],
+                  model=script(call("mcp_salaries"), call("mcp_post", {"text": "Q3 plan"})))
+    guard.protect(agent)
+    guard.protect(agent)  # idempotent
+    assert len(agent.mcp_servers[0].tool_input_guardrails) == 1
+    out = outputs(guard.run_sync(agent, "go"))
+    assert "nina: 120k" in out["mcp_salaries"]
+    assert out["mcp_post"].startswith("TrustGraph blocked `post_to_slack`: denied:") and posted == []
+
+
+# -- conversations that outlive one run -------------------------------------
+
+
+def memory_agents(server: Server, steps: list) -> tuple[Guard, Agent]:
+    guard = Guard(clients={"planner": server.client("planner")},
+                  sources={"read_salaries": "salaries", "read_roadmap": "roadmap"},
+                  actions={"post_message": "post_to_slack"})
+    agent = Agent(name="planner", tools=[read_salaries, read_roadmap, post_message], model=script(*steps))
+    guard.protect(agent)
+    return guard, agent
+
+
+def test_resumed_memory_session_without_the_token_is_refused(server: Server) -> None:
+    from agents import SQLiteSession
+
+    memory = SQLiteSession("conversation")
+    guard, agent = memory_agents(server, [call("read_salaries")])
+    context: dict[str, Any] = {}
+    guard.run_sync(agent, "read", session=memory, context=context)
+    assert context["trustgraph"].startswith("tg1.")
+
+    guard, agent = memory_agents(server, [call("read_roadmap"), call("post_message", {"text": "x"}, 1)])
+    out = outputs(guard.run_sync(agent, "post", session=memory))  # history, but a fresh context
+    assert "continues an earlier conversation" in out["post_message"] and posted == []
+
+    guard, agent = memory_agents(server, [call("read_roadmap"), call("post_message", {"text": "x"}, 1)])
+    out = outputs(guard.run_sync(agent, "post", session=memory, context=context))  # restored from it
+    assert "`salaries`" in out["post_message"] and "denied" in out["post_message"] and posted == []
+
+
+def test_input_with_earlier_tool_items_is_refused(server: Server) -> None:
+    history = [{"role": "user", "content": "read the salaries"},
+               {"type": "function_call", "call_id": "c0", "name": "read_salaries", "arguments": "{}"},
+               {"type": "function_call_output", "call_id": "c0", "output": "nina: 120k, sam: 95k"},
+               {"role": "user", "content": "now post the plan"}]
+    guard, agent = memory_agents(server, [call("read_roadmap"), call("post_message", {"text": "x"})])
+    out = outputs(guard.run_sync(agent, history))
+    assert "continues an earlier conversation" in out["post_message"] and posted == []
+    guard, agent = memory_agents(server, [call("read_roadmap"), call("post_message", {"text": "x"})])
+    assert outputs(guard.run_sync(agent, [{"role": "user", "content": "post"}]))["post_message"] == "posted"
+
+
+def test_run_streamed_is_scoped(server: Server) -> None:
+    guard, agent = memory_agents(server, [call("read_salaries"), call("post_message", {"text": "x"})])
+
+    async def run() -> Any:
+        result = await guard.run_streamed(agent, "go")
+        async for _ in result.stream_events():
+            pass
+        return result
+
+    out = outputs(asyncio.run(run()))
+    assert "`salaries`" in out["post_message"] and posted == []
