@@ -2,17 +2,24 @@
 
 [Open the demo](https://trustgraph-demo.vercel.app). No sign-in or API key is required.
 
-The root page is a typed-dataflow lab backed by `trustgraph-framework` through
-`POST /api/framework`. It reconstructs bounded fictional document/email and data
-export pipelines, displays exact artifact and operation records, and checks type
-compatibility, inherited access and approval freshness using Rust. Browser
-controls are hypothetical inputs, not authority for a live effect. Each request
-is independent; no session or persistent graph is needed.
+The root page is the **policy playground**: an editable `trustgraph.policy.yaml`
+(starting from the six bundled examples), an agent run to decide, and the
+verdict with its reason, blocking sources and lineage. It also shows the
+policy's inline test results, the plain-English explanation, the diff against
+the example as loaded (with every widening flagged) and a seeded simulator run.
+Everything is computed by `trustgraph-policy` and the policy runtime through
+`POST /api/policy`. Each request is independent; no session, storage or
+external service is involved, and the policy text is sent nowhere else.
 
-The previous five-chapter Northstar story remains at `/story.html` (also
-`/legacy.html`) with its existing `/api/demo` API. Both demonstrations are
-fictional. Neither runs Codex, connects to HydraDB, sends mail, uploads exports,
-or creates GitHub issues or pull requests.
+The earlier pages stay reachable by link:
+
+- `/lab.html`: the typed-dataflow lab backed by `trustgraph-framework` through
+  `POST /api/framework` (fictional document/email and data-export pipelines).
+- `/story.html` (also `/legacy.html`): the five-chapter Northstar story with its
+  `/api/demo` API.
+
+All demonstrations use fictional data. None runs Codex, connects to HydraDB,
+sends mail, uploads exports, or creates GitHub issues or pull requests.
 
 ## Deploy
 
@@ -23,17 +30,20 @@ cargo test --workspace --locked
 node scripts/test_demo.cjs
 node scripts/test_build_demo.cjs
 node web/framework.test.cjs
+node web/site.test.cjs
 vercel deploy --prod
 ```
 
 `vercel.json` builds the static interface into `public/` with
 `scripts/build_demo.cjs`, which empties `public/` first and fails if an expected
-HTML anchor is missing. Vercel builds four Rust functions with its official Rust
-runtime:
+HTML anchor is missing. It publishes `web/index.html` as `/index.html` and
+`web/framework.html` as `/lab.html`. Vercel builds five Rust functions with its
+official Rust runtime:
 
 | Function | Route | Purpose |
 |---|---|---|
-| `api/framework.rs` | `POST /api/framework` | Typed-dataflow lab (root page) |
+| `api/policy.rs` | `POST /api/policy` | Policy playground (root page) |
+| `api/framework.rs` | `POST /api/framework` | Typed-dataflow lab (`/lab.html`) |
 | `api/demo.rs` | `POST /api/demo` | Previous Northstar story (`/story.html`) |
 | `api/simulation.rs` | `POST /api/simulation` | Seeded virtual-time simulator |
 | `api/mcp.rs` | `/mcp`, `/api/mcp` | Read-only remote MCP server |
@@ -53,12 +63,33 @@ For local development with Vercel's routing and runtime bridge:
 vercel dev
 ```
 
-For the framework UI and Rust endpoints without Vercel credentials:
+For the playground, the story and every Rust endpoint without Vercel
+credentials (pages are read from `web/` on each request, so edits show on
+refresh; `/lab.html` is created by the build and is not served here, so use
+`vercel dev` to see the lab):
 
 ```sh
 cargo run --locked --example framework_server
 # http://127.0.0.1:9082
 ```
+
+## Policy playground: `/api/policy`
+
+`POST /api/policy` takes one JSON operation per request, chosen by `op`:
+`examples`, `check` (diagnostics, inline test results, explanation and a
+summary of names), `decide` (one query: sources read, agent, action and
+optional explicit recipients), `diff` (old and new policy text) and `simulate`
+(seeded runs of the policy runtime with invariant checks and path coverage).
+A policy with problems is not an HTTP error: the response is 200 with
+`ok: false` and its diagnostics. Malformed requests get 400 with
+`{"error", "code"}`.
+
+Limits, which are rejected rather than clamped: a 128 KiB body, 64 KiB of
+policy text, 64 sources and 256 recipients per query, names up to 256 bytes,
+and for `simulate` a seed from 0 to 65535, `count` 1 to 8 (default 4) and
+`steps` 1 to 120 (default 80). The simulator only runs a policy that is valid
+and passes its own inline tests, as activation would require. Each operation
+runs off the async executor, and a panic becomes a 503 JSON error.
 
 ## Previous story: visitor progress
 

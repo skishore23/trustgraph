@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 // Static assets referenced by the published pages. Keep in sync with web/*.html.
-const ASSETS = ['story.css', 'story.js', 'framework.css', 'framework.js'];
+const ASSETS = ['site.css', 'site.js', 'story.css', 'story.js', 'framework.css', 'framework.js'];
 
 function replaceOnce(text, anchor, replacement, label) {
   const index = text.indexOf(anchor);
@@ -22,7 +22,9 @@ function build(root = path.resolve(__dirname, '..'), output = path.join(root, 'p
   html = replaceOnce(html, 'Information boundaries <span', 'Interactive demo · Fictional data · Simulated releases <span', 'web/story.html');
   fs.writeFileSync(path.join(output, 'legacy.html'), html);
   fs.writeFileSync(path.join(output, 'story.html'), html);
-  fs.copyFileSync(path.join(root, 'web/framework.html'), path.join(output, 'index.html'));
+  // The policy playground is the landing page; the typed-dataflow lab moves to /lab.html.
+  fs.copyFileSync(path.join(root, 'web/index.html'), path.join(output, 'index.html'));
+  fs.copyFileSync(path.join(root, 'web/framework.html'), path.join(output, 'lab.html'));
   for (const file of ASSETS) fs.copyFileSync(path.join(root, 'web', file), path.join(output, file));
   return { output, files: fs.readdirSync(output).sort() };
 }
