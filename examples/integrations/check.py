@@ -32,6 +32,7 @@ def documented(example: str) -> list[str]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("example", choices=sorted(SCRIPTS))
+    parser.add_argument("--port", type=int, default=0, help="the server's port (default: any free one)")
     parser.add_argument("--bin", default=os.environ.get("TRUSTGRAPH_BIN", str(REPO / "target/debug/trustgraph")))
     args = parser.parse_args()
 
@@ -40,7 +41,7 @@ def main() -> int:
         with open(log, "w") as out:
             server = subprocess.Popen(
                 [args.bin, "serve", "--policy", str(REPO / "examples/policies/handoff.policy.yaml"),
-                 "--operator", "nina", "--state", str(state), "--port", "0"],
+                 "--operator", "nina", "--state", str(state), "--port", str(args.port)],
                 stdout=out, stderr=subprocess.STDOUT,
             )
         try:

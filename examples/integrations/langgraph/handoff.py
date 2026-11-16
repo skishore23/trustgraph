@@ -9,6 +9,7 @@ swap in a real chat model and nothing else changes.
 
 import argparse
 import os
+from typing import Annotated
 
 from langchain.agents import create_agent
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
@@ -17,7 +18,7 @@ from langchain_core.tools import tool
 from langgraph.graph import END, START, MessagesState, StateGraph
 
 import trustgraph
-from trustgraph.integrations.langchain import Guard, agent_node
+from trustgraph.integrations.langchain import Guard, agent_node, merge_tokens
 
 
 @tool
@@ -50,7 +51,7 @@ def script(*steps):
 
 
 class State(MessagesState):
-    trustgraph: str  # the hand-off token
+    trustgraph: Annotated[str, merge_tokens]  # the hand-off token; the reducer never sheds it
 
 
 def main():

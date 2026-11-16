@@ -8,14 +8,14 @@ so no model API is called.
 The ten lines that matter:
 
 ```python
-from trustgraph.integrations.langchain import Guard, agent_node
+from trustgraph.integrations.langchain import Guard, agent_node, merge_tokens
 
 guard = Guard(sources={"read_salaries": "salaries", "read_roadmap": "roadmap"},
               actions={"post_to_engineering": "post_to_engineering"})
 researcher = create_agent(model, tools, middleware=[guard.middleware()])
 planner = create_agent(model, tools, middleware=[guard.middleware()])
 
-graph = StateGraph(State)  # State declares `trustgraph: str`, the hand-off token
+graph = StateGraph(State)  # State declares `trustgraph: Annotated[str, merge_tokens]`, the hand-off token
 graph.add_node("researcher", agent_node(trustgraph.Client(token_file=".../researcher.token"), researcher, first=True))
 graph.add_node("planner", agent_node(trustgraph.Client(token_file=".../planner.token"), planner))
 ...
