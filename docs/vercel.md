@@ -32,7 +32,8 @@ method (405) and an unknown path (404). A panic becomes a 503 JSON error.
 ## Build and deploy
 
 `vercel.json` runs `node scripts/build_demo.cjs`, which empties `public/` and
-copies the page and its two assets into it. Vercel builds `api/policy.rs` with
+copies the page, its two assets and the self-hosted IBM Plex fonts
+(`web/fonts/`, SIL OFL 1.1) into it. Vercel builds `api/policy.rs` with
 its Rust runtime. No environment variables are needed.
 
 ```sh
