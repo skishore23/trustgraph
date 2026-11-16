@@ -1509,7 +1509,7 @@ tools:
     assert_eq!(
         paths,
         [
-            "tools.drive.post.arguments",
+            "tools.drive.post.acts[0].arguments",
             "tools.drive.read_file.reads[1]"
         ],
         "{warnings:#?}"
@@ -2154,7 +2154,7 @@ tools:
     assert!(
         warnings
             .iter()
-            .any(|w| w.contains("send_email.arguments") && w.contains("body")),
+            .any(|w| w.contains("send_email.acts[0].arguments") && w.contains("body")),
         "{warnings:#?}"
     );
     let config = config::parse(&text("{}")).unwrap();
@@ -2194,6 +2194,39 @@ tools:
 }
 
 #[test]
+fn unconstrained_arguments_are_warned_per_rule() {
+    let text = "version: 1
+upstreams:
+  slack: { command: [x] }
+tools:
+  slack.send_email:
+    arguments: [to, subject]
+    acts:
+      - when: { to: { pattern: \"*@corp.com\", type: email }, subject: \"Hello\" }
+        action: email_staff
+      - when: { subject: \"Weekly benchmarks\" }
+        action: email_staff
+";
+    let config = config::parse(text).unwrap();
+    let warnings: Vec<String> = config::warnings(&config)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("send_email.acts[1].arguments") && w.contains(": to;")),
+        "{warnings:#?}"
+    );
+    assert!(
+        !warnings
+            .iter()
+            .any(|w| w.contains("send_email.acts[0].arguments")),
+        "{warnings:#?}"
+    );
+}
+
+#[test]
 fn i1_gateway_check_prints_the_matchers_and_warns() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("gateway.yaml");
@@ -2226,8 +2259,9 @@ fn i1_gateway_check_prints_the_matchers_and_warns() {
         "when `to` is a plain email address at exactly `corp.com`: `email_staff`",
         "always (every call, whatever its arguments): `post_to_engineering`",
         "warning: tools.slack.post_message.acts[2]: no `when`: every call to this tool is treated as `post_to_engineering` whatever its arguments",
-        "warning: tools.slack.post_message.arguments: not constrained by any `when`: text, thread",
-        "warning: tools.slack.send_email.arguments: not constrained by any `when`: body, subject",
+        "warning: tools.slack.post_message.acts[0].arguments: this rule's `when` does not constrain: text, thread",
+        "warning: tools.slack.post_message.acts[2].arguments: this rule's `when` does not constrain: channel, text, thread",
+        "warning: tools.slack.send_email.acts[0].arguments: this rule's `when` does not constrain: body, subject",
     ] {
         assert!(stdout.contains(expected), "{expected:?} not in:\n{stdout}");
     }
@@ -2627,6 +2661,104 @@ async fn m2_in_connection_mode_a_refused_hand_off_blocks_the_whole_agent_until_c
     ok(&h.post(&fresh, "#engineering", "roadmap only").await);
     let post = h.post(&planner, "#engineering", "roadmap").await;
     assert_eq!(error_code(&post), "session_blocked", "{post}");
+}
+
+#[tokio::test]
+async fn a_receive_refused_for_a_budget_does_not_block_the_agent() {
+    // The journal limit that lets the researcher's read in and leaves no room
+    // for the planner's hand-off: found by raising it until the read fits.
+    for max_journal_bytes in (100..40_000u64).step_by(25) {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = Limits {
+            max_journal_bytes,
+            ..Limits::default()
+        };
+        let h = memory_with(dir.path(), "connection", limits).await;
+        let operator = h.login().await;
+        let researcher = h.connect("researcher").await;
+        if h.read(&researcher, "HR/Compensation/salaries.csv").await["isError"] == true {
+            continue;
+        }
+        let handoff = h.call(&researcher, gateway::HANDOFF_TOOL, json!({})).await;
+        let token = handoff["structuredContent"]["handoff"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let planner = h.connect("planner").await;
+        let refused = h
+            .call(&planner, gateway::RECEIVE_TOOL, json!({"token": token}))
+            .await;
+        if refused["isError"] != true {
+            continue;
+        }
+        assert_eq!(error_code(&refused), "quota_exceeded", "{refused}");
+        assert!(
+            text(&refused).contains("the hand-off did not happen and this session is unchanged"),
+            "{refused}"
+        );
+        let state = h.op_state(&operator).await;
+        assert_eq!(state["gateway"]["blocked"], json!([]), "{state}");
+        assert!(
+            h.sessions(&operator)
+                .await
+                .iter()
+                .all(|(_, agent, sources)| agent != "planner" || sources.is_empty()),
+            "the planner's session is unchanged"
+        );
+        // A bad token still blocks.
+        let bad = h
+            .call(&planner, gateway::RECEIVE_TOOL, json!({"token": "garbage"}))
+            .await;
+        assert_eq!(error_code(&bad), "invalid_handoff");
+        let state = h.op_state(&operator).await;
+        assert!(!state["gateway"]["blocked"].as_array().unwrap().is_empty());
+        return;
+    }
+    panic!("no journal limit separated the read from the hand-off");
+}
+
+#[tokio::test]
+async fn an_unwritable_blocked_file_degrades_the_gateway_until_a_write_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = memory(dir.path(), "connection").await;
+    let operator = h.login().await;
+    let planner = h.connect("planner").await;
+    let scout = h.connect("scout").await;
+    ok(&h.read(&scout, "Public/benchmarks.md").await);
+    // A directory where the temporary file goes: the write cannot succeed.
+    let obstacle = h.state.join("gateway.blocked.tmp");
+    std::fs::create_dir(&obstacle).unwrap();
+    let refused = h
+        .call(&planner, gateway::RECEIVE_TOOL, json!({"token": "garbage"}))
+        .await;
+    assert_eq!(error_code(&refused), "invalid_handoff");
+    // Every agent is refused, and the page says so.
+    let post = h.post(&scout, "#engineering", "bench").await;
+    assert_eq!(error_code(&post), "gateway_degraded", "{post}");
+    let read = h.read(&scout, "Public/benchmarks.md").await;
+    assert_eq!(error_code(&read), "gateway_degraded", "{read}");
+    let state = h.op_state(&operator).await;
+    assert_eq!(state["gateway"]["degraded"], json!(true), "{state}");
+    assert!(
+        state["gateway"]["blocked"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b == "conn:" || b.as_str().is_some_and(|b| b.starts_with("conn:"))),
+        "kept in memory: {state}"
+    );
+    // The write works again: the next attempt retries it and clears the state.
+    std::fs::remove_dir(&obstacle).unwrap();
+    ok(&h.read(&scout, "Public/benchmarks.md").await);
+    let state = h.op_state(&operator).await;
+    assert_eq!(state["gateway"]["degraded"], json!(false), "{state}");
+    let saved = gateway::load_blocked(&h.state.join("gateway.blocked")).unwrap();
+    assert!(saved.contains("agent:planner"), "{saved:?}");
+    let post = h.post(&planner, "#engineering", "x").await;
+    assert_eq!(error_code(&post), "session_blocked", "{post}");
+    let fresh = h.connect("planner").await;
+    let post = h.post(&fresh, "#engineering", "x").await;
+    assert_eq!(error_code(&post), "agent_blocked", "{post}");
 }
 
 fn bare_server(state: &Path) -> Arc<Server<MemoryJournal>> {

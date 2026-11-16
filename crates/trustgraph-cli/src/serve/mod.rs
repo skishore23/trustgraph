@@ -374,6 +374,8 @@ pub(crate) trait GatewayView: Send + Sync {
     /// Sessions, and (`agent:<name>`) agents, that refused a hand-off and
     /// may not act until the operator ends or clears them.
     fn blocked(&self) -> Vec<String>;
+    /// The blocked set cannot be written, so every action is refused.
+    fn degraded(&self) -> bool;
 }
 
 /// One live MCP connection to the gateway, as the operator page shows it.
@@ -1330,6 +1332,7 @@ impl<J: ServeJournal> Server<J> {
                 "max_connections_per_agent": gateway::MAX_CONNECTIONS_PER_AGENT,
                 "at_cap": g.at_cap(),
                 "blocked": g.blocked(),
+                "degraded": g.degraded(),
             })
         });
         Ok(json!({

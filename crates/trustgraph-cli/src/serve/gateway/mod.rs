@@ -32,6 +32,7 @@ mod upstream;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
@@ -223,6 +224,8 @@ pub(crate) struct Shared {
     /// Sessions that refused a hand-off and may not act until ended.
     blocked: Mutex<BTreeSet<String>>,
     blocked_path: PathBuf,
+    /// The blocked set could not be written: every action is refused until a write succeeds.
+    degraded: AtomicBool,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -238,11 +241,14 @@ impl Shared {
         lock(&self.blocked).contains(session)
     }
 
-    /// Mark `session` as unable to act, kept across restarts.
+    /// Mark `session` as unable to act, kept across restarts. When the set
+    /// cannot be written it stays blocked in memory and the gateway refuses
+    /// everything until a write succeeds.
     fn block(&self, session: &str) {
         let mut blocked = lock(&self.blocked);
-        if blocked.insert(session.to_string()) {
-            save_blocked_or_warn(&self.blocked_path, &blocked);
+        let new = blocked.insert(session.to_string());
+        if new || self.degraded.load(Ordering::SeqCst) {
+            self.persist(&blocked);
         }
     }
 
@@ -250,9 +256,42 @@ impl Shared {
         let mut blocked = lock(&self.blocked);
         let was = blocked.remove(session);
         if was {
-            save_blocked_or_warn(&self.blocked_path, &blocked);
+            self.persist(&blocked);
         }
         was
+    }
+
+    /// Write the set; a failure marks the gateway degraded, a success clears it.
+    fn persist(&self, blocked: &BTreeSet<String>) -> bool {
+        match save_blocked(&self.blocked_path, blocked) {
+            Ok(()) => {
+                self.degraded.store(false, Ordering::SeqCst);
+                true
+            }
+            Err(e) => {
+                eprintln!(
+                    "trustgraph gateway: cannot write {}: {e}; every action is refused until it can be written",
+                    self.blocked_path.display()
+                );
+                self.degraded.store(true, Ordering::SeqCst);
+                false
+            }
+        }
+    }
+
+    /// Refuse while the blocked set cannot be kept; each call retries the write.
+    fn check_degraded(&self) -> Result<(), ToolFail> {
+        if !self.degraded.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let blocked = lock(&self.blocked);
+        if self.persist(&blocked) {
+            return Ok(());
+        }
+        Err(ToolFail::new(
+            "gateway_degraded",
+            "the gateway cannot record which sessions are blocked, so it refuses every call until the operator fixes its state directory; nothing was forwarded",
+        ))
     }
 
     fn hold(&self, decision: &str, call: HeldCall) {
@@ -342,13 +381,11 @@ pub fn save_blocked(path: &Path, blocked: &BTreeSet<String>) -> std::io::Result<
     std::fs::rename(&tmp, path)
 }
 
-fn save_blocked_or_warn(path: &Path, blocked: &BTreeSet<String>) {
-    if let Err(e) = save_blocked(path, blocked) {
-        eprintln!(
-            "trustgraph gateway: cannot write {}: {e}; a blocked session is still blocked until this process ends",
-            path.display()
-        );
-    }
+/// A refused `receive` blocks the agent only when the token itself is bad
+/// or not permitted. Budgets, rate limits and engine or journal errors say
+/// nothing about the token, so they leave the session as it was.
+fn blocks_agent(code: &str) -> bool {
+    matches!(code, "invalid_handoff" | "not_cleared" | "unknown_artifact")
 }
 
 /// The blocked-set key of an agent as a whole.
@@ -477,6 +514,10 @@ impl GatewayView for Shared {
 
     fn blocked(&self) -> Vec<String> {
         lock(&self.blocked).iter().cloned().collect()
+    }
+
+    fn degraded(&self) -> bool {
+        self.degraded.load(Ordering::SeqCst)
     }
 
     fn held_call(&self, decision: &str) -> Option<Value> {
@@ -739,6 +780,7 @@ pub fn attach<J: ServeJournal>(
         held: Mutex::new(Held::default()),
         blocked: Mutex::new(blocked),
         blocked_path,
+        degraded: AtomicBool::new(false),
     });
     if server
         .gateway
@@ -939,6 +981,7 @@ impl<J: ServeJournal> Gateway<J> {
         arguments: JsonObject,
     ) -> CallToolResult {
         let outcome = async {
+            self.shared.check_degraded()?;
             let session = self.session_for(&agent, mcp.as_deref())?;
             match name.as_str() {
                 HANDOFF_TOOL => {
@@ -964,7 +1007,18 @@ impl<J: ServeJournal> Gateway<J> {
                     let value = self
                         .blocking(move |g| g.receive(&agent, &session, &token))
                         .await
-                        .inspect_err(|_| {
+                        .map_err(|fail| {
+                            if !blocks_agent(&fail.code) {
+                                // Not about the token: the hand-off simply
+                                // did not happen and the session is as it was.
+                                return ToolFail {
+                                    message: format!(
+                                        "{}; the hand-off did not happen and this session is unchanged",
+                                        fail.message
+                                    ),
+                                    ..fail
+                                };
+                            }
                             // Refusing a hand-off must never leave the
                             // receiver freer than accepting it. In
                             // connection mode a new connection is a new
@@ -974,6 +1028,7 @@ impl<J: ServeJournal> Gateway<J> {
                             if receiver != whole {
                                 shared.block(&whole);
                             }
+                            fail
                         })?;
                     Ok(structured(value))
                 }

@@ -27,7 +27,7 @@ SLACK_BOT_TOKEN=demo-slack-token-0001 target/debug/trustgraph gateway \
 ```
 
 ```text
-warning: tools.slack.post_message.arguments: not constrained by any `when`: text; each is hashed into the checked output and shown to the approver, but can hold anything, so it must not be able to choose who the call reaches
+warning: tools.slack.post_message.acts[0].arguments: this rule's `when` does not constrain: text; each is hashed into the checked output and shown to the approver, but can hold anything, so it must not be able to choose who the call reaches
 upstream `slack`: fake_upstream: starting with credential [redacted]
 trustgraph gateway: upstream `slack`: connected, 12 tools
 trustgraph gateway: upstream `drive`: connected, 12 tools
@@ -96,7 +96,7 @@ Agents see 4 tools; every other upstream tool is invisible and uncallable:
     forwards only the arguments: channel, text; a call with any other is refused
     upstream arguments NOT forwardable: blocks, thread
   trustgraph__handoff and trustgraph__receive pass what a session carries to another agent's session
-warning: tools.slack.post_message.arguments: not constrained by any `when`: text; each is hashed into the checked output and shown to the approver, but can hold anything, so it must not be able to choose who the call reaches
+warning: tools.slack.post_message.acts[0].arguments: this rule's `when` does not constrain: text; each is hashed into the checked output and shown to the approver, but can hold anything, so it must not be able to choose who the call reaches
 ```
 
 `gateway check` runs each stdio upstream whose variables are set here, to
@@ -210,6 +210,9 @@ tools:
   and not locked) is removed when a gateway next starts; one whose lock a
   running gateway holds, or one with no lock file, is never touched. The
   child never gets the gateway's `HOME` or the rest of its environment.
+  Directories left by versions before the lock file existed
+  (`$TMPDIR/trustgraph-upstream-*` with no lock file) are never removed
+  automatically; delete them by hand when no gateway is running.
   That is not isolation: see [Threat model](#threat-model). Its stderr is
   printed with every secret value replaced by `[redacted]`.
 - **Tools.** Only the tools listed under `tools:` exist for agents. They are
@@ -326,9 +329,11 @@ rule meant.
 
 The gateway and `gateway check` also warn about an `acts` rule with no
 `when` (every call to the tool is that action, whatever its arguments), and
-name each allow-listed argument of an `acts` tool that no `when` constrains:
-it is part of the checked output and shown to the approver, but it can hold
-anything, so it must not be one that chooses who the call reaches.
+name, for each `acts` rule separately, every allow-listed argument of the
+tool that this rule's own `when` does not constrain (another rule naming it
+does not count): it is part of the checked output and shown to the approver,
+but it can hold anything, so it must not be one that chooses who the call
+reaches.
 
 Classification trusts the upstream's own naming. A link, alias, symlink or
 id on the upstream can make `Product/roadmap.md` return other content. That
@@ -450,6 +455,11 @@ Every agent sees two more tools:
   then, and the receiving session may no longer act: every later action is
   refused with `session_blocked` until the operator ends the session.
   Refusing a hand-off never leaves the receiver freer than accepting it.
+  Only a bad or not-permitted token blocks (forged, edited, expired, issuer
+  removed, not cleared). A refusal that is not about the token (a journal or
+  artifact budget used up, a rate limit, an engine or journal error) does
+  not block: it is a plain tool error saying the hand-off did not happen,
+  and the receiving session is unchanged.
 
 What a refusal blocks depends on the session mode:
 
@@ -469,6 +479,11 @@ through a link, renamed into place), so they survive a restart. The gateway
 does not start if that file exists but cannot be read or is not a JSON list
 of session ids: ignoring it would unblock. Fix it, or remove it to unblock
 everything it held.
+
+If the file cannot be written later, the block stays in memory and the
+gateway refuses every call from every agent (`gateway_degraded`) until a
+write succeeds; each later call retries the write, and the operator page
+shows the degraded state.
 
 The gateway makes and checks tokens with an HMAC key kept 0600 in
 `<state>/gateway.secret`. A token names the agent that issued it and the
