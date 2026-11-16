@@ -1274,6 +1274,8 @@ pub fn start(options: Options, port: u16) -> Result<Arc<Server<FileJournal>>, St
     };
     tokens::private_dir(&state)
         .map_err(|e| start_error(2, format!("cannot create {}: {e}", state.display())))?;
+    let state = std::fs::canonicalize(&state)
+        .map_err(|e| start_error(2, format!("cannot resolve {}: {e}", state.display())))?;
     let policy_dir = options
         .policy
         .parent()

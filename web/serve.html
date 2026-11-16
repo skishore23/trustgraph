@@ -9,9 +9,23 @@
 <script src="/serve.js" defer></script>
 </head>
 <body>
-<main id="page">
+<main>
 <h1>TrustGraph</h1>
-<p id="status">Loading.</p>
+<p id="who">Connecting.</p>
+<p id="notice" class="notice" hidden></p>
+
+<div id="signed-in" hidden>
+<p><a href="/" id="refresh">Refresh</a> <span class="muted">(updates every few seconds)</span></p>
+
+<h2>Waiting for approval</h2>
+<div id="pending"></div>
+
+<h2>Approved</h2>
+<div id="approvals"></div>
+
+<h2>Proposed policies</h2>
+<div id="proposals"></div>
+</div>
 </main>
 </body>
 </html>
