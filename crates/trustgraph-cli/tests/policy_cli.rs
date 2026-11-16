@@ -402,6 +402,9 @@ mod unix {
         assert_eq!(files(d.path()), ["target"]);
     }
 
+    /// Closing the read end races the child's write: the whole schema may
+    /// already sit in the pipe buffer (exit 0), or the write fails (exit 2).
+    /// Either way it must not panic.
     #[test]
     fn closed_stdout_exits_2_not_panic() {
         let d = tempfile::tempdir().unwrap();
@@ -409,12 +412,19 @@ mod unix {
             .current_dir(d.path())
             .args(["policy", "schema"])
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
         drop(child.stdout.take());
-        let status = child.wait().unwrap();
-        assert_eq!(status.code(), Some(2));
+        let o = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&o.stderr);
+        assert!(!stderr.contains("panicked"), "{stderr}");
+        assert_ne!(o.status.code(), Some(101), "{stderr}");
+        assert!(
+            matches!(o.status.code(), Some(0 | 2)),
+            "exit {:?}: {stderr}",
+            o.status.code()
+        );
     }
 
     #[test]
