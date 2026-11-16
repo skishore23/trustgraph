@@ -13,6 +13,7 @@ session read to the next agent's session, so restrictions follow the work.
 | --- | --- | --- |
 | [LangChain / LangGraph](#langchain-and-langgraph) | Tool wrappers, or `ToolNode` `wrap_tool_call` / `create_agent` middleware | Only through tools you did not wrap or map |
 | [OpenAI Agents SDK](#openai-agents-sdk) | Function-tool input and output guardrails; run hooks for hand-offs | Only through tools you did not map, or tool kinds guardrails do not cover |
+| [Claude Agent SDK](#claude-agent-sdk) | `PreToolUse` / `PostToolUse` / `SubagentStart` / `SubagentStop` hooks | Only through tools you did not map; hooks see every tool call, built-in and MCP |
 
 A library integration is only as strong as the host program: a tool called
 without the wrapper, or a tool missing from the map, is not checked. Sessions
@@ -114,3 +115,56 @@ interpreter, image generation), computer, shell and apply-patch tools, and
 the hand-off call itself do not go through tool guardrails. `Agent.as_tool()`
 runs a nested agent whose session is not linked to the caller's: map the
 agent-tool itself as a source if what it returns must stay restricted.
+
+## Claude Agent SDK
+
+Tested with claude-agent-sdk 0.2.182.
+
+```sh
+pip install "./sdk/python[claude-agent-sdk]"
+```
+
+```python
+import trustgraph
+from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+from trustgraph.integrations.claude_agent_sdk import Guard
+
+guard = Guard(
+    trustgraph.Client(token_file="~/.trustgraph/serve/tokens/planner.token"),
+    sources={"mcp__drive__read": "salaries"},
+    actions={"mcp__slack__post": "post_to_engineering"},
+)
+async with ClaudeSDKClient(ClaudeAgentOptions(hooks=guard.hooks(), mcp_servers=servers)) as agent:
+    await agent.query("Post the Q3 plan")
+```
+
+- **Tools.** Map exact tool names: built-in (`Read`, `WebFetch`, …), MCP
+  (`mcp__<server>__<tool>`) and in-process SDK tools alike. A mapped action is
+  recorded with its `tool_input` (or `Action(..., content=lambda args: ...)`)
+  and checked in `PreToolUse`; a mapped source's `tool_response` is
+  registered in `PostToolUse`.
+- **Blocked calls.** `PreToolUse` answers `permissionDecision: "deny"` with
+  "TrustGraph blocked …", "TrustGraph held …" (needs approval, with the
+  decision id) or "could not complete the check" as the reason. Needs approval
+  is a deny, not "ask": the SDK's own permission prompt would let someone
+  approve around the operator.
+- **Fail closed.** Every matcher is `on_failure="block"`, so a hook that raises
+  or times out blocks the tool. The SDK keeps a tool's result when a
+  `PostToolUse` hook fails, so the source hook never raises: if the result
+  cannot be registered, it replaces the result (`updatedToolOutput`) and stops
+  the run (`continue: false`). Keep the client's timeout (30 s) below the hook
+  timeout (`Guard(timeout=60)`).
+- **Sessions.** One per SDK `session_id`, created on first use; `guard.forget(session_id)`
+  drops it. `guard.session(session_id).handoff()` hands it to another process.
+- **Subagents.** Each subagent (`agent_id`) gets its own session, from
+  `subagents={agent_type: client}` or the main client. It starts with what its
+  parent had seen, because its prompt was written by the parent, and when it
+  stops the parent receives what it saw. A subagent not cleared for its
+  parent's sources does not start, and its mapped tools are refused.
+  Example: [examples/integrations/claude-agent-sdk](../examples/integrations/claude-agent-sdk).
+
+Not covered: the tests drive the real `ClaudeSDKClient` hook dispatch with a
+scripted CLI on the other end, not the Claude Code CLI itself. Unmapped tools,
+including `Bash`, run untouched: a shell command can read a source or post
+somewhere without a check. Shell-command hooks from settings files are
+separate and are not affected.

@@ -136,6 +136,7 @@ class Session:
 
     def handoff(self) -> str:
         """An opaque token carrying what this session has seen, for another agent's session."""
+        self._usable()
         payload = json.dumps({"artifacts": list(self.seen)}, separators=(",", ":")).encode()
         return _PREFIX + base64.urlsafe_b64encode(payload).decode().rstrip("=")
 
