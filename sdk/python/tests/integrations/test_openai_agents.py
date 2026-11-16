@@ -236,16 +236,66 @@ def test_resumed_memory_session_without_the_token_is_refused(server: Server) -> 
     memory = SQLiteSession("conversation")
     guard, agent = memory_agents(server, [call("read_salaries")])
     context: dict[str, Any] = {}
-    guard.run_sync(agent, "read", session=memory, context=context)
+    asyncio.run(guard.run(agent, "read", session=memory, context=context))
     assert context["trustgraph"].startswith("tg1.")
 
     guard, agent = memory_agents(server, [call("read_roadmap"), call("post_message", {"text": "x"}, 1)])
-    out = outputs(guard.run_sync(agent, "post", session=memory))  # history, but a fresh context
+    out = outputs(asyncio.run(guard.run(agent, "post", session=memory)))  # history, but a fresh context
     assert "continues an earlier conversation" in out["post_message"] and posted == []
 
     guard, agent = memory_agents(server, [call("read_roadmap"), call("post_message", {"text": "x"}, 1)])
-    out = outputs(guard.run_sync(agent, "post", session=memory, context=context))  # restored from it
+    out = outputs(asyncio.run(guard.run(agent, "post", session=memory, context=context)))  # restored from it
     assert "`salaries`" in out["post_message"] and "denied" in out["post_message"] and posted == []
+    with pytest.raises(ValueError, match="await guard.run"):
+        guard.run_sync(agent, "post", session=memory)
+
+
+def test_a_refused_resumed_run_stays_refused_on_retry(server: Server) -> None:
+    """The re-review's o1.py: turn 2 is refused with a fresh dict context; retrying with that
+    context must not find a clean (empty) token there."""
+    from agents import SQLiteSession
+
+    memory = SQLiteSession("conversation")
+    guard, agent = memory_agents(server, [call("read_salaries")])
+    asyncio.run(guard.run(agent, "read salaries", session=memory, context={}))  # its context is lost
+    ctx: dict[str, Any] = {}
+    for turn in range(3):
+        guard, agent = memory_agents(server, [call("read_roadmap", n=turn), call("post_message", {"text": "salary summary"}, turn)])
+        out = outputs(asyncio.run(guard.run(agent, "post", session=memory, context=ctx)))
+        assert "did not run" in out["post_message"] and posted == [], (turn, out)
+    from trustgraph._session import _parse
+    assert _parse(ctx["trustgraph"])[1]  # the broken marker is kept
+
+
+def test_a_failed_restore_stays_refused_and_keeps_the_token(handoff_server: Server) -> None:
+    """A stored token the agent is not cleared for breaks the session; saving keeps it, never less."""
+    from trustgraph._session import _parse
+
+    with handoff_server.client("planner").session() as s:
+        s.read("roadmap", "Q3")  # the researcher is not cleared for roadmap
+        ctx: dict[str, Any] = {"trustgraph": s.handoff()}
+    stored = set(_parse(ctx["trustgraph"])[0])
+    for turn in range(2):
+        guard = Guard(clients={"researcher": handoff_server.client("researcher")},
+                      sources={"read_salaries": "salaries"}, actions={"post_message": "post_to_engineering"})
+        agent = Agent(name="researcher", tools=[read_salaries, post_message],
+                      model=script(call("read_salaries", n=turn), call("post_message", {"text": "x"}, turn)))
+        guard.protect(agent)
+        out = outputs(guard.run_sync(agent, "go", context=ctx))
+        assert "withheld" in out["read_salaries"] and "did not run" in out["post_message"] and posted == []
+        ids, broken = _parse(ctx["trustgraph"])
+        assert stored <= set(ids) and broken
+
+
+def test_protect_refuses_what_it_cannot_guard(server: Server) -> None:
+    from agents import WebSearchTool
+
+    guard = Guard(clients={}, actions={"web_search": "post_to_slack"})
+    with pytest.raises(ValueError, match="WebSearchTool"):
+        guard.protect(Agent(name="a", tools=[WebSearchTool()]))
+    guard = Guard(clients={}, actions={"post_mesage": "post_to_slack"})  # a typo matches nothing
+    with pytest.raises(ValueError, match="post_mesage"):
+        guard.protect(Agent(name="a", tools=[post_message]))
 
 
 def test_input_with_earlier_tool_items_is_refused(server: Server) -> None:

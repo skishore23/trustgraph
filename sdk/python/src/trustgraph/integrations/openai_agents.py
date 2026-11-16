@@ -40,7 +40,7 @@ from agents import (
 
 from .._client import Client
 from .._errors import TrustGraphError
-from .._session import Session, _token, current_session
+from .._session import Session, current_session, merge_tokens
 from ._common import Action, as_spec, blocked_message, check_action, not_registered_message
 
 __all__ = ["Action", "Guard", "as_action", "as_source"]
@@ -91,7 +91,9 @@ class _Run:
         stored = context.get(CONTEXT_KEY) if isinstance(context, Mapping) else None
         if stored:
             try:
-                s.receive(stored)  # a failure breaks `s`: its mapped tools are refused
+                # A broken marker, an uncleared agent or a lost artifact breaks `s`, and
+                # `save` then keeps the stored token and adds the marker: never less.
+                s.receive(stored)
             except TrustGraphError:
                 pass
         elif self.resumed:
@@ -105,8 +107,11 @@ class _Run:
         if not isinstance(context, MutableMapping):
             return
         with self.lock:
-            ids = list(dict.fromkeys(i for s in self.sessions.values() for i in s.seen))
-        context[CONTEXT_KEY] = _token(ids)
+            sessions = list(self.sessions.values())
+            stored = context.get(CONTEXT_KEY)
+            context[CONTEXT_KEY] = merge_tokens(
+                stored if stored is None or isinstance(stored, str) else "not a token", *(s.persist() for s in sessions)
+            )
 
 
 _run: contextvars.ContextVar[_Run | None] = contextvars.ContextVar("trustgraph_openai_run", default=None)
@@ -188,6 +193,45 @@ def as_action(tool: FunctionTool, action: str | Action) -> FunctionTool:
 _MCP = "trustgraph_mcp"
 
 
+def _version() -> str:
+    try:
+        from importlib.metadata import version
+
+        return version("openai-agents")
+    except Exception:
+        return "unknown"
+
+
+def _unsupported(what: str) -> TrustGraphError:
+    return TrustGraphError(
+        "unsupported_framework", f"openai-agents {_version()}: {what}, so TrustGraph cannot guard its tools"
+    )
+
+
+def _check_framework() -> None:
+    fields = {f.name for f in dataclasses.fields(FunctionTool)}
+    if not {"tool_input_guardrails", "tool_output_guardrails"} <= fields:
+        raise _unsupported("FunctionTool has no tool_input_guardrails / tool_output_guardrails")
+
+
+def _check_mcp_copies(server: Any, name: str) -> None:
+    """The SDK copies a server's guardrails onto each MCP tool it builds; check on a probe tool."""
+    try:
+        from agents.mcp.util import MCPUtil
+        from mcp.types import Tool as MCPTool
+
+        probe = MCPUtil.to_function_tool(
+            MCPTool(name="trustgraph_probe", inputSchema={"type": "object", "properties": {}}), server, False
+        )
+        ok = name in {g.name for g in probe.tool_input_guardrails or []} and name in {
+            g.name for g in probe.tool_output_guardrails or []
+        }
+    except Exception as e:
+        raise _unsupported(f"building an MCP tool to check its guardrails failed ({e!r})") from None
+    if not ok:
+        raise _unsupported("an MCP server's tool guardrails are not copied onto its tools")
+
+
 class _Hooks(RunHooks[Any]):
     def __init__(self, inner: RunHooks[Any] | None) -> None:
         self._inner = inner
@@ -239,6 +283,28 @@ class Guard:
         self.actions = {name: as_spec(a) for name, a in (actions or {}).items()}
 
     def protect(self, *agents: Agent[Any]) -> None:
+        """Guard every mapped tool of ``agents``. Pass every agent that has a
+        mapped tool in one call: a mapped name that matches no tool (and none
+        of them has MCP servers, whose tools are named only at run time), or
+        that names a tool kind guardrails do not cover, raises ``ValueError``."""
+        _check_framework()
+        names = set(self.actions) | set(self.sources)
+        found: set[str] = set()
+        for agent in agents:
+            for tool in agent.tools:
+                name = getattr(tool, "name", None)
+                if name in names and not isinstance(tool, FunctionTool):
+                    raise ValueError(
+                        f"`{name}` is a {type(tool).__name__}, which tool guardrails do not cover; "
+                        "unmap it, or replace it with a function tool"
+                    )
+                found.add(name)
+        missing = names - found
+        if missing and not any(agent.mcp_servers for agent in agents):
+            raise ValueError(
+                f"mapped tools not found on these agents: {', '.join(sorted(missing))}; "
+                "pass every agent to one protect() call"
+            )
         for agent in agents:
             tools = []
             for tool in agent.tools:
@@ -250,6 +316,7 @@ class Guard:
             agent.tools = tools
             for server in agent.mcp_servers:
                 self._protect_server(server)
+                _check_mcp_copies(server, f"{_MCP}:{id(self)}")
 
     def _protect_server(self, server: Any) -> None:
         """Every tool of an MCP server gets the server's guardrails (the SDK's hook for them)."""
@@ -300,9 +367,12 @@ class Guard:
             return await Runner.run(starting_agent, input, hooks=self.hooks(kwargs.pop("hooks", None)), **kwargs)
 
     def run_sync(self, starting_agent: Agent[Any], input: Any, **kwargs: Any) -> Any:
-        """``Runner.run_sync`` with fresh sessions for this run."""
-        history = asyncio.run(self._has_history(kwargs)) if kwargs.get("session") is not None else False
-        with self.scope(input, _resumed_memory=history, **kwargs):
+        """``Runner.run_sync`` with fresh sessions for this run. With ``session=``, use ``run``."""
+        if kwargs.get("session") is not None:
+            # Reading the session's history first would need a second event loop, which can
+            # bind the session's locks to the wrong loop.
+            raise ValueError("guard.run_sync does not take session=; use `await guard.run(...)`")
+        with self.scope(input, _resumed_memory=False, **kwargs):
             return Runner.run_sync(starting_agent, input, hooks=self.hooks(kwargs.pop("hooks", None)), **kwargs)
 
     async def run_streamed(self, starting_agent: Agent[Any], input: Any, **kwargs: Any) -> Any:
