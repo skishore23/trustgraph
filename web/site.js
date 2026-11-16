@@ -353,6 +353,24 @@ function renderExplain(text) {
   return lines.map(line => h('li', null, richText(line)));
 }
 
+// One-line summaries for the folded Tests and What changed cells; `open`
+// unfolds a cell when something failed or changed.
+function testsSummary(tests) {
+  if (!Array.isArray(tests)) return { text: 'fix the errors to run them', open: false, bad: true };
+  if (!tests.length) return { text: 'no tests', open: false, bad: false };
+  const failed = tests.filter(t => !t.pass).length;
+  if (failed) return { text: `${failed} of ${plural(tests.length, 'test')} fail`, open: true, bad: true };
+  return { text: `${plural(tests.length, 'test')} pass`, open: false, bad: false };
+}
+
+function diffSummary(result) {
+  if (!result) return { text: 'no changes', open: false, bad: false };
+  if (!result.ok && result.file) return { text: 'fix the errors to compare', open: false, bad: true };
+  const changes = Array.isArray(result.changes) ? result.changes : [];
+  if (!changes.length) return { text: 'no changes', open: false, bad: false };
+  return { text: `${plural(changes.length, 'change')}${result.widens ? ' · widens access' : ''}`, open: true, bad: Boolean(result.widens) };
+}
+
 const DIFF_TAGS = { widens: 'WIDENS', narrows: 'NARROWS', neutral: 'CHANGE' };
 
 function renderDiff(result) {
@@ -443,17 +461,17 @@ const STARTER_LEAK = toRun({ agent: 'planner', sources: ['salaries', 'roadmap'],
 
 const EXPERIMENTS = {
   handoff: [
-    { id: 'launder', label: 'Launder the salary file through notes', run: HANDOFF_RUN,
+    { id: 'launder', label: 'Launder through notes', run: HANDOFF_RUN,
       note: 'Two agents, two steps: salaries → planning notes → a summary for engineering.' },
-    { id: 'uncleared', label: "Hand the notes to an agent that isn't cleared", run: HANDOFF_RUN,
+    { id: 'uncleared', label: 'Uncleared agent', run: HANDOFF_RUN,
       edit: [/(\n {2}salaries:[^\n]*\n {4}readers: \[hr\]\n {4}agents: \[researcher), planner\]/, '$1]'],
       note: 'Removed `planner` from salaries.agents: it may not take in anything built on salaries.' },
-    { id: 'roadmap', label: 'Drop the notes, keep the roadmap',
+    { id: 'roadmap', label: 'Roadmap only',
       run: { ...HANDOFF_RUN, steps: [HANDOFF_RUN.steps[0], { agent: 'planner', sources: ['roadmap'], prior: [] }] },
       note: 'planner wrote the summary from the roadmap alone.' },
-    { id: 'hr', label: 'Send the same summary to HR instead', run: { ...HANDOFF_RUN, action: 'brief_hr' },
+    { id: 'hr', label: 'Send to HR', run: { ...HANDOFF_RUN, action: 'brief_hr' },
       note: 'Same summary, sent to hr with `brief_hr`.' },
-    { id: 'widen', label: 'Quietly widen the salary file', run: HANDOFF_RUN,
+    { id: 'widen', label: 'Widen the salary file', run: HANDOFF_RUN,
       edit: [/(\n {2}salaries:[^\n]*\n {4}readers: \[)hr\]/, '$1hr, engineering]'],
       note: 'Added `engineering` to salaries.readers. A test fails and the diff flags it.' },
   ],
@@ -543,7 +561,7 @@ function renderExperiments() {
   const set = experimentSet();
   ui.experiments.hidden = !set;
   ui.experimentButtons.replaceChildren(...(set || []).map(e => h('button', {
-    type: 'button', class: 'exp', 'aria-pressed': String(state.experiment === e.id), on: { click: () => runExperiment(e.id) },
+    type: 'button', class: 'tab', 'aria-pressed': String(state.experiment === e.id), on: { click: () => runExperiment(e.id) },
   }, e.label)));
   const current = (set || []).find(e => e.id === state.experiment);
   ui.experimentNote.replaceChildren(...(current ? richText(current.note) : []));
@@ -627,6 +645,7 @@ async function runCheck() {
   setStatus(status.cls, status.text);
   ui.diagnostics.replaceChildren(...renderDiagnostics(result.diagnostics, focusDiagnostic));
   ui.tests.replaceChildren(...renderTests(result.tests));
+  setFold(ui.testsBox, ui.testsSummary, testsSummary(result.tests));
   ui.explain.replaceChildren(...renderExplain(result.explain));
   state.valid = Boolean(result.ok && result.summary);
   if (state.valid) {
@@ -695,108 +714,138 @@ async function runDiff(policy, ok) {
   if (state.original == null || policy === state.original) {
     lanes.diff.cancel();
     ui.diff.replaceChildren(...renderDiff(null));
+    setFold(ui.diffBox, ui.diffSummary, diffSummary(null));
     return;
   }
   if (!ok) {
     lanes.diff.cancel();
     ui.diff.replaceChildren(...renderDiff({ ok: false, file: 'new' }));
+    setFold(ui.diffBox, ui.diffSummary, diffSummary({ ok: false, file: 'new' }));
     return;
   }
   const res = await lanes.diff.run(buildRequest('diff', { old: state.original, new: policy }));
   if (!res.fresh) return;
   if (res.error) { ui.diff.replaceChildren(h('li', { class: 'muted', text: `Couldn't compare: ${res.error.message}` })); return; }
   ui.diff.replaceChildren(...renderDiff(res.value));
+  setFold(ui.diffBox, ui.diffSummary, diffSummary(res.value));
 }
 
-function chip(value, label, checked, onChange, title) {
-  return h('label', { class: 'chip', title },
-    h('input', { type: 'checkbox', value, checked, on: { change: event => onChange(event.target.checked) } }), label);
+function setFold(box, label, summary) {
+  if (!box || !label) return;
+  label.textContent = summary.text;
+  label.setAttribute('class', summary.bad ? 'fold-sum mono bad' : 'fold-sum mono');
+  box.open = summary.open;
 }
 
-function select(id, values, selected, onChange) {
-  const el = h('select', { id, name: id, on: { change: event => onChange(event.target.value) } }, values.map(v => h('option', { value: v, text: v })));
+function select(id, values, selected, onChange, labelOf = v => v) {
+  const el = h('select', { id, name: id, class: 'inline', on: { change: event => onChange(event.target.value) } },
+    values.map(v => h('option', { value: v, text: labelOf(v) })));
   el.value = selected;
   return el;
 }
 
-// Each step as an editable sentence, with the line the engine recorded under it.
+// A multiple choice that rests as one underlined phrase and opens a small
+// list of labelled checkboxes. `options`: [{ value, label, checked, note }].
+function picker(id, name, options, summarise, onToggle) {
+  const summary = h('summary', { id: `${id}-summary` });
+  const refresh = () => {
+    const text = summarise(options.filter(o => o.checked));
+    summary.textContent = text;
+    summary.setAttribute('aria-label', `${name}: ${text}`);
+  };
+  const boxes = options.map(o => h('label', null,
+    h('input', { type: 'checkbox', value: o.value, checked: o.checked, on: { change: event => { o.checked = event.target.checked; refresh(); onToggle(o.value, o.checked); } } }),
+    o.label, o.note ? h('span', { class: 'muted', text: o.note }) : null));
+  refresh();
+  return h('details', { class: 'pick', id }, summary, h('div', { class: 'pick-panel', role: 'group', 'aria-label': name }, boxes));
+}
+
+// Each step as one sentence of quiet inline controls, the engine's record under it.
 function renderSteps(focusId) {
   const summary = state.summary;
   const run = state.run;
   const labels = stepNames(run.steps.length);
-  const many = run.steps.length > 1;
   ui.recorded = [];
   const blocks = run.steps.map((step, i) => {
     const last = i === run.steps.length - 1;
-    const toggle = (array, item) => on => {
-      const at = array.indexOf(item);
-      if (on && at < 0) array.push(item);
-      if (!on && at >= 0) array.splice(at, 1);
-      clearExperiment();
-      runSteps();
-    };
-    const inputs = [
-      ...Array.from({ length: i }, (_, n) => chip(`step:${n}`, labels[n], step.prior.includes(n), toggle(step.prior, n))),
-      ...Object.entries(summary.sources || {}).map(([name, s]) =>
-        chip(name, name, step.sources.includes(name), toggle(step.sources, name), list(s.agents).includes(step.agent) ? null : `${step.agent} may not use ${name}`)),
-    ];
     const agentId = `agent-${i}`;
+    const inputs = [
+      ...Array.from({ length: i }, (_, n) => ({ value: `step:${n}`, label: labels[n], checked: step.prior.includes(n), kind: 'prior', key: n })),
+      ...Object.entries(summary.sources || {}).map(([name, s]) => ({ value: name, label: name, checked: step.sources.includes(name), kind: 'source', key: name,
+        note: list(s.agents).includes(step.agent) ? null : `${step.agent} may not use` })),
+    ];
+    const reads = picker(`reads-${i}`, `What step ${i + 1} read`, inputs,
+      chosen => chosen.map(o => o.label).join(' + ') || 'nothing',
+      (value, on) => {
+        const option = inputs.find(o => o.value === value);
+        const array = option.kind === 'prior' ? step.prior : step.sources;
+        const at = array.indexOf(option.key);
+        if (on && at < 0) array.push(option.key);
+        if (!on && at >= 0) array.splice(at, 1);
+        clearExperiment();
+        runSteps();
+      });
     const tail = last
       ? [' and wants to ', h('label', { class: 'sr-only', for: 'action', text: 'Action' }),
         select('action', Object.keys(summary.actions || {}), run.action, value => { run.action = value; run.recipients = null; clearExperiment(); renderSteps('action'); runSteps(); }),
-        h('span', { 'aria-hidden': 'true', text: '→' }), h('span', { class: 'sr-only', text: ' sending to ' }),
-        h('span', { class: 'chips', role: 'group', 'aria-label': 'Recipients' }, recipientChips()), '.']
+        h('span', { 'aria-hidden': 'true', text: ' → ' }), h('span', { class: 'sr-only', text: ' sending to ' }), recipientPicker(), '.']
       : [' and wrote ', h('b', { text: labels[i] }), '.'];
     const recorded = h('p', { class: 'recorded mono' });
     ui.recorded.push(recorded);
     return h('div', { class: 'step' },
       h('p', { class: 'sentence' },
-        many ? h('span', { class: 'step-n mono', text: `${i + 1}.` }) : null,
         h('label', { class: 'sr-only', for: agentId, text: `Agent for step ${i + 1}` }),
         select(agentId, list(summary.agents), step.agent, value => { step.agent = value; clearExperiment(); renderSteps(agentId); runSteps(); }),
-        ' read ', h('span', { class: 'chips', role: 'group', 'aria-label': `What step ${i + 1} read` }, inputs), tail),
+        ' read ', reads, tail),
       recorded);
   });
-  const controls = h('p', { class: 'step-controls' },
-    run.steps.length < MAX_UI_STEPS ? h('button', { class: 'plain', type: 'button', on: { click: addStep } }, '+ add a step') : null,
-    many ? h('button', { class: 'plain', type: 'button', on: { click: removeStep } }, '− remove the last step') : null);
-  ui.steps.replaceChildren(...blocks, controls);
+  const counts = Array.from({ length: MAX_UI_STEPS }, (_, n) => String(n + 1));
+  const control = h('p', { class: 'step-count' },
+    h('label', { for: 'step-count', text: 'Run with ' }),
+    select('step-count', counts, String(run.steps.length), value => setStepCount(Number(value)), v => (v === '1' ? '1 step' : `${v} steps`)));
+  ui.steps.replaceChildren(...blocks, control);
   if (focusId) { const el = $(focusId); if (el && typeof el.focus === 'function') el.focus(); }
 }
 
-function recipientChips() {
+// Recipients rest as the audience and a count, e.g. "engineering (2)".
+function recipientPicker() {
   const run = state.run;
   const action = state.summary.actions[run.action] || {};
   const people = list(action.people);
   const chosen = expandRecipients(run, state.summary);
-  return people.map(person => chip(person, person, chosen.includes(person), on => {
-    const set = new Set(expandRecipients(run, state.summary));
-    if (on) set.add(person); else set.delete(person);
-    const picked = people.filter(p => set.has(p));
-    run.recipients = picked.length === people.length ? null : picked;
-    clearExperiment();
-    runSteps();
-  }));
+  const options = people.map(person => ({ value: person, label: person, checked: chosen.includes(person) }));
+  return picker('recipients', 'Recipients', options,
+    picked => (picked.length === people.length ? `${list(action.audience).join(', ')} (${people.length})` : picked.map(o => o.label).join(', ') || 'no one'),
+    () => {
+      const picked = options.filter(o => o.checked).map(o => o.value);
+      run.recipients = picked.length === people.length ? null : picked;
+      clearExperiment();
+      runSteps();
+    });
 }
 
-// A new last step reads the previous one; its agent starts as the previous agent.
-function addStep() {
+// More steps: each new last step reads the previous one with the same agent.
+function setStepCount(n) {
   const run = state.run;
-  if (run.steps.length >= MAX_UI_STEPS) return;
-  const previous = run.steps[run.steps.length - 1];
-  run.steps.push({ agent: previous.agent, sources: [], prior: [run.steps.length - 1] });
+  const target = Math.max(1, Math.min(MAX_UI_STEPS, n));
+  while (run.steps.length < target) {
+    const previous = run.steps[run.steps.length - 1];
+    run.steps.push({ agent: previous.agent, sources: [], prior: [run.steps.length - 1] });
+  }
+  while (run.steps.length > target) run.steps.pop();
   clearExperiment();
-  renderSteps(`agent-${run.steps.length - 1}`);
+  renderSteps('step-count');
   runSteps();
 }
 
-function removeStep() {
-  const run = state.run;
-  if (run.steps.length <= 1) return;
-  run.steps.pop();
-  clearExperiment();
-  renderSteps(`agent-${run.steps.length - 1}`);
-  runSteps();
+// Close an open picker on Escape or a click elsewhere.
+function closePickers(event) {
+  for (const open of document.querySelectorAll('details.pick[open]')) {
+    if (event.type === 'keydown' && event.key !== 'Escape') continue;
+    if (event.type === 'click' && open.contains(event.target)) continue;
+    open.open = false;
+    if (event.type === 'keydown' && open.contains(event.target)) open.querySelector('summary').focus();
+  }
 }
 
 function focusDiagnostic(diagnostic) {
@@ -850,6 +899,7 @@ function boot() {
   Object.assign(ui, {
     example: $('example'), policy: $('policy'), status: $('check-status'), reset: $('reset'),
     diagnostics: $('diagnostics'), tests: $('tests'), steps: $('steps'), decision: $('decision'), explain: $('explain'), diff: $('diff'),
+    testsBox: $('tests-box'), testsSummary: $('tests-summary'), diffBox: $('diff-box'), diffSummary: $('diff-summary'),
     experiments: $('experiments'), experimentButtons: $('experiment-buttons'), experimentNote: $('experiment-note'),
     simForm: $('sim-form'), seed: $('sim-seed'), simRun: $('sim-run'), simResult: $('sim-result'),
   });
@@ -867,6 +917,10 @@ function boot() {
     runCheck();
   });
   ui.simForm.addEventListener('submit', runSimulation);
+  if (typeof document.addEventListener === 'function') {
+    document.addEventListener('click', closePickers);
+    document.addEventListener('keydown', closePickers);
+  }
   renderExperiments();
   return loadExamples();
 }

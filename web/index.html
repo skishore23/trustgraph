@@ -21,9 +21,9 @@
 </header>
 
 <main id="main" class="page">
-<h1>Decide where your agent's output can go, based on what it read.</h1>
 <div class="intro">
 <div>
+<h1>Decide where your agent's output can go, based on what it read.</h1>
 <p class="lead">TrustGraph is policy-as-code for what AI agents produce. Restrictions follow the data through every hand-off, and every output gets <span class="mono">allow</span>, <span class="mono">needs approval</span> or <span class="mono">deny</span>, with the reason.</p>
 </div>
 
@@ -51,21 +51,21 @@
 <div class="frame">
   <h2 id="try-title" class="frame-head">Try it <span class="mono">— runs the real Rust engine</span></h2>
 
-  <div id="experiments" class="cell experiments">
-    <div id="experiment-buttons" class="exp-row" role="group" aria-label="Experiments"></div>
+  <div id="experiments" class="experiments">
+    <div id="experiment-buttons" class="tabs" role="group" aria-label="Experiments"></div>
     <p id="experiment-note" class="note mono" aria-live="polite"></p>
   </div>
 
-  <div class="row two main">
+  <div class="row main">
     <div class="cell">
       <div class="cell-head">
         <h3>Policy</h3>
         <label class="sr-only" for="example">Example policy</label>
-        <select id="example" name="example" class="compact" disabled><option value="starter">Starter</option></select>
+        <select id="example" name="example" class="inline" disabled><option value="handoff">Hand-off between agents</option></select>
         <button id="reset" class="plain" type="button">Reset</button>
       </div>
       <label class="sr-only" for="policy">Policy YAML</label>
-      <textarea id="policy" name="policy" class="editor" rows="18" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off" wrap="off" aria-describedby="editor-help check-status"># Scenario: a research agent reads the salary file and writes planning notes; a planning agent combines the notes with the roadmap.
+      <textarea id="policy" name="policy" class="editor" rows="20" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off" wrap="off" aria-describedby="editor-help check-status"># Scenario: a research agent reads the salary file and writes planning notes; a planning agent combines the notes with the roadmap.
 # What the notes carry follows them, so a summary built on them stays HR-only however many steps later.
 version: 1
 
@@ -133,7 +133,6 @@ tests:
         <p id="editor-help" class="hint">Tab indents. Shift+Tab, or Esc then Tab, leaves the editor.</p>
       </div>
     </div>
-
     <div class="cell">
       <h3 class="sr-only">The run</h3>
       <div id="steps" class="steps"><p class="muted">Loading the run…</p></div>
@@ -141,15 +140,15 @@ tests:
     </div>
   </div>
 
-  <div class="row two main">
-    <div class="cell">
-      <div class="cell-head"><h3>Tests</h3></div>
+  <div class="row bottom">
+    <details id="tests-box" class="cell fold">
+      <summary><span class="fold-title">Tests</span> <span id="tests-summary" class="fold-sum mono">not run yet</span></summary>
       <ul id="tests" class="lines"><li class="muted">Tests run when the policy is checked.</li></ul>
-    </div>
-    <div class="cell">
-      <div class="cell-head"><h3>What changed</h3></div>
+    </details>
+    <details id="diff-box" class="cell fold">
+      <summary><span class="fold-title">What changed</span> <span id="diff-summary" class="fold-sum mono">no changes</span></summary>
       <ul id="diff" class="lines" aria-live="polite"><li class="muted">No changes from the example as loaded.</li></ul>
-    </div>
+    </details>
   </div>
 </div>
 <details class="explain">
@@ -182,8 +181,12 @@ tests:
 </section>
 
 <section id="simulator" aria-labelledby="sim-title">
+<div class="split">
+<div class="split-text">
 <h2 id="sim-title">Simulate</h2>
 <p>Seeded runs drive the real runtime through policy changes, crashes and approval expiry, and check five safety invariants at every step. They cannot cover what your system does after <span class="mono">allow</span>.</p>
+</div>
+<div class="split-side">
 <div class="frame">
   <form id="sim-form" class="cell sim-form" novalidate>
     <label for="sim-seed" class="mono">seed</label>
@@ -192,11 +195,19 @@ tests:
   </form>
   <div id="sim-result" class="cell" aria-live="polite"><p class="muted">Uses the policy in the playground above.</p></div>
 </div>
+</div>
+</div>
 </section>
 
 <section aria-labelledby="agents-title">
+<div class="split">
+<div class="split-text">
 <h2 id="agents-title">Written by agents, approved by people</h2>
 <p>Agents draft the policy: every command has <code>--json</code> output with a stable code, a path and a did-you-mean suggestion. A person reviews the plain-English explanation and a diff that flags every widening.</p>
+
+<p><a href="https://github.com/skishore23/trustgraph/blob/main/docs/agents/writing-policies.md">Agent guide</a> · <a href="https://github.com/skishore23/trustgraph/blob/main/llms.txt">llms.txt</a></p>
+</div>
+<div class="split-side">
 <pre>$ trustgraph policy check --json trustgraph.policy.yaml
 {
   "diagnostics": [
@@ -210,14 +221,22 @@ tests:
   ],
   "ok": false
 }</pre>
-<p><a href="https://github.com/skishore23/trustgraph/blob/main/docs/agents/writing-policies.md">Agent guide</a> · <a href="https://github.com/skishore23/trustgraph/blob/main/llms.txt">llms.txt</a></p>
+</div>
+</div>
 </section>
 
 <section aria-labelledby="rule-title">
+<div class="split">
+<div class="split-text">
 <h2 id="rule-title">The rule</h2>
+
+<p>Approval adds a human check; it never widens who may read a source. Anything the policy does not name is denied.</p>
+</div>
+<div class="split-side">
 <pre>readers(output) = readers(input 1) ∩ readers(input 2) ∩ …
 allowed         = everyone the action reaches ⊆ readers(output)</pre>
-<p>Approval adds a human check; it never widens who may read a source. Anything the policy does not name is denied.</p>
+</div>
+</div>
 </section>
 
 <section aria-labelledby="proof-title">
@@ -243,8 +262,14 @@ allowed         = everyone the action reaches ⊆ readers(output)</pre>
 </section>
 
 <section id="install" aria-labelledby="use-title">
+<div class="split">
+<div class="split-text">
 <h2 id="use-title">Use it</h2>
 <p>TrustGraph ships as a CLI and Rust crates.</p>
+
+<p>To let agents ask before they act, run <code>trustgraph serve --policy trustgraph.policy.yaml --operator leo</code>: a local HTTP and MCP service. <a href="https://github.com/skishore23/trustgraph/blob/main/docs/serve.md">Serve guide</a></p>
+</div>
+<div class="split-side">
 <pre>cargo install --locked --git https://github.com/skishore23/trustgraph trustgraph-cli
 
 trustgraph policy init --path trustgraph.policy.yaml
@@ -253,9 +278,11 @@ trustgraph policy test trustgraph.policy.yaml
 trustgraph policy simulate trustgraph.policy.yaml --seed 0
 trustgraph policy explain trustgraph.policy.yaml
 trustgraph policy diff old.policy.yaml trustgraph.policy.yaml</pre>
-<p>To let agents ask before they act, run <code>trustgraph serve --policy trustgraph.policy.yaml --operator leo</code>: a local HTTP and MCP service. <a href="https://github.com/skishore23/trustgraph/blob/main/docs/serve.md">Serve guide</a></p>
+</div>
+</div>
 </section>
 
+<div class="split pair">
 <section aria-labelledby="limits-title">
 <h2 id="limits-title">Limits</h2>
 <ul>
@@ -270,6 +297,7 @@ trustgraph policy diff old.policy.yaml trustgraph.policy.yaml</pre>
 <h2 id="fit-title">Where it fits</h2>
 <p>Permission databases such as SpiceDB or OpenFGA decide what your agent may read. TrustGraph decides where what it wrote may go.</p>
 </section>
+</div>
 </main>
 
 <footer class="foot">

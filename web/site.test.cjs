@@ -241,23 +241,33 @@ async function main() {
   assert.equal(byClass(steps, 'step').length, 2, 'two steps, each a sentence');
   assert.match(text(byClass(steps, 'step')[0]), /read.*salaries.*and wrote planning notes\./);
   assert.match(text(byClass(steps, 'step')[1]), /read.*planning notes.*roadmap.*and wants to/);
+  // At rest each choice is one quiet phrase; the checkboxes sit inside closed pickers.
+  assert.deepEqual(all(steps, n => n.tagName === 'SUMMARY').map(text), ['salaries', 'planning notes + roadmap', 'engineering (2)']);
+  assert.ok(all(steps, n => n.tagName === 'DETAILS').every(d => !d.open), 'pickers start closed');
+  assert.ok(all(steps, n => n.tagName === 'SELECT').every(n => n.attributes.class === 'inline'), 'selects read as inline words');
+  assert.equal(all(steps, n => n.tagName === 'INPUT' && n.checked).length, 5, 'the ticked inputs are real checkboxes');
+  assert.equal(text(pageB.$('tests-summary')), '1 test pass');
+  assert.equal(pageB.$('tests-box').open, false, 'passing tests stay folded');
+  assert.equal(text(pageB.$('diff-summary')), 'no changes');
   assert.deepEqual(byClass(steps, 'recorded').map(text), ['planning notes — carries: salaries — readable by: nina', 'summary — carries: roadmap, salaries — readable by: nina']);
   assert.match(text(pageB.$('decision')), /DENIED/);
   assert.match(text(pageB.$('decision')), /Held back by: salaries \(hr only\) — leaves out ravi, sam/);
-  assert.deepEqual(all(pageB.$('experiment-buttons'), n => n.tagName === 'BUTTON' && n.attributes['aria-pressed'] === 'true').map(text), ['Launder the salary file through notes']);
+  assert.deepEqual(all(pageB.$('experiment-buttons'), n => n.tagName === 'BUTTON' && n.attributes['aria-pressed'] === 'true').map(text), ['Launder through notes']);
   assert.equal(all(pageB.$('experiment-buttons'), n => n.tagName === 'BUTTON').length, 5);
   assert.match(text(pageB.$('experiment-note')), /Two agents, two steps: salaries → planning notes → a summary for engineering/);
   assert.match(text(pageB.$('diff')), /No changes from the example as loaded/);
   assert.match(text(pageB.$('explain')), /salaries: output can reach hr/);
 
   // A refused step: shown at that step in the deny colour, and no verdict.
-  const unclearedButton = all(pageB.$('experiment-buttons'), n => n.tagName === 'BUTTON' && text(n) === "Hand the notes to an agent that isn't cleared")[0];
+  const unclearedButton = all(pageB.$('experiment-buttons'), n => n.tagName === 'BUTTON' && text(n) === 'Uncleared agent')[0];
   pageB.queue.push(res(HCHECK));
   pageB.queue.push(res(RUN_REFUSED));
   pageB.queue.push(res({ ok: true, diagnostics: [], file: null, widens: false, changes: [{ kind: 'narrows', subject: 'source salaries', gained: [], lost: ['planner'], summary: 'agents lost planner' }] }));
   await unclearedButton.fire('click');
   await new Promise(r => setImmediate(r));
   assert.match(pageB.calls.find(c => c.body.op === 'run' && c !== pageB.calls[2]).body.policy, /agents: \[researcher\]\n/);
+  assert.equal(text(pageB.$('diff-summary')), '1 change');
+  assert.equal(pageB.$('diff-box').open, true, 'a change unfolds What changed');
   const refusedLine = byClass(pageB.$('steps'), 'refused');
   assert.equal(refusedLine.length, 1);
   assert.match(text(refusedLine[0]), /refused — agent planner may not use source salaries|refused — agent `planner` may not use source `salaries`/);
@@ -265,16 +275,18 @@ async function main() {
   assert.match(text(pageB.$('decision')), /refused step 2/);
   assert.doesNotMatch(text(pageB.$('decision')), /DENIED|ALLOWED/);
 
-  // "+ add a step" adds a third step that reads the second; "− remove" takes it away.
-  const addButton = all(pageB.$('steps'), n => n.tagName === 'BUTTON' && text(n) === '+ add a step')[0];
+  // One step-count control: three steps adds a step that reads the second; two takes it away.
+  const stepCount = () => all(pageB.$('steps'), n => n.tagName === 'SELECT' && n.attributes.id === 'step-count')[0];
+  assert.equal(stepCount().value, '2');
+  assert.deepEqual(all(stepCount(), n => n.tagName === 'OPTION').map(text), ['1 step', '2 steps', '3 steps'], 'at most three steps');
   pageB.queue.push(res(RUN_DENY));
-  await addButton.fire('click');
+  stepCount().value = '3';
+  await stepCount().fire('change', { target: { value: '3' } });
   assert.equal(byClass(pageB.$('steps'), 'step').length, 3);
   assert.deepEqual(pageB.calls.at(-1).body.steps.map(s => [s.reads, s.writes]), [[['source:salaries'], 'notes 1'], [['step:0', 'source:roadmap'], 'notes 2'], [['step:1'], 'summary']]);
-  assert.equal(all(pageB.$('steps'), n => n.tagName === 'BUTTON' && text(n) === '+ add a step').length, 0, 'at most three steps');
   assert.equal(all(pageB.$('experiment-buttons'), n => n.attributes && n.attributes['aria-pressed'] === 'true').length, 0, 'editing the run clears the selected experiment');
   pageB.queue.push(res(RUN_DENY));
-  await all(pageB.$('steps'), n => n.tagName === 'BUTTON' && text(n) === '− remove the last step')[0].fire('click');
+  await stepCount().fire('change', { target: { value: '2' } });
   assert.equal(byClass(pageB.$('steps'), 'step').length, 2);
 
   // Unticking a recipient sends an explicit recipient list.
@@ -283,6 +295,7 @@ async function main() {
   samBox.checked = false;
   await samBox.fire('change');
   assert.deepEqual(pageB.calls.at(-1).body.check.recipients, ['ravi']);
+  assert.equal(text(all(pageB.$('steps'), n => n.tagName === 'SUMMARY').at(-1)), 'ravi', 'the recipients phrase follows the choice');
 
   // The starter still has its own five experiments, as a single-step run.
   pageB.queue.push(res(CHECK_OK));
@@ -293,7 +306,7 @@ async function main() {
   assert.deepEqual(all(pageB.$('experiment-buttons'), n => n.tagName === 'BUTTON').map(text), ['Leak the salary file', 'Post only the roadmap', 'Email a customer', 'Give engineering the salary file', 'Misspell a group']);
   assert.deepEqual(pageB.calls.at(-1).body.steps, [{ agent: 'planner', reads: ['source:salaries', 'source:roadmap'], writes: 'output' }]);
   assert.equal(byClass(pageB.$('steps'), 'step').length, 1);
-  assert.equal(all(pageB.$('steps'), n => n.tagName === 'BUTTON' && text(n) === '+ add a step').length, 1);
+  assert.equal(all(pageB.$('steps'), n => n.tagName === 'SELECT' && n.attributes.id === 'step-count')[0].value, '1');
   pageB.queue.push(res(CHECK_OK));
   pageB.queue.push(res(RUN_DENY));
   pageB.$('example').value = 'slack-digest';
