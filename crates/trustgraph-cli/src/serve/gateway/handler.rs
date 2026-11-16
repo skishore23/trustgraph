@@ -127,7 +127,7 @@ impl<J: ServeJournal> ServerHandler for Handler<J> {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "These tools pass through the TrustGraph gateway. What you read through them is recorded, and every action is checked against it before it runs; a refused action did not run. To pass what you read to another agent, call trustgraph__handoff and give it the token; it calls trustgraph__receive.",
+                "These tools pass through the TrustGraph gateway. Recorded reads restrict later actions. Policy-denied actions are not forwarded; upstream errors or timeouts can occur after execution. To pass what you read to another agent, call trustgraph__handoff and give it the token; it calls trustgraph__receive.",
             )
     }
 

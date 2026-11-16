@@ -20,6 +20,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use serde::Serialize;
 use serde_yaml::{Mapping, Value};
 use trustgraph_engine::{OutputContract, validate_schema};
 use trustgraph_framework::SchemaId;
@@ -141,7 +142,7 @@ pub enum Upstream {
 }
 
 /// How one `when` argument is matched.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum MatchType {
     /// The value equals the pattern byte for byte; no wildcards. The
     /// default in `acts` rules.
@@ -168,20 +169,20 @@ impl MatchType {
 }
 
 /// One argument of a `when` rule.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Matcher {
     pub argument: String,
     pub pattern: String,
     pub kind: MatchType,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ReadRule {
     pub when: Vec<Matcher>,
     pub source: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ActRule {
     pub when: Vec<Matcher>,
     pub action: String,
@@ -190,7 +191,7 @@ pub struct ActRule {
     pub content: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum Kind {
     Reads {
         rules: Vec<ReadRule>,
@@ -205,7 +206,7 @@ pub enum Kind {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Capability {
     Legacy,
     Source,
@@ -228,7 +229,7 @@ impl Capability {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Tool {
     /// `upstream.tool`, as in the config.
     pub key: String,

@@ -1478,13 +1478,28 @@ impl<J: ServeJournal> Gateway<J> {
                 "this session has read nothing through the gateway, so there is nothing to check the action against; it was not forwarded",
             ));
         }
+        let step = if self.shared.config.protected {
+            let upstream = self
+                .upstreams
+                .get(&tool.upstream)
+                .ok_or_else(ToolFail::not_available)?;
+            let binding = self.signer.binding(
+                &serde_json::to_vec(&json!({
+                    "tool": tool, "upstream": upstream.binding(&self.signer),
+                }))
+                .map_err(|_| ToolFail::new("internal", "cannot bind protected tool"))?,
+            );
+            format!("gateway:{}:{binding}", tool.exposed)
+        } else {
+            format!("gateway:{}", tool.exposed)
+        };
         let output = self
             .server
             .record_output(
                 agent,
                 OutputRequest {
                     inputs: carried,
-                    step: format!("gateway:{}", tool.exposed),
+                    step,
                     sha256: Some(call.sha256.clone()),
                     content: None,
                 },
@@ -2018,7 +2033,7 @@ pub fn summary(
                     "  {} reads a source; its result is recorded before it is returned:",
                     tool.exposed
                 ));
-                for rule in rules {
+                for rule in rules.iter().filter(|_| !config.protected) {
                     lines.push(format!(
                         "    {}: `{}` (usable by {})",
                         when_text(&rule.when),
@@ -2030,6 +2045,9 @@ pub fn summary(
                     "    otherwise: `{otherwise}` (usable by {})",
                     people(&agents_of(otherwise))
                 ));
+                if config.protected && !rules.is_empty() {
+                    lines.push("    request path rules do not relax this fallback in protected mode".into());
+                }
             }
             Kind::Acts {
                 rules,

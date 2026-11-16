@@ -296,6 +296,30 @@ pub struct UpstreamConn {
     live: tokio::sync::Mutex<Option<Connection>>,
 }
 
+impl UpstreamConn {
+    /// Includes the resolved account credentials without publishing their hashes.
+    /// Changing endpoint, command or environment invalidates prior approvals.
+    pub(super) fn binding(&self, signer: &super::handoff::Signer) -> String {
+        let value = match &self.spec {
+            Spec::Http { url, headers } => {
+                let headers: BTreeMap<_, _> = headers
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_bytes()))
+                    .collect();
+                serde_json::json!({"url":url, "headers":headers})
+            }
+            Spec::Stdio { command, env } => {
+                let env: BTreeMap<_, _> = env
+                    .iter()
+                    .map(|(name, value)| (name, value.expose()))
+                    .collect();
+                serde_json::json!({"command":command, "env":env})
+            }
+        };
+        signer.binding(&serde_json::to_vec(&value).expect("upstream binding is JSON"))
+    }
+}
+
 /// Every upstream of one config.
 pub struct Upstreams {
     by_name: BTreeMap<String, Arc<UpstreamConn>>,

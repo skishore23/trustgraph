@@ -984,6 +984,11 @@ async fn agent_sessions_survive_reconnects_and_restarts_until_the_operator_ends_
 /// Stop `h` (every connection must be closed) and start again on the same
 /// state directory.
 async fn restart(h: Gw<FileJournal>, dir: &Path, session: &str) -> Gw<FileJournal> {
+    stop_disk_gateway(h).await;
+    on_disk(dir, session).await
+}
+
+async fn stop_disk_gateway(h: Gw<FileJournal>) {
     let Gw { gateway, task, .. } = h;
     task.abort();
     let _ = task.await;
@@ -1001,7 +1006,6 @@ async fn restart(h: Gw<FileJournal>, dir: &Path, session: &str) -> Gw<FileJourna
         "the old server is still held"
     );
     drop(server);
-    on_disk(dir, session).await
 }
 
 #[tokio::test]
@@ -3137,6 +3141,11 @@ const PROTECTED_POLICY: &str = include_str!("../../../examples/typed-gateway/pol
 const PROTECTED_CONFIG: &str = include_str!("../../../examples/typed-gateway/gateway.yaml");
 
 async fn protected_gateway(dir: &Path) -> Gw<FileJournal> {
+    protected_gateway_account(dir, PROTECTED_POLICY, "account_one").await
+}
+
+async fn protected_gateway_account(dir: &Path, policy: &str, account: &str) -> Gw<FileJournal> {
+    let policy = policy.to_string();
     let state = dir.join("state");
     let log = dir.join("github.log");
     launch_with(
@@ -3145,7 +3154,7 @@ async fn protected_gateway(dir: &Path) -> Gw<FileJournal> {
         move |port| {
             std::fs::create_dir_all(&state).unwrap();
             Server::new(
-                Runtime::open(FileJournal::open(&state).unwrap(), PROTECTED_POLICY, 0).unwrap(),
+                Runtime::open(FileJournal::open(&state).unwrap(), &policy, 0).unwrap(),
                 settings(port, &state, Limits::default()),
             )
             .unwrap()
@@ -3159,7 +3168,7 @@ async fn protected_gateway(dir: &Path) -> Gw<FileJournal> {
                 .replace(
                     "--stdio]",
                     &format!(
-                        "--stdio]\n    env: {{FAKE_UPSTREAM_LOG: '{}' }}",
+                        "--stdio]\n    env: {{FAKE_UPSTREAM_LOG: '{}', ADAPTER_ACCOUNT: {account} }}",
                         log.display()
                     ),
                 )
@@ -3222,19 +3231,7 @@ async fn protected_gateway_demo() {
     assert_eq!(calls(&log, "create_pull_request").len(), 1);
     println!("ALLOWED private PR; forwarded calls: 1");
     agent.client.cancel().await.unwrap();
-    let Gw { gateway, task, .. } = h;
-    task.abort();
-    let _ = task.await;
-    let server = gateway.server().clone();
-    drop(gateway);
-    for _ in 0..100 {
-        if Arc::strong_count(&server) == 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert_eq!(Arc::strong_count(&server), 1);
-    drop(server);
+    stop_disk_gateway(h).await;
     // Restart/reconnect with the same authenticated principal cannot shed reads.
     let h = protected_gateway(dir.path()).await;
     let agent = h.connect("coding_agent").await;
@@ -3347,4 +3344,42 @@ async fn upgrading_connection_tracking_migrates_instead_of_forgetting_reads() {
             .iter()
             .any(|(session, _, _)| session == "conn:legacy")
     );
+}
+
+#[tokio::test]
+async fn protected_approval_cannot_follow_an_upstream_account_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = PROTECTED_POLICY.replace(
+        "public_pr: {agents: [coding_agent, public_agent], audience: [public]}",
+        "public_pr: {agents: [coding_agent, public_agent], audience: [public], approval: {reviewers: [engineering], valid_for: 1h}}",
+    );
+    let h = protected_gateway_account(dir.path(), &policy, "account_one").await;
+    let agent = h.connect("coding_agent").await;
+    ok(&h.call(&agent, "github__read_public", json!({})).await);
+    let args =
+        json!({"repository_id":"repo_public_42", "title":"Fix typo", "body":"Correct spelling"});
+    let held = h
+        .call(&agent, "github__create_pull_request", args.clone())
+        .await;
+    assert_eq!(error_code(&held), "needs_approval");
+    let first_decision = decision_of(&held);
+    let operator = h.login().await;
+    let (status, _) = h
+        .op_post(
+            "/v1/operator/approve",
+            &operator,
+            json!({"decision":first_decision}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    agent.client.cancel().await.unwrap();
+    stop_disk_gateway(h).await;
+    // Identical principal, payload, policy and destination string, different
+    // actual upstream account. An old approval must never release this call.
+    let h = protected_gateway_account(dir.path(), &policy, "account_two").await;
+    let agent = h.connect("coding_agent").await;
+    let held = h.call(&agent, "github__create_pull_request", args).await;
+    assert_eq!(error_code(&held), "needs_approval");
+    assert_ne!(decision_of(&held), first_decision);
+    assert!(calls(&dir.path().join("github.log"), "create_pull_request").is_empty());
 }

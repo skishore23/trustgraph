@@ -78,6 +78,14 @@ pub struct Signer {
 }
 
 impl Signer {
+    /// Stable, keyed deployment binding. Separate domain from hand-off tokens;
+    /// exposing the binding cannot become an offline credential-guessing oracle.
+    pub(super) fn binding(&self, bytes: &[u8]) -> String {
+        let mut message = b"trustgraph-gateway-binding-v1\0".to_vec();
+        message.extend_from_slice(bytes);
+        hex(&hmac(&self.key, &message))
+    }
+
     /// The secret in `<state>/gateway.secret`, created 0600 on first use.
     pub fn open(state: &Path) -> std::io::Result<Self> {
         let path = state.join(SECRET_FILE);
