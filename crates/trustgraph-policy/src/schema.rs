@@ -26,9 +26,9 @@ pub fn schema() -> Value {
             "version": {"const": 1, "description": "Format version; must be 1."},
             "groups": {
                 "type": "object",
-                "description": "Named lists of people.",
+                "description": "Named lists of people. Groups cannot contain groups: list the people instead.",
                 "propertyNames": {"pattern": NAME},
-                "additionalProperties": names("People in the group.")
+                "additionalProperties": names("People in the group; never a group name.")
             },
             "agents": names("The AI agents this policy governs."),
             "sources": {

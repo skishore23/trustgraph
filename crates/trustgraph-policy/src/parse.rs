@@ -296,6 +296,14 @@ impl Cx {
                 0
             }
             Some(Value::Number(n)) if n.as_u64() == Some(1) => 1,
+            Some(Value::String(text)) if text.trim() == "1" => {
+                self.error(
+                    "version",
+                    "unsupported_version",
+                    "version must be the number 1, unquoted".into(),
+                );
+                0
+            }
             Some(other) => {
                 self.error(
                     "version",
@@ -342,12 +350,21 @@ impl Cx {
         let Some(m) = self.map(v, "groups") else {
             return out;
         };
-        for (name, members) in self.entries(m, "groups") {
+        let entries = self.entries(m, "groups");
+        let names: BTreeSet<&str> = entries.iter().map(|(name, _)| *name).collect();
+        // (path, group named as a member), reported once every group is read.
+        let mut nested = Vec::new();
+        for (name, members) in entries {
             let path = join("groups", name);
             self.name(name, &path);
             let mut set = BTreeSet::new();
             for (i, person) in self.strings(members, &path) {
-                self.name(&person, &format!("{path}[{i}]"));
+                let at = format!("{path}[{i}]");
+                if names.contains(person.as_str()) {
+                    nested.push((at, person));
+                    continue;
+                }
+                self.name(&person, &at);
                 set.insert(person);
             }
             if matches!(members, Value::Sequence(s) if s.is_empty()) {
@@ -358,6 +375,25 @@ impl Cx {
                 );
             }
             out.insert(name.to_string(), set);
+        }
+        // A group listed inside a group would otherwise read as a person
+        // with the group's name.
+        for (at, group) in nested {
+            let suggestion = out
+                .get(&group)
+                .filter(|people| !people.is_empty())
+                .map(|people| {
+                    let people: Vec<&str> = people.iter().map(String::as_str).collect();
+                    format!("replace `{group}` with its members: {}", people.join(", "))
+                });
+            self.error_with(
+                &at,
+                "nested_group",
+                format!(
+                    "`{group}` is a group; groups cannot contain groups, so list the people instead"
+                ),
+                suggestion,
+            );
         }
         out
     }

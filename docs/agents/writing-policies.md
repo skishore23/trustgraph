@@ -180,6 +180,7 @@ Work in this order. Do not skip steps.
 | `invalid_name` | A name does not match `^[a-z0-9][a-z0-9_.@-]{0,63}$`. | Use lowercase letters, digits and `_ . @ -`. |
 | `name_collision` | A name is used both as an agent and as a group or person. | Rename one of them. |
 | `empty_group` | A group has no members. | Add members or remove the group. |
+| `nested_group` | A group lists another group (or itself) as a member. Groups cannot contain groups. | List that group's people instead (see `suggestion`). |
 | `empty_set` | A list that must have entries is empty. | Fill it. An empty `readers` or `audience` is never silently "nobody". |
 | `unknown_name` | A reader, audience, reviewer, agent or source is not defined. | Define it, or use the name in `suggestion`. |
 | `invalid_duration` | `valid_for` is not like `30m`, `2h` or `1d`, or is longer than 30 days. | Write a number and `m`, `h` or `d`. |
