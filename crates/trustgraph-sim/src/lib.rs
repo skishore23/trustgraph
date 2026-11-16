@@ -2,6 +2,7 @@
 //! This scheduler models command order and declared I/O failures; it does not
 //! intercept OS threads, HTTP packets, or database internals.
 pub mod checker;
+pub mod policy_sim;
 pub mod trace;
 use std::collections::BTreeMap;
 pub use trace::*;

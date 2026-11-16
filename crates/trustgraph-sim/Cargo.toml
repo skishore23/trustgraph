@@ -9,5 +9,7 @@ workspace = true
 [dependencies]
 trustgraph-core = { path = "../trustgraph-core" }
 trustgraph-runtime = { path = "../trustgraph-runtime" }
+trustgraph-policy = { path = "../trustgraph-policy" }
+trustgraph-engine = { path = "../trustgraph-engine" }
 serde.workspace = true
 serde_json.workspace = true
