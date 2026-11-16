@@ -16,11 +16,18 @@ session read to the next agent's session, so restrictions follow the work.
 | [Claude Agent SDK](#claude-agent-sdk) | `PreToolUse` / `PostToolUse` / `SubagentStart` / `SubagentStop` hooks | Only through tools you did not map; hooks see every tool call, built-in and MCP |
 | [MCP proxy](#mcp-proxy) | A process between any MCP client and one MCP server | Not if the proxy alone holds the upstream's credentials |
 
+In place of a blocked tool's result, every integration gives the agent one of
+three texts: "TrustGraph blocked `<action>`: denied: …" for a deny,
+"TrustGraph held `<action>`: needs approval: … (decision <id>)" for needs
+approval, or "TrustGraph could not complete the check …" when the server
+cannot be reached or refuses. In each case the tool did not run. A source
+result that cannot be registered is withheld from the agent.
+
 A library integration is only as strong as the host program: a tool called
 without the wrapper, or a tool missing from the map, is not checked. The MCP
 proxy is the option an agent cannot skip, provided only the proxy can reach
-the upstream server. Sessions
-over-restrict by design (see [Sessions](sdk-python.md#sessions)).
+the upstream server. Sessions over-restrict by design (see
+[Sessions](sdk-python.md#sessions)).
 
 ## LangChain and LangGraph
 
@@ -32,7 +39,7 @@ pip install "./sdk/python[langchain]"
 
 ```python
 import trustgraph
-from trustgraph.integrations.langchain import Guard, as_action, as_source
+from trustgraph.integrations.langchain import Guard
 
 client = trustgraph.Client(token_file="~/.trustgraph/serve/tokens/planner.token")
 guard = Guard(sources={"read_salaries": "salaries"}, actions={"post_message": "post_to_engineering"})
@@ -52,11 +59,7 @@ with client.session():
   tool-execution step: `ToolNode(tools, wrap_tool_call=guard.wrap_tool_call,
   awrap_tool_call=guard.awrap_tool_call)`, or `middleware=[guard.middleware()]`
   for `create_agent`. Tools in neither map run untouched.
-- **Blocked calls.** The tool does not run; the agent receives a `ToolMessage`
-  with `status="error"`: "TrustGraph blocked …" for a deny, "TrustGraph held …"
-  with the decision id for needs-approval, and "could not complete the check"
-  when the server cannot be reached. A source result that cannot be registered
-  is withheld.
+- **Blocked calls** come back as a `ToolMessage` with `status="error"`.
 - **Sessions.** The current session (`with client.session():` around the run).
   With no session, `Guard(..., client=client)` keeps one session per LangGraph
   `thread_id` for the life of the guard; otherwise mapped tools are refused.
@@ -99,10 +102,7 @@ result = guard.run_sync(planner, "Post the Q3 plan")
   before the model sees it. `as_source(tool, ...)` and `as_action(tool, ...)`
   return a guarded copy of one `FunctionTool`; `guard.protect(*agents)` does
   this for every mapped tool of those agents.
-- **Blocked calls.** The guardrail returns `reject_content`: the tool does
-  not run, or its result is withheld, and the model receives "TrustGraph
-  blocked …", "TrustGraph held …" (needs approval, with the decision id) or
-  "could not complete the check".
+- **Blocked calls** are the guardrail's `reject_content`.
 - **Sessions.** `guard.run` / `guard.run_sync` give each agent of the run its
   own session, from its entry in `clients`; an agent with no client is
   refused. Without `Guard.run`, the guardrails use the current session
@@ -146,11 +146,9 @@ async with ClaudeSDKClient(ClaudeAgentOptions(hooks=guard.hooks(), mcp_servers=s
   recorded with its `tool_input` (or `Action(..., content=lambda args: ...)`)
   and checked in `PreToolUse`; a mapped source's `tool_response` is
   registered in `PostToolUse`.
-- **Blocked calls.** `PreToolUse` answers `permissionDecision: "deny"` with
-  "TrustGraph blocked …", "TrustGraph held …" (needs approval, with the
-  decision id) or "could not complete the check" as the reason. Needs approval
-  is a deny, not "ask": the SDK's own permission prompt would let someone
-  approve around the operator.
+- **Blocked calls** are `permissionDecision: "deny"` with the text as the
+  reason. Needs approval is a deny too, not "ask": the SDK's own permission
+  prompt would let someone approve around the operator.
 - **Fail closed.** Every matcher is `on_failure="block"`, so a hook that raises
   or times out blocks the tool. The SDK keeps a tool's result when a
   `PostToolUse` hook fails, so the source hook never raises: if the result
@@ -162,8 +160,10 @@ async with ClaudeSDKClient(ClaudeAgentOptions(hooks=guard.hooks(), mcp_servers=s
 - **Subagents.** Each subagent (`agent_id`) gets its own session, from
   `subagents={agent_type: client}` or the main client. It starts with what its
   parent had seen, because its prompt was written by the parent, and when it
-  stops the parent receives what it saw. A subagent not cleared for its
-  parent's sources does not start, and its mapped tools are refused.
+  stops the parent receives what it saw. For a subagent not cleared for its
+  parent's sources the `SubagentStart` hook fails, which with
+  `on_failure="block"` keeps it from starting, and its mapped tools are
+  refused either way.
   Example: [examples/integrations/claude-agent-sdk](../examples/integrations/claude-agent-sdk).
 
 Not covered: the tests drive the real `ClaudeSDKClient` hook dispatch with a
@@ -207,10 +207,8 @@ Point the MCP client at the proxy command instead of the server.
   untracked; `block` hides them from listings and refuses them. Without
   `unmapped:`, the proxy uses `unclassified` if the active policy defines that
   source and `block` otherwise.
-- **Blocked calls** return an MCP error result ("TrustGraph blocked …",
-  "TrustGraph held …" with the decision id, or "could not complete the
-  check") and are not forwarded. A result that cannot be registered is
-  withheld.
+- **Blocked calls** are an MCP error result (`isError`) and are not
+  forwarded.
 - **Sessions.** One per proxy process. `--handoff-file PATH` writes the hand-off
   token after every read; `--carry TOKEN` (or `TRUSTGRAPH_CARRY`) starts from
   one. If this agent is not cleared for what the token carries, the proxy does

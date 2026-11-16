@@ -1,0 +1,102 @@
+name: Python SDK
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'sdk/python/**'
+      - 'crates/**'
+      - 'examples/integrations/**'
+      - 'examples/policies/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/sdk-python.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'sdk/python/**'
+      - 'crates/**'
+      - 'examples/integrations/**'
+      - 'examples/policies/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/sdk-python.yml'
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build trustgraph
+        run: cargo build --locked -p trustgraph-cli
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trustgraph
+          path: target/debug/trustgraph
+          retention-days: 1
+
+  sdk:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: trustgraph
+          path: bin
+      - run: chmod +x bin/trustgraph
+      - name: Install the SDK
+        run: pip install "./sdk/python[test]"
+      - name: Unit and integration tests
+        env:
+          TRUSTGRAPH_BIN: ${{ github.workspace }}/bin/trustgraph
+        run: pytest -q sdk/python/tests --ignore=sdk/python/tests/integrations
+
+  framework:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - extra: langchain
+            module: langgraph
+            tests: test_langchain.py
+          - extra: openai-agents
+            module: agents
+            tests: test_openai_agents.py
+          - extra: claude-agent-sdk
+            module: claude_agent_sdk
+            tests: test_claude_agent_sdk.py
+          - extra: mcp
+            module: mcp
+            tests: test_mcp.py
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: trustgraph
+          path: bin
+      - run: chmod +x bin/trustgraph
+      - name: Install the SDK with ${{ matrix.extra }}
+        run: pip install "./sdk/python[${{ matrix.extra }},test]"
+      - name: The framework imports (so its tests cannot skip)
+        run: python -c "import ${{ matrix.module }}"
+      - name: Integration tests
+        env:
+          TRUSTGRAPH_BIN: ${{ github.workspace }}/bin/trustgraph
+          OPENAI_AGENTS_DISABLE_TRACING: '1'
+        run: pytest -q sdk/python/tests/integrations/${{ matrix.tests }}

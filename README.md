@@ -97,12 +97,13 @@ PASS roadmap summary can be posted
 A policy carries its own tests. Each one states what the agent read, what it
 tries to do and the answer you expect.
 
-Read a policy back in plain English, and see exactly who gains access when it
-changes:
+Read a policy back in plain English, see exactly who gains access when it
+changes, and run it through the simulator:
 
 ```sh
 trustgraph policy explain trustgraph.policy.yaml
 trustgraph policy diff old.policy.yaml new.policy.yaml
+trustgraph policy simulate trustgraph.policy.yaml
 ```
 
 ```text
@@ -110,15 +111,7 @@ salaries: output can reach hr (nina). Usable by agent planner.
 email_customer: mailer may send to customers (acme) after approval by sales (leo), valid 30m.
 
 WIDENS  source salaries: readers gained ravi, sam
-```
 
-Run your own policy through the simulator:
-
-```sh
-trustgraph policy simulate trustgraph.policy.yaml
-```
-
-```text
 64 runs, 12,936 events: 994 allow, 5,082 deny, 392 needs_approval — 0 violations
 ```
 
@@ -159,33 +152,48 @@ curl -s localhost:8787/v1/check \
 
 The API, the MCP endpoint, tokens, the operator page, limits and the threat
 model are in [docs/serve.md](docs/serve.md).
-[examples/python_client.py](examples/python_client.py) is a client with no
-dependencies.
+
+### From Python
+
+Mark what reads a source and what acts; inside a session, what was read
+follows what is written ([SDK reference](docs/sdk-python.md)):
+
+```python
+import trustgraph
+
+client = trustgraph.Client(token_file="~/.trustgraph/serve/tokens/planner.token")
+
+@trustgraph.source("salaries")
+def read_salaries():
+    return "nina: 120k, sam: 95k"
+
+@trustgraph.action("post_to_slack", content=lambda args, kwargs: args[0])
+def post_to_slack(text):
+    print("posted:", text)               # runs only on allow
+
+with client.session():
+    read_salaries()
+    try:
+        post_to_slack("Q3 headcount plan")
+    except trustgraph.Denied as e:
+        print(e.decision.verdict, e.decision.reason)
+```
+
+```text
+deny denied: `salaries` is readable by hr only; engineering (ravi, sam) is not included
+```
+
+Integrations, each with a hand-off example: [LangChain / LangGraph, OpenAI
+Agents SDK, Claude Agent SDK and an MCP proxy](docs/integrations.md). A
+wrapper checks only the tools it wraps; the MCP proxy cannot be skipped when
+it alone holds the upstream's credentials.
 
 ### Rust crates
 
-```rust
-use trustgraph_policy::{decide, parse, Query, Verdict};
-
-let policy = parse(&policy_yaml).policy.expect("valid policy");
-let outcome = decide(&policy, &Query {
-    output_from: ["salaries", "roadmap"].map(String::from).into(),
-    agent: "planner".into(),
-    action: "post_to_slack".into(),
-    recipients: None, // the action's whole audience
-});
-assert_eq!(outcome.verdict, Verdict::Deny);
-println!("{}", outcome.reason);
-```
-
-```sh
-cargo run -p trustgraph-policy --example decide
-```
-
-| Crate | Use it for |
-| --- | --- |
-| [`trustgraph-policy`](crates/trustgraph-policy) | Parse, validate, test, explain and diff policies. `decide` is a pure function. |
-| [`trustgraph-engine`](crates/trustgraph-engine) | The journaled runtime `trustgraph serve` runs: it records sources and outputs, tracks approvals and survives restarts. |
+[`trustgraph-policy`](crates/trustgraph-policy) parses, tests, explains and
+diffs policies, and `decide` is a pure function (`cargo run -p
+trustgraph-policy --example decide`). [`trustgraph-engine`](crates/trustgraph-engine)
+is the journaled runtime `trustgraph serve` runs.
 
 ## How we know it works
 
@@ -232,7 +240,9 @@ read. TrustGraph decides where what it wrote may go. Use both.
 | `crates/trustgraph-framework` | The lineage graph the engine is built on |
 | `crates/trustgraph-sim` | The seeded policy simulator and its safety checks |
 | `crates/trustgraph-cli` | The `trustgraph` command: `policy` and `serve` |
+| `sdk/python` | The Python SDK and its framework integrations |
 | `examples/policies` | Six worked policies |
+| `examples/integrations` | A hand-off example per integration |
 | `docs/agents` | The policy-writing guide for agents |
 | `web`, `api`, `hosted` | The public site and its playground endpoint |
 

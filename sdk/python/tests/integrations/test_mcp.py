@@ -16,6 +16,7 @@ pytest.importorskip("yaml")
 from mcp import Client as McpClient  # noqa: E402
 from mcp.client.stdio import StdioServerParameters  # noqa: E402
 
+from trustgraph import TrustGraphError  # noqa: E402
 from trustgraph.integrations.mcp import Proxy, load_mapping  # noqa: E402
 
 from ..conftest import POLICIES, Server, start  # noqa: E402
@@ -144,6 +145,15 @@ actions:
         assert denied.is_error and "`salaries` is readable by hr only" in text(denied)
 
     asyncio.run(with_proxy(handoff_server, m, planner, carry=handoff.read_text()))
+
+
+def test_uncleared_carry_refuses_to_start(handoff_server: Server, tmp_path: Path) -> None:
+    with handoff_server.client("planner").session() as p:
+        p.read("roadmap", "Q3")  # researcher is not listed for roadmap
+        token = p.handoff()
+    with pytest.raises(TrustGraphError) as e:
+        Proxy(handoff_server.client("researcher"), mapping(tmp_path), UPSTREAM, carry=token)
+    assert e.value.code == "unknown_artifact"
 
 
 def test_server_down_fails_closed(server: Server, tmp_path: Path) -> None:

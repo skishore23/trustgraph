@@ -7,11 +7,14 @@
 - [Writing policies (agent guide)](docs/agents/writing-policies.md): the file format, the check, test, explain and diff loop, every diagnostic code, and the rules for proposing changes.
 - [Starter policy](crates/trustgraph-policy/starter.policy.yaml): the commented file written by `trustgraph policy init`.
 - [trustgraph serve](docs/serve.md): the local HTTP API and MCP endpoint agents use to register what they read, record what they wrote and check right before they act; per-agent tokens, the operator page, limits and the threat model.
+- [Python SDK](docs/sdk-python.md): `trustgraph.Client`, sessions (what was read follows what is written), `@source` / `@action` decorators, hand-off tokens, exceptions and fail-closed behaviour.
+- [Integrations](docs/integrations.md): LangChain / LangGraph, OpenAI Agents SDK, Claude Agent SDK and an MCP proxy; what each covers and what it does not.
 
 ## Examples
 
 - [examples/policies/](examples/policies/): six complete, tested policies (handoff, slack-digest, customer-email, pull-request-bot, support-replies, multi-agent-research).
 - [examples/python_client.py](examples/python_client.py): a dependency-free client for `trustgraph serve`.
+- [examples/integrations/](examples/integrations/): a hand-off example per integration (langgraph, openai-agents, claude-agent-sdk, mcp).
 
 ## Commands
 
