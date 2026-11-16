@@ -2899,3 +2899,57 @@ async fn c2_concurrent_identical_retries_release_one_call() {
     assert_eq!(forwarded, 1, "{results:?}");
     assert_eq!(slack_calls(&h).len(), 1);
 }
+
+#[tokio::test]
+async fn m8_after_concurrent_retries_the_losers_call_stays_approvable() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Arc::new(memory(dir.path(), "agent").await);
+    let operator = h.login().await;
+    let planner = h.connect("planner").await;
+    ok(&h.read(&planner, "Product/roadmap.md").await);
+    let args = json!({"channel": "#leadership", "text": "Q3 plan"});
+    let mut connections = Vec::new();
+    for _ in 0..3 {
+        connections.push(Arc::new(h.connect("planner").await));
+    }
+    for round in 0..10 {
+        let held = h.call(&planner, "slack__post_message", args.clone()).await;
+        assert_eq!(error_code(&held), "needs_approval", "{held}");
+        let decision = decision_of(&held);
+        let (status, body) = h
+            .op_post(
+                "/v1/operator/approve",
+                &operator,
+                json!({"decision": decision}),
+            )
+            .await;
+        assert_eq!(status, 200, "round {round}: {body}");
+        let mut tasks = Vec::new();
+        for c in &connections {
+            let (h, c, args) = (h.clone(), c.clone(), args.clone());
+            tasks.push(tokio::spawn(async move {
+                h.call(&c, "slack__post_message", args).await
+            }));
+        }
+        let mut forwarded = 0;
+        for t in tasks {
+            if t.await.unwrap()["isError"] != true {
+                forwarded += 1;
+            }
+        }
+        assert_eq!(forwarded, 1, "round {round}");
+        assert_eq!(slack_calls(&h).len(), round + 1);
+        // Every loser was held again: the operator still sees exactly what
+        // it would forward, so the next approval can be given.
+        let state = h.op_state(&operator).await;
+        let pending = state["pending"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["decision"] == decision.as_str())
+            .unwrap_or_else(|| panic!("round {round}: not pending: {state}"))
+            .clone();
+        assert_eq!(pending["gateway"]["held"], true, "round {round}: {pending}");
+        assert_eq!(pending["can_approve"], true, "round {round}: {pending}");
+    }
+}

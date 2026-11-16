@@ -162,11 +162,54 @@ struct HeldCall {
     sha256: String,
 }
 
+/// Held calls by decision id, each with the generation it was held at.
+/// Identical calls share a decision id, so a call released by an approval
+/// may already have been held again by a concurrent identical retry that
+/// was refused; the generation lets the release leave that one alone.
 #[derive(Default)]
 struct Held {
-    calls: BTreeMap<String, HeldCall>,
+    calls: BTreeMap<String, (u64, HeldCall)>,
     /// Decision ids, oldest first.
     order: VecDeque<String>,
+    /// The generation the next hold gets.
+    next: u64,
+}
+
+impl Held {
+    /// The generation now: every call held from here on is newer.
+    fn generation(&self) -> u64 {
+        self.next
+    }
+
+    fn hold(&mut self, decision: &str, call: HeldCall) {
+        let generation = self.next;
+        self.next += 1;
+        if self
+            .calls
+            .insert(decision.to_string(), (generation, call))
+            .is_none()
+        {
+            self.order.push_back(decision.to_string());
+        }
+        while self.order.len() > MAX_HELD_CALLS {
+            if let Some(old) = self.order.pop_front() {
+                self.calls.remove(&old);
+            }
+        }
+    }
+
+    /// Forget the call an approval released: only if it was held before
+    /// `before`, the generation when the releasing call's check began.
+    fn release(&mut self, decision: &str, before: u64) {
+        if self
+            .calls
+            .get(decision)
+            .is_some_and(|(generation, _)| *generation < before)
+        {
+            self.calls.remove(decision);
+            self.order.retain(|d| d != decision);
+        }
+    }
 }
 
 /// What the server's operator routes see of the gateway.
@@ -211,22 +254,15 @@ impl Shared {
     }
 
     fn hold(&self, decision: &str, call: HeldCall) {
-        let mut held = lock(&self.held);
-        if held.calls.insert(decision.to_string(), call).is_none() {
-            held.order.push_back(decision.to_string());
-        }
-        while held.order.len() > MAX_HELD_CALLS {
-            if let Some(old) = held.order.pop_front() {
-                held.calls.remove(&old);
-            }
-        }
+        lock(&self.held).hold(decision, call);
     }
 
-    fn release(&self, decision: &str) {
-        let mut held = lock(&self.held);
-        if held.calls.remove(decision).is_some() {
-            held.order.retain(|d| d != decision);
-        }
+    fn held_generation(&self) -> u64 {
+        lock(&self.held).generation()
+    }
+
+    fn release(&self, decision: &str, before: u64) {
+        lock(&self.held).release(decision, before);
     }
 
     /// Close an MCP session in the background.
@@ -423,7 +459,7 @@ impl GatewayView for Shared {
 
     fn held_call(&self, decision: &str) -> Option<Value> {
         let held = lock(&self.held);
-        let call = held.calls.get(decision)?;
+        let (_, call) = held.calls.get(decision)?;
         let arguments: Vec<Value> = canonical_map(&call.arguments)
             .iter()
             .map(|(name, value)| shown_argument(name, value))
@@ -504,8 +540,9 @@ pub fn canonical_arguments(arguments: &JsonObject) -> Vec<u8> {
 
 /// What a checked action call may do.
 enum Forward {
-    /// Allowed; `Some(decision)` when an approval allowed it and was used up.
-    Checked(Option<String>),
+    /// Allowed; `Some((decision, generation))` when an approval allowed it
+    /// and was used up, with the held-call generation before the check.
+    Checked(Option<(String, u64)>),
     /// `allow_without_reads` and the session has read nothing.
     Unchecked,
 }
@@ -1042,7 +1079,9 @@ impl<J: ServeJournal> Gateway<J> {
                         "trustgraph gateway: `{}` was called with nothing read and forwarded without a check (allow_without_reads)",
                         tool.exposed
                     ),
-                    Forward::Checked(Some(decision)) => self.shared.release(&decision),
+                    Forward::Checked(Some((decision, before))) => {
+                        self.shared.release(&decision, before)
+                    }
                     Forward::Checked(None) => {}
                 }
                 Ok(self.forward(&tool, arguments).await?.0)
@@ -1266,6 +1305,9 @@ impl<J: ServeJournal> Gateway<J> {
             .ok_or_else(|| ToolFail::new("internal", "no artifact id"))?
             .to_string();
         let action = call.action.clone();
+        // Before the check: a concurrent identical call refused after it is
+        // held at a later generation, and the release leaves it alone.
+        let before = self.shared.held_generation();
         let decision = self.server.check_once(
             agent,
             CheckRequest {
@@ -1282,7 +1324,7 @@ impl<J: ServeJournal> Gateway<J> {
         let extra = Some(json!({"decision": id, "verdict": decision["verdict"].clone()}));
         match decision["verdict"].as_str() {
             Some("allow") => Ok(Forward::Checked(
-                (decision["consumed"] == true).then_some(id),
+                (decision["consumed"] == true).then_some((id, before)),
             )),
             Some("needs_approval") => {
                 self.shared.hold(&id, call);
@@ -1835,4 +1877,52 @@ pub fn summary(
         "  {HANDOFF_TOOL} and {RECEIVE_TOOL} pass what a session carries to another agent's session"
     ));
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn call(text: &str) -> HeldCall {
+        HeldCall {
+            tool: "slack__post_message".into(),
+            action: "brief_leadership".into(),
+            content: None,
+            arguments: json!({"text": text}).as_object().cloned().unwrap(),
+            sha256: "00".into(),
+        }
+    }
+
+    /// The interleaving of two identical retries after one approval: the
+    /// winner's check uses the approval up, the loser's check (after it)
+    /// is refused and holds the call again, and only then is the winner's
+    /// release applied. The loser's call must still be held.
+    #[test]
+    fn a_release_never_forgets_a_call_held_again_after_its_check() {
+        let mut held = Held::default();
+        held.hold("d1", call("first"));
+        let winner_before = held.generation();
+        held.hold("d1", call("again"));
+        held.release("d1", winner_before);
+        let (_, kept) = held.calls.get("d1").expect("the loser's call is kept");
+        assert_eq!(kept.arguments["text"], "again");
+        assert_eq!(held.order.len(), 1);
+        // A release with nothing newer forgets it.
+        let before = held.generation();
+        held.release("d1", before);
+        assert!(held.calls.is_empty() && held.order.is_empty());
+        // A release of a decision never held, or already gone, is a no-op.
+        held.release("d2", u64::MAX);
+        assert!(held.calls.is_empty());
+    }
+
+    #[test]
+    fn held_calls_are_capped_oldest_first() {
+        let mut held = Held::default();
+        for i in 0..MAX_HELD_CALLS + 3 {
+            held.hold(&format!("d{i}"), call("x"));
+        }
+        assert_eq!(held.calls.len(), MAX_HELD_CALLS);
+        assert!(!held.calls.contains_key("d0") && held.calls.contains_key("d3"));
+    }
 }

@@ -338,7 +338,8 @@ rule should name only paths whose content you know.
   retries exactly the same call; the gateway forwards it and uses the
   approval up (a journaled revoke), so the same call again needs a new
   approval. A call with any argument changed is a different output and a
-  new decision. Two retries at once release one call.
+  new decision. Two retries at once release one call; the other is held
+  again, with its arguments, and can be approved like the first.
 - **Nothing read.** An action from a session that has read nothing is refused
   with `nothing_read`. With `allow_without_reads: true` on the tool (agent
   mode only), it is forwarded without a check, because the runtime cannot
