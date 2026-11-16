@@ -1766,10 +1766,16 @@ pub async fn main(options: Options, port: u16) -> i32 {
     println!("Agent tokens: {}", server.token_dir().display());
     println!(
         "Policy in force: revision {revision} ({}), digest {short}",
-        if source == "file" {
-            "from the policy file"
-        } else {
+        if source != "file" {
             "activated in service"
+        } else if server
+            .startup_report()
+            .first()
+            .is_some_and(|line| line.starts_with("The policy file differs"))
+        {
+            "from an earlier version of the policy file"
+        } else {
+            "from the policy file"
         }
     );
     println!("Operator: {}", server.settings().operator);
