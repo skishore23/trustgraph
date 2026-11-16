@@ -19,11 +19,59 @@
     return String(id || '').slice(0, 12);
   }
 
-  // Exactly what an approval grants, repeated in the confirmation step.
+  // Exactly what an approval grants, repeated in the confirmation step. A
+  // call the gateway holds names its tool and the hash of its arguments:
+  // the approval releases that one call, once.
   function approvalSummary(p) {
+    var call = p.gateway && p.gateway.held ? p.gateway : null;
     return 'Approve: ' + p.agent + ' may ' + p.action + ' to ' + list(p.recipients) +
-      ', from ' + list(p.sources) + ' (decision ' + shortId(p.decision) + '…).';
+      ', from ' + list(p.sources) +
+      (call ? ', as one call of ' + neutralise(call.tool) + ' with arguments ' + shortId(call.sha256) + '…' : '') +
+      ' (decision ' + shortId(p.decision) + '…).';
   }
+
+  // Agent-supplied text, made safe to read: control characters, bidi
+  // overrides and invisible characters are shown as escapes (\x1b,
+  // \u202e), so nothing can reorder, hide or restyle what the operator
+  // reads. The page only ever sets it as textContent.
+  function neutralise(text) {
+    return String(text === undefined || text === null ? '' : text).replace(
+      /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g,
+      function (c) {
+        var code = c.charCodeAt(0);
+        var hex = code.toString(16);
+        return code < 0x100
+          ? '\\x' + (hex.length < 2 ? '0' : '') + hex
+          : '\\u' + ('0000' + hex).slice(-4);
+      }
+    );
+  }
+
+  // The lines that show a call the gateway holds: its tool and action,
+  // where it goes, every forwarded argument (each cut at 2,000 characters
+  // with a marker) and the SHA-256 of the full arguments.
+  function callLines(p) {
+    var call = p.gateway;
+    if (!call) return [];
+    var lines = [{ text: 'gateway call: ' + neutralise(call.tool) + ' → ' + p.action + ' → ' + list(p.recipients) }];
+    if (!call.held) {
+      lines.push({ text: 'The gateway no longer has this call (it restarted). The agent must retry it before it can be approved.', cls: 'warn' });
+      return lines;
+    }
+    lines.push({ text: 'forwarded arguments, exactly:', cls: 'muted' });
+    (call.arguments || []).forEach(function (a) {
+      lines.push({ text: neutralise(a.name) + ':', cls: 'muted' });
+      lines.push({
+        text: neutralise(a.value) + (a.more ? '\n… truncated — ' + a.more + ' more characters' : ''),
+        cls: 'value'
+      });
+    });
+    lines.push({ text: 'SHA-256 of the full arguments: ' + call.sha256, cls: 'muted' });
+    return lines;
+  }
+
+  var CONTEXT_NOTE = 'Ending a session makes the gateway forget what it read and closes its connections; ' +
+    'the agent keeps whatever is already in its own context. Stop or restart the agent first.';
 
   // The confirmation keys the page would render for `state`: an Approve for
   // each pending decision the operator can approve, an Activate for each
@@ -39,7 +87,23 @@
     gatewaySessions(state).forEach(function (s) {
       keys.push('end:' + s.session);
     });
+    gatewayConnections(state).forEach(function (c) {
+      keys.push('close:' + c.connection);
+    });
     return keys;
+  }
+
+  function gatewayConnections(state) {
+    return (state.gateway && state.gateway.connections) || [];
+  }
+
+  // Agents at the connection cap: new connections are refused, never
+  // evicted, so the operator ends leaked ones here.
+  function capNotice(state) {
+    var gateway = state.gateway;
+    if (!gateway || !gateway.at_cap || !gateway.at_cap.length) return '';
+    return gateway.at_cap.join(', ') + ' holds the most open connections allowed (' +
+      gateway.max_connections_per_agent + '); new connections are refused until some are ended below.';
   }
 
   function gatewaySessions(state) {
@@ -101,7 +165,11 @@
 
   var api = {
     GONE: GONE,
+    CONTEXT_NOTE: CONTEXT_NOTE,
     approvalSummary: approvalSummary,
+    callLines: callLines,
+    capNotice: capNotice,
+    neutralise: neutralise,
     confirmableKeys: confirmableKeys,
     endSummary: endSummary,
     proposer: proposer,
@@ -231,6 +299,9 @@
       var item = el('div', null, 'item');
       item.appendChild(el('p', p.agent + ' wants ' + p.action + ' → ' + list(p.recipients)));
       item.appendChild(el('p', 'derived from: ' + list(p.sources)));
+      callLines(p).forEach(function (line) {
+        item.appendChild(el(line.cls === 'value' ? 'pre' : 'p', line.text, line.cls));
+      });
       item.appendChild(el('p', p.reason, 'muted'));
       item.appendChild(el('p', 'asked ' + clock(p.requested_at) + ' · decision ' + shortId(p.decision), 'muted'));
       if (!p.can_approve) {
@@ -307,10 +378,14 @@
     (gateway.problems || []).forEach(function (line) {
       problems.appendChild(el('p', line, 'warn'));
     });
+    var cap = capNotice(state);
+    if (cap) problems.appendChild(el('p', cap, 'warn'));
+    renderConnections(state);
     var box = $('sessions');
     box.replaceChildren();
     var sessions = gatewaySessions(state);
     if (!sessions.length) return empty(box, 'No live sessions (' + gateway.mode + ' mode).');
+    box.appendChild(el('p', CONTEXT_NOTE, 'muted'));
     sessions.forEach(function (s) {
       var key = 'end:' + s.session;
       var item = el('div', null, 'item');
@@ -318,11 +393,37 @@
       item.appendChild(el('p', 'carries: ' + (s.sources.length ? s.sources.join(', ') : 'nothing yet')));
       item.appendChild(el('p', 'session ' + s.session, 'muted'));
       if (confirming === key) {
-        confirmStep(item, key, endSummary(s), 'End now', function () {
+        confirmStep(item, key, endSummary(s) + ' ' + CONTEXT_NOTE, 'End now', function () {
           act('/v1/operator/end-session', { session: s.session }, 'Ended the session of ' + s.agent + '.');
         });
       } else {
         item.appendChild(button('End session', key, false, function () {
+          confirming = key;
+          load(true, 'yes:' + key);
+        }));
+      }
+      box.appendChild(item);
+    });
+  }
+
+  // Every open MCP connection, with its last activity. Connections never
+  // idle out (that would shed what they read), so leaked ones end here.
+  function renderConnections(state) {
+    var box = $('connections');
+    box.replaceChildren();
+    var connections = gatewayConnections(state);
+    if (!connections.length) return empty(box, 'No open connections.');
+    connections.forEach(function (c) {
+      var key = 'close:' + c.connection;
+      var item = el('div', null, 'item');
+      item.appendChild(el('p', c.agent + ' · opened ' + clock(c.started_at) + ' · last active ' + clock(c.last_active)));
+      item.appendChild(el('p', 'connection ' + c.connection + ' · session ' + c.session, 'muted'));
+      if (confirming === key) {
+        confirmStep(item, key, 'End this connection? The session it serves keeps what it read; the client must connect again.', 'End now', function () {
+          act('/v1/operator/end-connection', { connection: c.connection }, 'Ended a connection of ' + c.agent + '.');
+        });
+      } else {
+        item.appendChild(button('End connection', key, false, function () {
           confirming = key;
           load(true, 'yes:' + key);
         }));
