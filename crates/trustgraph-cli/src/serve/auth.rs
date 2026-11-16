@@ -225,7 +225,7 @@ mod tests {
     #[test]
     fn launch_secret_is_single_use_and_sessions_are_cookie_only() {
         let dir = tempfile::tempdir().unwrap();
-        let sessions = OwnerSessions::new("8080", SESSION_LIFETIME);
+        let sessions = OwnerSessions::new("8787", SESSION_LIFETIME);
         let launch = sessions.launch_secret().unwrap();
         let file = dir.path().join("operator.html");
         sessions.write_launch_file(&file, &launch).unwrap();
@@ -244,7 +244,7 @@ mod tests {
         );
         let set_cookie = sessions.exchange(&launch).unwrap();
         assert!(set_cookie.contains("HttpOnly") && set_cookie.contains("SameSite=Strict"));
-        assert!(set_cookie.starts_with("trustgraph_owner_8080="));
+        assert!(set_cookie.starts_with("trustgraph_owner_8787="));
         assert!(!file.exists(), "launch file is removed after exchange");
         assert!(
             sessions.exchange(&launch).is_none(),
@@ -259,9 +259,9 @@ mod tests {
         )])));
         assert!(!sessions.valid(&headers(&[(
             header::COOKIE,
-            &format!("trustgraph_owner_8080={launch}")
+            &format!("trustgraph_owner_8787={launch}")
         )])));
-        let other_port = OwnerSessions::new("8084", SESSION_LIFETIME);
+        let other_port = OwnerSessions::new("8789", SESSION_LIFETIME);
         assert_ne!(other_port.cookie_name(), sessions.cookie_name());
         assert!(!other_port.valid(&headers(&[(header::COOKIE, cookie_value)])));
     }
@@ -277,30 +277,30 @@ mod tests {
 
     #[test]
     fn host_and_origin_are_strict() {
-        for good in ["127.0.0.1:8080", "localhost:8080"] {
-            assert!(loopback_host(&headers(&[(header::HOST, good)]), 8080).is_some());
+        for good in ["127.0.0.1:8787", "localhost:8787"] {
+            assert!(loopback_host(&headers(&[(header::HOST, good)]), 8787).is_some());
         }
         for bad in [
-            "127.0.0.1:8081",
-            "127.0.0.1.evil.test:8080",
-            "evil.test:8080",
+            "127.0.0.1:8788",
+            "127.0.0.1.evil.test:8787",
+            "evil.test:8787",
             "127.0.0.1",
-            "127.0.0.1:08080",
-            "127.0.0.1:+8080",
-            "localhost:8080@evil",
+            "127.0.0.1:08787",
+            "127.0.0.1:+8787",
+            "localhost:8787@evil",
             "",
         ] {
             assert!(
-                loopback_host(&headers(&[(header::HOST, bad)]), 8080).is_none(),
+                loopback_host(&headers(&[(header::HOST, bad)]), 8787).is_none(),
                 "{bad}"
             );
         }
-        assert!(loopback_host(&HeaderMap::new(), 8080).is_none());
+        assert!(loopback_host(&HeaderMap::new(), 8787).is_none());
         let h = headers(&[(header::ORIGIN, "http://evil.test")]);
-        assert!(!same_origin(&h, "127.0.0.1:8080"));
-        let h = headers(&[(header::ORIGIN, "http://127.0.0.1:8080")]);
-        assert!(same_origin(&h, "127.0.0.1:8080"));
-        assert!(same_origin(&HeaderMap::new(), "127.0.0.1:8080"));
+        assert!(!same_origin(&h, "127.0.0.1:8787"));
+        let h = headers(&[(header::ORIGIN, "http://127.0.0.1:8787")]);
+        assert!(same_origin(&h, "127.0.0.1:8787"));
+        assert!(same_origin(&HeaderMap::new(), "127.0.0.1:8787"));
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"abcd"));
