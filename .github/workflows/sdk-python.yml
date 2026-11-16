@@ -69,18 +69,41 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Each framework at the lower bound of its range (the tested versions) and at the latest
+          # version the range allows, so drift inside the range is caught.
           - extra: langchain
             module: langgraph
             tests: test_langchain.py
             example: langgraph
+            bound: lower
+            pins: langchain==1.5.0 langchain-core==1.8.1 langgraph==1.2.22
+          - extra: langchain
+            module: langgraph
+            tests: test_langchain.py
+            example: langgraph
+            bound: latest
           - extra: openai-agents
             module: agents
             tests: test_openai_agents.py
             example: openai-agents
+            bound: lower
+            pins: openai-agents==0.24.0
+          - extra: openai-agents
+            module: agents
+            tests: test_openai_agents.py
+            example: openai-agents
+            bound: latest
           - extra: claude-agent-sdk
             module: claude_agent_sdk
             tests: test_claude_agent_sdk.py
             example: claude-agent-sdk
+            bound: lower
+            pins: claude-agent-sdk==0.2.182
+          - extra: claude-agent-sdk
+            module: claude_agent_sdk
+            tests: test_claude_agent_sdk.py
+            example: claude-agent-sdk
+            bound: latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -91,8 +114,8 @@ jobs:
           name: trustgraph
           path: bin
       - run: chmod +x bin/trustgraph
-      - name: Install the SDK with ${{ matrix.extra }}
-        run: pip install "./sdk/python[${{ matrix.extra }},test]"
+      - name: Install the SDK with ${{ matrix.extra }} (${{ matrix.bound }})
+        run: pip install --upgrade "./sdk/python[${{ matrix.extra }},test]" ${{ matrix.pins }}
       - name: The framework imports (so its tests cannot skip)
         run: python -c "import ${{ matrix.module }}"
       - name: Integration tests
