@@ -2064,6 +2064,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "trustgraph-core",
+ "trustgraph-engine",
  "trustgraph-framework",
  "trustgraph-policy",
 ]

@@ -101,7 +101,9 @@ pub enum Reply {
 }
 
 /// Deliberate bugs the simulator injects to prove its invariants catch them.
-/// `Fault::None` is the only value production code uses.
+/// `Fault::None` is the only value production code uses. Only built with the
+/// `fault-injection` feature, which normal builds leave off.
+#[cfg(feature = "fault-injection")]
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Fault {

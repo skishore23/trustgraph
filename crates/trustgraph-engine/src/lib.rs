@@ -12,6 +12,8 @@ mod rules;
 mod runtime;
 
 pub use engine::Engine;
-pub use event::{Event, Fault, Reply};
+#[cfg(feature = "fault-injection")]
+pub use event::Fault;
+pub use event::{Event, Reply};
 pub use journal::{FileJournal, Journal, JournalError, MemoryJournal, Record};
 pub use runtime::{OpenError, Runtime};

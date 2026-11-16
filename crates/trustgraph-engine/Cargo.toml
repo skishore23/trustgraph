@@ -8,6 +8,11 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Deliberate engine bugs (`Fault`) for the simulator. Never enable in a
+# production build: one fault answers `Check` without `decide`.
+fault-injection = []
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
@@ -18,4 +23,6 @@ trustgraph-framework = { path = "../trustgraph-framework" }
 trustgraph-policy = { path = "../trustgraph-policy" }
 
 [dev-dependencies]
+# The crate's own tests also exercise the injected faults.
+trustgraph-engine = { path = ".", features = ["fault-injection"] }
 tempfile.workspace = true

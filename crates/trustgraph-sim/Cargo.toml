@@ -10,6 +10,6 @@ workspace = true
 trustgraph-core = { path = "../trustgraph-core" }
 trustgraph-runtime = { path = "../trustgraph-runtime" }
 trustgraph-policy = { path = "../trustgraph-policy" }
-trustgraph-engine = { path = "../trustgraph-engine" }
+trustgraph-engine = { path = "../trustgraph-engine", features = ["fault-injection"] }
 serde.workspace = true
 serde_json.workspace = true

@@ -5,7 +5,9 @@ use thiserror::Error;
 use trustgraph_policy::{Diagnostic, Severity, lint, parse, run_tests};
 
 use crate::engine::Engine;
-use crate::event::{Event, Fault, Reply};
+#[cfg(feature = "fault-injection")]
+use crate::event::Fault;
+use crate::event::{Event, Reply};
 use crate::journal::{GENESIS_PREV, Journal, JournalError, Record};
 
 #[derive(Debug, Error)]
@@ -67,17 +69,28 @@ fn engine_rejected(message: String) -> OpenError {
 
 impl<J: Journal> Runtime<J> {
     pub fn open(journal: J, policy_yaml: &str, at: u64) -> Result<Self, OpenError> {
-        Self::open_with_fault(journal, policy_yaml, at, Fault::None)
+        Self::open_engine(journal, policy_yaml, at, Engine::new)
     }
 
     /// Like `open`, with a deliberate engine bug for the simulator. The fault
     /// applies to replay and to live handling alike.
+    #[cfg(feature = "fault-injection")]
     #[doc(hidden)]
     pub fn open_with_fault(
-        mut journal: J,
+        journal: J,
         policy_yaml: &str,
         at: u64,
         fault: Fault,
+    ) -> Result<Self, OpenError> {
+        Self::open_engine(journal, policy_yaml, at, || Engine::new().with_fault(fault))
+    }
+
+    /// `open`, building every engine it needs with `new_engine`.
+    fn open_engine(
+        mut journal: J,
+        policy_yaml: &str,
+        at: u64,
+        new_engine: impl Fn() -> Engine,
     ) -> Result<Self, OpenError> {
         let wanted = validate(policy_yaml)?;
         let genesis = |policy_yaml: &str| Event::Genesis {
@@ -86,14 +99,12 @@ impl<J: Journal> Runtime<J> {
         let records = journal.load()?;
         if records.is_empty() {
             // Nothing may be journaled that the engine would refuse.
-            let reply = Engine::new()
-                .with_fault(fault)
-                .apply(at, &genesis(policy_yaml));
+            let reply = new_engine().apply(at, &genesis(policy_yaml));
             if let Reply::Rejected { code: _, message } = reply {
                 return Err(engine_rejected(message));
             }
         }
-        let mut engine = Engine::new().with_fault(fault);
+        let mut engine = new_engine();
         let mut previous_at = 0;
         // Digest of the policy in the last Genesis the engine accepted.
         let mut file_digest: Option<String> = None;

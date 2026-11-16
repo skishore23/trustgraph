@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 
-use trustgraph_engine::{Engine, Event, Fault, Reply};
+#[cfg(feature = "fault-injection")]
+use trustgraph_engine::Fault;
+use trustgraph_engine::{Engine, Event, Reply};
 use trustgraph_policy::{Query, Verdict, decide, parse};
 
 const SPEC: &str = include_str!("../../trustgraph-policy/tests/fixtures/spec-example.policy.yaml");
@@ -379,11 +381,15 @@ fn removed_then_readded_source() {
 
 #[test]
 fn policy_change_voids_approvals() {
-    for (fault, survives) in [
-        (Fault::None, false),
-        (Fault::KeepApprovalsAcrossPolicyChange, true),
-    ] {
-        let mut engine = Engine::new().with_fault(fault);
+    #[allow(unused_mut)]
+    let mut cases = vec![("no fault", Engine::new(), false)];
+    #[cfg(feature = "fault-injection")]
+    cases.push((
+        "KeepApprovalsAcrossPolicyChange",
+        Engine::new().with_fault(Fault::KeepApprovalsAcrossPolicyChange),
+        true,
+    ));
+    for (fault, mut engine, survives) in cases {
         engine.apply(
             0,
             &Event::Genesis {
@@ -420,7 +426,7 @@ fn policy_change_voids_approvals() {
         } else {
             Verdict::NeedsApproval
         };
-        assert_eq!(verdict(&after), expected, "{fault:?}");
+        assert_eq!(verdict(&after), expected, "{fault}");
     }
 }
 
@@ -898,11 +904,15 @@ fn engine_matches_decide_on_every_example() {
 /// narrowing into a real `Allow`. Without the fault the same check is denied.
 #[test]
 fn graph_only_stale_readers_leaks_after_narrowing() {
-    for (fault, expected) in [
-        (Fault::None, Verdict::Deny),
-        (Fault::GraphOnlyStaleReaders, Verdict::Allow),
-    ] {
-        let mut engine = Engine::new().with_fault(fault);
+    #[allow(unused_mut)]
+    let mut cases = vec![("no fault", Engine::new(), Verdict::Deny)];
+    #[cfg(feature = "fault-injection")]
+    cases.push((
+        "GraphOnlyStaleReaders",
+        Engine::new().with_fault(Fault::GraphOnlyStaleReaders),
+        Verdict::Allow,
+    ));
+    for (fault, mut engine, expected) in cases {
         engine.apply(
             0,
             &Event::Genesis {
@@ -919,11 +929,12 @@ fn graph_only_stale_readers_leaks_after_narrowing() {
         assert_eq!(
             verdict(&check(&mut engine, 5, "planner", &out, "post_to_slack")),
             expected,
-            "{fault:?}"
+            "{fault}"
         );
     }
 }
 
+#[cfg(feature = "fault-injection")]
 #[test]
 fn skipped_reader_refresh_shows_as_mismatch_never_allow() {
     let mut engine = Engine::new().with_fault(Fault::SkipReaderRefresh);

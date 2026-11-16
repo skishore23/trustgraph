@@ -16,7 +16,9 @@ use trustgraph_framework::{
 };
 use trustgraph_policy::{Policy, Query, Verdict, decide, diff, explain};
 
-use crate::event::{Event, Fault, Reply};
+#[cfg(feature = "fault-injection")]
+use crate::event::Fault;
+use crate::event::{Event, Reply};
 use crate::rules::{
     MAX_INPUTS, MAX_RECIPIENTS, action_rule, clip, decision_reply, echo, field, graph_error,
     graph_readers, principals, reject, sha256, validate_policy,
@@ -76,6 +78,7 @@ type OutputKey = (String, String, Vec<String>, String);
 /// The deterministic runtime core. See the crate docs.
 #[derive(Debug, Default)]
 pub struct Engine {
+    #[cfg(feature = "fault-injection")]
     fault: Fault,
     graph: Graph,
     policy: Option<Policy>,
@@ -237,10 +240,33 @@ impl Engine {
             .ok_or_else(|| reject("engine_mismatch", "a lineage source is missing"))
     }
 
+    /// The same engine with a deliberate bug, for the simulator only.
+    #[cfg(feature = "fault-injection")]
     #[doc(hidden)]
     pub fn with_fault(mut self, fault: Fault) -> Self {
         self.fault = fault;
         self
+    }
+
+    /// False only under an injected fault that leaves Graph readers stale.
+    fn refreshes_readers(&self) -> bool {
+        #[cfg(feature = "fault-injection")]
+        if matches!(
+            self.fault,
+            Fault::SkipReaderRefresh | Fault::GraphOnlyStaleReaders
+        ) {
+            return false;
+        }
+        true
+    }
+
+    /// True only under an injected fault that keeps approvals across activation.
+    fn keeps_approvals(&self) -> bool {
+        #[cfg(feature = "fault-injection")]
+        if self.fault == Fault::KeepApprovalsAcrossPolicyChange {
+            return true;
+        }
+        false
     }
 
     fn active(&self) -> Result<&Policy, Reply> {
@@ -255,10 +281,7 @@ impl Engine {
             .checked_add(1)
             .ok_or_else(|| reject("revision_exhausted", "the policy revision cannot grow"))?;
 
-        let refresh = !matches!(
-            self.fault,
-            Fault::SkipReaderRefresh | Fault::GraphOnlyStaleReaders
-        );
+        let refresh = self.refreshes_readers();
         let names: BTreeSet<String> = self
             .rule_names
             .iter()
@@ -317,7 +340,7 @@ impl Engine {
         }
         self.rule_names = names;
 
-        if self.fault != Fault::KeepApprovalsAcrossPolicyChange {
+        if !self.keeps_approvals() {
             for granted in self.approvals.values() {
                 self.graph.revoke_approval(&granted.approval);
             }
@@ -503,41 +526,46 @@ impl Engine {
         );
         let query_id =
             || digest::structured("engine-query-v1", &(artifact, agent, action, recipients)).0;
-        let graph_only = self.fault == Fault::GraphOnlyStaleReaders;
-        if outcome.verdict == Verdict::Deny && !graph_only {
-            return Ok(decision_reply(query_id(), outcome));
-        }
-
-        // `decide` permits it; the Graph must say the same thing.
-        let Some(rule) = policy.actions.get(action) else {
-            if graph_only {
-                return Ok(decision_reply(query_id(), outcome));
-            }
-            return Ok(self.mismatch(query_id(), outcome.verdict, "no such action"));
-        };
-        let people = policy.people(recipients.unwrap_or(&rule.audience));
-        let intent = ActionIntent {
+        let intent = |audience: &BTreeSet<String>| ActionIntent {
             actor: PrincipalId(agent.into()),
             action: action.into(),
             artifact: ArtifactId(artifact.into()),
             destination: action.into(),
-            recipients: principals(people),
+            recipients: principals(policy.people(recipients.unwrap_or(audience))),
             parameters: serde_json::Value::Null,
         };
-        let graph = self.graph.check_action(&intent, None, at);
-        if graph_only {
-            return Ok(match graph {
-                Decision::Allow { context } => Reply::Decision {
-                    id: context.digest,
-                    verdict: Verdict::Allow,
-                    code: Gate::Allowed.code().into(),
-                    reason: "allowed".into(),
-                    blocking: Vec::new(),
-                    expires_at: None,
+
+        // Deliberately wrong, for the simulator only: answer from the Graph
+        // alone without the `decide` gate. Compiled out of normal builds.
+        #[cfg(feature = "fault-injection")]
+        if self.fault == Fault::GraphOnlyStaleReaders {
+            let Some(rule) = policy.actions.get(action) else {
+                return Ok(decision_reply(query_id(), outcome));
+            };
+            return Ok(
+                match self.graph.check_action(&intent(&rule.audience), None, at) {
+                    Decision::Allow { context } => Reply::Decision {
+                        id: context.digest,
+                        verdict: Verdict::Allow,
+                        code: Gate::Allowed.code().into(),
+                        reason: "allowed".into(),
+                        blocking: Vec::new(),
+                        expires_at: None,
+                    },
+                    _ => decision_reply(query_id(), outcome),
                 },
-                _ => decision_reply(query_id(), outcome),
-            });
+            );
         }
+
+        if outcome.verdict == Verdict::Deny {
+            return Ok(decision_reply(query_id(), outcome));
+        }
+        // `decide` permits it; the Graph must say the same thing.
+        let Some(rule) = policy.actions.get(action) else {
+            return Ok(self.mismatch(query_id(), outcome.verdict, "no such action"));
+        };
+        let intent = intent(&rule.audience);
+        let graph = self.graph.check_action(&intent, None, at);
         match (outcome.verdict, graph) {
             (Verdict::Allow, Decision::Allow { context }) => {
                 Ok(decision_reply(context.digest, outcome))
