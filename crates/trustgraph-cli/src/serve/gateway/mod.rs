@@ -42,7 +42,7 @@ use serde_json::{Value, json};
 use trustgraph_engine::{Event, FileJournal, Reply};
 use trustgraph_policy::Policy;
 
-use self::config::{Config, Kind, SessionMode, Tool, UNCLASSIFIED};
+use self::config::{Capability, Config, Kind, SessionMode, Tool, UNCLASSIFIED};
 use self::handoff::{LIFETIME_SECONDS, Payload, Signer};
 use self::upstream::{CallError, Upstreams};
 use super::{
@@ -613,6 +613,9 @@ pub fn schema_report(
     tool: &Tool,
     published: Option<&rmcp::model::Tool>,
 ) -> (Vec<String>, Vec<String>) {
+    if tool.capability == Capability::Disabled {
+        return (Vec::new(), Vec::new());
+    }
     let mut problems = Vec::new();
     let Some(published) = published else {
         problems.push(format!(
@@ -741,6 +744,11 @@ pub fn attach<J: ServeJournal>(
     config: Config,
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Arc<Gateway<J>>, Vec<String>> {
+    if !config.protected {
+        eprintln!(
+            "trustgraph gateway: legacy version 1: outbound read/passthrough arguments are not checked; use version 2 for a protected boundary"
+        );
+    }
     {
         let rt = server.lock().map_err(|e| vec![e.message])?;
         let policy = rt
@@ -821,6 +829,27 @@ fn end_stale_sessions<J: ServeJournal>(
         .filter(|id| mode == SessionMode::Connection || !id.starts_with("agent:"))
         .collect();
     for session in stale {
+        if mode == SessionMode::Agent {
+            // Upgrading a connection-scoped deployment must retain inherited
+            // restrictions. If the union exceeds limits, startup fails closed.
+            if let Some(old) = rt.engine().session(&session) {
+                let target = format!("agent:{}", old.agent);
+                match server.handle(
+                    &mut rt,
+                    Event::SessionCarry {
+                        session: target,
+                        agent: old.agent,
+                        artifacts: old.artifacts,
+                    },
+                )? {
+                    Reply::Session { .. } => {}
+                    Reply::Rejected { code, message } => {
+                        return Err(ApiError::rejected(code, message));
+                    }
+                    _ => return Err(ApiError::internal("cannot migrate gateway context")),
+                }
+            }
+        }
         server.handle(&mut rt, Event::EndSession { session })?;
     }
     Ok(())
@@ -1038,6 +1067,7 @@ impl<J: ServeJournal> Gateway<J> {
                         .config
                         .tools
                         .get(&name)
+                        .filter(|t| t.capability != Capability::Disabled)
                         .cloned()
                         .ok_or_else(ToolFail::not_available)?;
                     config::check_arguments(&tool.arguments, &arguments).map_err(|why| {
@@ -1092,16 +1122,45 @@ impl<J: ServeJournal> Gateway<J> {
         tool: Tool,
         arguments: JsonObject,
     ) -> Result<CallToolResult, ToolFail> {
+        if self.shared.config.protected
+            && let Some(action) = &tool.egress
+        {
+            let held = HeldCall {
+                tool: tool.exposed.clone(),
+                action: action.clone(),
+                content: None,
+                sha256: sha256_hex(&canonical_arguments(&arguments)),
+                arguments: arguments.clone(),
+                constrained: BTreeSet::new(),
+            };
+            let (agent, session, tool) = (agent.clone(), session.clone(), tool.clone());
+            let forward = self
+                .blocking(move |g| g.decide(&agent, &session, &tool, held, false))
+                .await?;
+            if let Forward::Checked(Some((decision, before))) = forward {
+                self.shared.release(&decision, before);
+            }
+        }
         match &tool.kind {
             Kind::Reads { rules, otherwise } => {
-                let source = rules
-                    .iter()
-                    .find(|r| config::when_matches(&r.when, &arguments))
-                    .map_or(otherwise, |r| &r.source)
-                    .clone();
+                let source = if self.shared.config.protected {
+                    // Request paths and upstream claims are not resource attestations.
+                    // Without a service-specific resolver, classify every result with
+                    // the restrictive fallback, including apparently public paths.
+                    otherwise.clone()
+                } else {
+                    rules
+                        .iter()
+                        .find(|r| config::when_matches(&r.when, &arguments))
+                        .map_or(otherwise, |r| &r.source)
+                        .clone()
+                };
                 self.read(agent, session, tool, source, arguments).await
             }
             Kind::Passthrough { untracked: true } => {
+                if self.shared.config.protected {
+                    return Err(ToolFail::not_available());
+                }
                 let tool2 = tool.clone();
                 self.blocking(move |g| g.tool_ok(&tool2)).await?;
                 Ok(self.forward(&tool, arguments).await?.0)
@@ -1159,7 +1218,20 @@ impl<J: ServeJournal> Gateway<J> {
                     }
                     Forward::Checked(None) => {}
                 }
-                Ok(self.forward(&tool, arguments).await?.0)
+                let result = self.forward(&tool, arguments).await?.0;
+                if self.shared.config.protected {
+                    // Never introduce a sink's unclassified response into context.
+                    // Read-and-sink tools must classify and record their responses.
+                    if result.is_error == Some(true) {
+                        return Err(ToolFail::new(
+                            "upstream_failed",
+                            "upstream returned an error",
+                        ));
+                    }
+                    Ok(structured(json!({"forwarded": true})))
+                } else {
+                    Ok(result)
+                }
             }
         }
     }
@@ -1193,6 +1265,9 @@ impl<J: ServeJournal> Gateway<J> {
                 .await?;
         }
         let (mut result, bytes) = self.forward(&tool, arguments).await?;
+        if let Some(meta) = result.meta.as_mut() {
+            meta.remove("trustgraph");
+        }
         let sha = sha256_hex(&bytes);
         let named = source.clone();
         let schema = tool.schema.clone();
@@ -1887,9 +1962,14 @@ pub fn summary(
             SessionMode::Connection =>
                 "each MCP connection is one session; it assumes the host opens a new connection per task with a fresh agent context, and that the agent cannot reconnect at will: a client that reconnects by itself starts with an empty session. Use `session: agent` when the host cannot guarantee that",
             SessionMode::Agent =>
-                "one session per agent for the gateway's lifetime; only the operator can end it",
+                "one durable context per agent across reconnects and restarts; only the operator can retire it",
         }
     )];
+    lines.push(if config.protected {
+        "Boundary: protected version 2. Unclassified tools are disabled; outbound arguments require authorization; read results use the restrictive fallback; sink responses are withheld.".into()
+    } else {
+        "Boundary: legacy version 1. Read and passthrough arguments are not protected egress; this is not the protected deployment.".into()
+    });
     lines.push(format!(
         "Upstreams: {}.",
         config
@@ -1904,7 +1984,12 @@ pub fn summary(
     ));
     lines.push(format!(
         "Agents see {} tools; every other upstream tool is invisible and uncallable:",
-        config.tools.len() + 2
+        config
+            .tools
+            .values()
+            .filter(|tool| tool.capability != Capability::Disabled)
+            .count()
+            + 2
     ));
     let agents_of = |source: &str| {
         policy
@@ -1914,6 +1999,19 @@ pub fn summary(
             .unwrap_or_default()
     };
     for tool in config.tools.values() {
+        if config.protected {
+            lines.push(format!(
+                "  {} capability: {}{}",
+                tool.exposed,
+                tool.capability.as_str(),
+                tool.egress
+                    .as_ref()
+                    .map_or(String::new(), |action| format!(", egress: {action}"))
+            ));
+        }
+        if tool.capability == Capability::Disabled {
+            continue;
+        }
         match &tool.kind {
             Kind::Reads { rules, otherwise } => {
                 lines.push(format!(

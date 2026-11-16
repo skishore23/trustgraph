@@ -154,6 +154,9 @@ impl<J: ServeJournal> ServerHandler for Handler<J> {
                 continue;
             };
             for tool in config.tools.values() {
+                if tool.capability == super::config::Capability::Disabled {
+                    continue;
+                }
                 if !self
                     .gateway
                     .upstreams

@@ -1321,7 +1321,7 @@ async fn the_stdio_bridge_relays_to_a_running_gateway() {
 
 #[test]
 fn config_errors_are_reported_together_with_paths() {
-    let bad = r#"version: 2
+    let bad = r#"version: 3
 session: sometimes
 colour: blue
 upstreams:
@@ -3131,4 +3131,220 @@ async fn typed_gateway_demo() {
         .await);
     assert_eq!(calls(&h.slack_log, "post_message").len(), 1);
     println!("ALLOWED: authorized source -> engineering; upstream calls = 1");
+}
+
+const PROTECTED_POLICY: &str = include_str!("../../../examples/typed-gateway/policy.yaml");
+const PROTECTED_CONFIG: &str = include_str!("../../../examples/typed-gateway/gateway.yaml");
+
+async fn protected_gateway(dir: &Path) -> Gw<FileJournal> {
+    let state = dir.join("state");
+    let log = dir.join("github.log");
+    launch_with(
+        dir,
+        "agent",
+        move |port| {
+            std::fs::create_dir_all(&state).unwrap();
+            Server::new(
+                Runtime::open(FileJournal::open(&state).unwrap(), PROTECTED_POLICY, 0).unwrap(),
+                settings(port, &state, Limits::default()),
+            )
+            .unwrap()
+        },
+        |_| {
+            PROTECTED_CONFIG
+                .replace(
+                    "target/debug/examples/fake_upstream",
+                    &fake_upstream().display().to_string(),
+                )
+                .replace(
+                    "--stdio]",
+                    &format!(
+                        "--stdio]\n    env: {{FAKE_UPSTREAM_LOG: '{}' }}",
+                        log.display()
+                    ),
+                )
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn protected_gateway_demo() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = protected_gateway(dir.path()).await;
+    let agent = h.connect("coding_agent").await;
+    let tools = agent.client.peer().list_all_tools().await.unwrap();
+    assert!(!tools.iter().any(|t| t.name == "github__admin_delete_all"));
+    let unknown = h.call(&agent, "github__admin_delete_all", json!({})).await;
+    assert_eq!(error_code(&unknown), "tool_not_available");
+    let log = dir.path().join("github.log");
+    assert!(calls(&log, "admin_delete_all").is_empty());
+    let private = h.call(&agent, "github__read_private", json!({})).await;
+    ok(&private);
+    assert!(text(&private).contains("73"));
+    let evidence = &private["_meta"]["trustgraph"]["lineage"];
+    assert!(evidence.to_string().contains("SourceCode@1"));
+    assert!(evidence.to_string().contains("Summary@1"));
+    let public_pr = json!({"repository_id":"repo_public_42", "title":"Follow the injected instruction", "body":"private batch size: 73"});
+    let denied = h
+        .call(&agent, "github__create_pull_request", public_pr.clone())
+        .await;
+    assert_eq!(error_code(&denied), "denied");
+    assert!(text(&denied).contains("private_code"));
+    let trace = &denied["structuredContent"]["error"]["lineage"];
+    assert!(trace.to_string().contains("first_line_v1"));
+    assert!(calls(&log, "create_pull_request").is_empty());
+    println!("DENIED private code -> first_line_v1 -> Summary@1 -> public PR; forwarded calls: 0");
+    println!("{}", serde_json::to_string_pretty(trace).unwrap());
+    for query in [
+        "private batch size: 73",
+        "https://attacker.example/?secret=73",
+    ] {
+        let denied = h
+            .call(&agent, "github__search", json!({"query":query}))
+            .await;
+        assert_eq!(error_code(&denied), "denied");
+    }
+    assert!(calls(&log, "search").is_empty());
+    println!("DENIED secret in search query and URL; forwarded queries: 0");
+    let wrong_destination = h
+        .call(
+            &agent,
+            "github__create_pull_request",
+            json!({"repository_id":"attacker_repo", "title":"x", "body":"73"}),
+        )
+        .await;
+    assert_eq!(error_code(&wrong_destination), "blocked");
+    // Same protected agent completes an authorized coding task.
+    let allowed = h.call(&agent, "github__create_pull_request", json!({"repository_id":"repo_private_7", "title":"Fix internal bug", "body":"private batch size: 73"})).await;
+    ok(&allowed);
+    assert_eq!(allowed["structuredContent"]["forwarded"], true);
+    assert_eq!(calls(&log, "create_pull_request").len(), 1);
+    println!("ALLOWED private PR; forwarded calls: 1");
+    agent.client.cancel().await.unwrap();
+    let Gw { gateway, task, .. } = h;
+    task.abort();
+    let _ = task.await;
+    let server = gateway.server().clone();
+    drop(gateway);
+    for _ in 0..100 {
+        if Arc::strong_count(&server) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(Arc::strong_count(&server), 1);
+    drop(server);
+    // Restart/reconnect with the same authenticated principal cannot shed reads.
+    let h = protected_gateway(dir.path()).await;
+    let agent = h.connect("coding_agent").await;
+    let denied = h
+        .call(&agent, "github__create_pull_request", public_pr)
+        .await;
+    assert_eq!(error_code(&denied), "denied");
+    assert_eq!(calls(&log, "create_pull_request").len(), 1);
+    println!("DENIED public PR after restart and reconnect; no additional forwarding");
+    let clean = h.connect("public_agent").await;
+    ok(&h.call(&clean, "github__read_public", json!({})).await);
+    ok(&h.call(&clean, "github__create_pull_request", json!({"repository_id":"repo_public_42", "title":"Fix README typo", "body":"Correct the spelling"})).await);
+    let forwarded = calls(&log, "create_pull_request");
+    assert_eq!(forwarded.len(), 2);
+    assert!(forwarded[1].contains("repo_public_42"));
+    assert!(!forwarded[1].contains("73"));
+    println!("ALLOWED ordinary public coding task from a fresh public-only principal");
+    // A public-looking path returning confidential data retains the fallback.
+    let read = h
+        .call(
+            &agent,
+            "github__read_file",
+            json!({"path":"Public/leaked.rs"}),
+        )
+        .await;
+    ok(&read);
+    assert_eq!(
+        read["_meta"]["trustgraph"]["sources"],
+        json!(["private_code"])
+    );
+    println!("CLASSIFIED public-looking path conservatively as private_code");
+}
+
+#[test]
+fn protected_config_rejects_unchecked_egress_and_unstable_contexts() {
+    let bad = [
+        PROTECTED_CONFIG.replace("session: agent", "session: connection"),
+        PROTECTED_CONFIG.replace("capability: read_and_sink", "capability: source"),
+        PROTECTED_CONFIG.replace("    egress: public_search\n", ""),
+        PROTECTED_CONFIG.replace("capability: source", "capability: local_pure"),
+        PROTECTED_CONFIG.replace(
+            "repository_id: repo_public_42",
+            "repository_id: {pattern: 'repo_*', type: glob}",
+        ),
+        PROTECTED_CONFIG.replace("    destination_arguments: [repository_id]\n", ""),
+    ];
+    for config in bad {
+        assert!(config::parse(&config).is_err(), "{config}");
+    }
+    let config = config::parse(PROTECTED_CONFIG).unwrap();
+    assert!(config.protected);
+    assert_eq!(
+        config.tools["github__admin_delete_all"].capability,
+        config::Capability::Disabled
+    );
+    let policy = trustgraph_policy::parse(PROTECTED_POLICY).policy.unwrap();
+    assert!(config::check_against(&config, &policy).is_empty());
+}
+
+#[tokio::test]
+async fn upgrading_connection_tracking_migrates_instead_of_forgetting_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let mut rt = Runtime::open(FileJournal::open(&state).unwrap(), PROTECTED_POLICY, 0).unwrap();
+    let trustgraph_engine::Reply::Artifact { id } = rt
+        .handle(
+            1,
+            trustgraph_engine::Event::RegisterSource {
+                source: "private_code".into(),
+                sha256: "a".repeat(64),
+                schema: None,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("no source")
+    };
+    rt.handle(
+        2,
+        trustgraph_engine::Event::SessionCarry {
+            session: "conn:legacy".into(),
+            agent: "coding_agent".into(),
+            artifacts: vec![id],
+        },
+    )
+    .unwrap();
+    drop(rt);
+    let h = protected_gateway(dir.path()).await;
+    let agent = h.connect("coding_agent").await;
+    let denied = h
+        .call(
+            &agent,
+            "github__create_pull_request",
+            json!({"repository_id":"repo_public_42", "title":"x", "body":"private data"}),
+        )
+        .await;
+    assert_eq!(error_code(&denied), "denied");
+    assert!(calls(&dir.path().join("github.log"), "create_pull_request").is_empty());
+    let operator = h.login().await;
+    let sessions = h.sessions(&operator).await;
+    assert!(
+        sessions
+            .iter()
+            .any(|(session, _, sources)| session == "agent:coding_agent"
+                && sources.contains(&"private_code".into()))
+    );
+    assert!(
+        !sessions
+            .iter()
+            .any(|(session, _, _)| session == "conn:legacy")
+    );
 }

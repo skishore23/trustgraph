@@ -1,0 +1,47 @@
+version: 2
+session: agent
+upstreams:
+  github:
+    command: [target/debug/examples/fake_upstream, --stdio]
+tools:
+  github.read_private:
+    capability: source
+    schema: SourceCode@1
+    reads: []
+    otherwise: private_code
+    transform:
+      implementation: first_line_v1
+      input: SourceCode@1
+      output: Summary@1
+  github.read_public:
+    capability: source
+    schema: CodingTask@1
+    reads: []
+    otherwise: public_task
+  github.read_file:
+    capability: read_and_sink
+    egress: github_private_query
+    schema: SourceCode@1
+    arguments: [path]
+    reads:
+      - when: {path: 'Public/**'}
+        source: public_task
+    otherwise: private_code
+  github.search:
+    capability: read_and_sink
+    egress: public_search
+    arguments: [query]
+    passthrough: true
+  github.create_pull_request:
+    capability: sink
+    destination_arguments: [repository_id]
+    arguments: [repository_id, title, body]
+    acts:
+      - when: {repository_id: repo_public_42}
+        action: public_pr
+        content: body
+      - when: {repository_id: repo_private_7}
+        action: private_pr
+        content: body
+  # No capability: disabled, including calls by guessed tool name.
+  github.admin_delete_all: {}

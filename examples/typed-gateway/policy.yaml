@@ -1,0 +1,15 @@
+version: 1
+groups:
+  engineering: [nina, sam]
+  public: [nina, sam, anonymous]
+agents: [coding_agent, public_agent]
+sources:
+  private_code: {readers: [engineering], agents: [coding_agent]}
+  public_task: {readers: [public], agents: [coding_agent, public_agent]}
+  # Generic responses have no service-specific resource attestation.
+  unclassified: {readers: [engineering], agents: [coding_agent]}
+actions:
+  public_search: {agents: [coding_agent, public_agent], audience: [public]}
+  github_private_query: {agents: [coding_agent], audience: [engineering]}
+  public_pr: {agents: [coding_agent, public_agent], audience: [public]}
+  private_pr: {agents: [coding_agent], audience: [engineering]}

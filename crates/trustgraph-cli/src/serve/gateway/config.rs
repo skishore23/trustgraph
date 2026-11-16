@@ -115,7 +115,7 @@ pub enum SessionMode {
     /// One session per MCP connection (`Mcp-Session-Id`).
     #[default]
     Connection,
-    /// One session per agent token for the gateway's lifetime.
+    /// One journaled context per authenticated agent, across restarts.
     Agent,
 }
 
@@ -205,6 +205,29 @@ pub enum Kind {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capability {
+    Legacy,
+    Source,
+    Sink,
+    ReadAndSink,
+    LocalPure,
+    Disabled,
+}
+
+impl Capability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Source => "source",
+            Self::Sink => "sink",
+            Self::ReadAndSink => "read_and_sink",
+            Self::LocalPure => "local_pure",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Tool {
     /// `upstream.tool`, as in the config.
@@ -221,10 +244,17 @@ pub struct Tool {
     pub schema: Option<SchemaId>,
     /// A local deterministic text projection; retains every input restriction.
     pub transform: Option<OutputContract>,
+    pub capability: Capability,
+    /// Fixed upstream service audience; every argument is checked before egress.
+    pub egress: Option<String>,
+    /// Canonical identity arguments resolved by the trusted service adapter.
+    pub destination_arguments: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Version 2 enables the scoped protected boundary; version 1 is legacy.
+    pub protected: bool,
     pub session: SessionMode,
     pub upstreams: BTreeMap<String, Upstream>,
     /// By exposed name.
@@ -631,12 +661,14 @@ pub fn parse(text: &str) -> Result<Config, Vec<Problem>> {
         return Err(cx.problems);
     };
     let top = cx.entries(root, "", Some(TOP_KEYS));
+    let protected = matches!(top.get("version"), Some(Value::Number(n)) if n.as_u64() == Some(2));
     match top.get("version") {
-        Some(Value::Number(n)) if n.as_u64() == Some(1) => {}
-        Some(_) => cx.error("version", "must be 1"),
+        Some(Value::Number(n)) if matches!(n.as_u64(), Some(1 | 2)) => {}
+        Some(_) => cx.error("version", "must be 1 (legacy) or 2 (protected)"),
         None => cx.error("version", "required; write `version: 1`"),
     }
     let session = match top.get("session") {
+        None if protected => SessionMode::Agent,
         None => SessionMode::Connection,
         Some(Value::String(s)) if s == "connection" => SessionMode::Connection,
         Some(Value::String(s)) if s == "agent" => SessionMode::Agent,
@@ -645,6 +677,12 @@ pub fn parse(text: &str) -> Result<Config, Vec<Problem>> {
             SessionMode::Connection
         }
     };
+    if protected && session != SessionMode::Agent {
+        cx.error(
+            "session",
+            "version 2 requires `session: agent` so reconnects cannot discard provenance",
+        );
+    }
     let max_result_bytes = match top.get("max_result_bytes") {
         None => DEFAULT_MAX_RESULT_BYTES,
         Some(Value::Number(n)) => match n.as_u64() {
@@ -736,7 +774,45 @@ pub fn parse(text: &str) -> Result<Config, Vec<Problem>> {
                     let mut spec = value.clone();
                     let mut schema = None;
                     let mut transform = None;
+                    let mut capability = if protected {
+                        Capability::Disabled
+                    } else {
+                        Capability::Legacy
+                    };
+                    let mut egress = None;
+                    let mut destination_arguments = BTreeSet::new();
                     if let Value::Mapping(ref mut map) = spec {
+                        if let Some(value) =
+                            map.remove(Value::String("destination_arguments".into()))
+                        {
+                            destination_arguments =
+                                cx.arguments(Some(&&value), &path).unwrap_or_default();
+                        }
+                        if let Some(value) = map.remove(Value::String("capability".into())) {
+                            capability = match value.as_str() {
+                                Some("source") => Capability::Source,
+                                Some("sink") => Capability::Sink,
+                                Some("read_and_sink") => Capability::ReadAndSink,
+                                Some("local_pure") => Capability::LocalPure,
+                                Some("disabled") => Capability::Disabled,
+                                _ => {
+                                    cx.error(&join(&path, "capability"), "must be source, sink, read_and_sink, local_pure or disabled");
+                                    Capability::Disabled
+                                }
+                            };
+                        }
+                        if let Some(value) = map.remove(Value::String("egress".into())) {
+                            egress = cx.string(&value, &join(&path, "egress"));
+                        }
+                        if protected
+                            && capability == Capability::Disabled
+                            && !["reads", "acts", "passthrough"]
+                                .iter()
+                                .any(|key| map.contains_key(Value::String((*key).into())))
+                        {
+                            map.insert(Value::String("passthrough".into()), Value::Bool(true));
+                            map.insert(Value::String("untracked".into()), Value::Bool(true));
+                        }
                         if let Some(value) = map.remove(Value::String("schema".into())) {
                             schema = cx.string(&value, &join(&path, "schema")).map(SchemaId);
                             if let Some(s) = &schema
@@ -787,6 +863,38 @@ pub fn parse(text: &str) -> Result<Config, Vec<Problem>> {
                             "schema and transform are supported only on reads tools",
                         );
                     }
+                    if protected {
+                        match capability {
+                            Capability::LocalPure => cx.error(&path, "upstream tools cannot be local_pure; use an implemented local transform"),
+                            Capability::Source if !arguments.is_empty() => cx.error(&path, "a source with outbound arguments must be read_and_sink with an egress action"),
+                            Capability::Source if !matches!(kind, Kind::Reads { .. }) => cx.error(&path, "source requires reads classification"),
+                            Capability::Sink if !matches!(kind, Kind::Acts { allow_without_reads: false, .. }) => cx.error(&path, "sink requires acts and may not allow_without_reads"),
+                            Capability::ReadAndSink if egress.is_none() || !matches!(kind, Kind::Reads { .. } | Kind::Passthrough { untracked: false }) => cx.error(&path, "read_and_sink requires egress and tracked reads/passthrough"),
+                            _ => {}
+                        }
+                        if egress.is_some() && capability != Capability::ReadAndSink {
+                            cx.error(&path, "egress is only supported on read_and_sink tools");
+                        }
+                        if capability == Capability::Sink {
+                            if destination_arguments.is_empty() {
+                                cx.error(&path, "sink requires destination_arguments naming canonical destination identities");
+                            }
+                            if let Kind::Acts { rules, .. } = &kind {
+                                for (i, rule) in rules.iter().enumerate() {
+                                    for argument in &destination_arguments {
+                                        if !arguments.contains(argument)
+                                            || !rule.when.iter().any(|m| {
+                                                m.argument == *argument
+                                                    && m.kind == MatchType::Exact
+                                            })
+                                        {
+                                            cx.error(&format!("{path}.acts[{i}]"), format!("canonical destination `{argument}` requires an exact matcher"));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     tools.insert(
                         exposed.clone(),
                         Tool {
@@ -798,6 +906,9 @@ pub fn parse(text: &str) -> Result<Config, Vec<Problem>> {
                             arguments,
                             schema,
                             transform,
+                            capability,
+                            egress,
+                            destination_arguments,
                         },
                     );
                 }
@@ -806,6 +917,7 @@ pub fn parse(text: &str) -> Result<Config, Vec<Problem>> {
     }
     if cx.problems.is_empty() {
         Ok(Config {
+            protected,
             session,
             upstreams,
             tools,
@@ -1083,6 +1195,9 @@ pub fn check_against(config: &Config, policy: &Policy) -> Vec<Problem> {
 /// Problems of one tool against `policy`; a tool with any fails closed.
 pub fn tool_problems(tool: &Tool, policy: &Policy) -> Vec<Problem> {
     let mut problems = Vec::new();
+    if tool.capability == Capability::Disabled {
+        return problems;
+    }
     let path = join("tools", &tool.key);
     let mut source = |name: &str, path: String| {
         if !policy.sources.contains_key(name) {
@@ -1118,6 +1233,14 @@ pub fn tool_problems(tool: &Tool, policy: &Policy) -> Vec<Problem> {
                 });
             }
         }
+    }
+    if let Some(action) = &tool.egress
+        && !policy.actions.contains_key(action)
+    {
+        problems.push(Problem {
+            path: join(&path, "egress"),
+            message: format!("`{action}` is not an action in the active policy"),
+        });
     }
     problems
 }
