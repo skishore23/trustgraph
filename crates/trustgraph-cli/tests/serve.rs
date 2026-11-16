@@ -379,7 +379,8 @@ async fn identity_comes_only_from_the_token() {
     }
 
     // Missing, wrong and almost-right tokens.
-    let wrong = format!("{}0", &planner[..63]);
+    let last = if planner.ends_with('0') { '1' } else { '0' };
+    let wrong = format!("{}{last}", &planner[..63]);
     for token in [None, Some("nope"), Some(wrong.as_str())] {
         let (status, reply) = h
             .post(

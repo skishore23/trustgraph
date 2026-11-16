@@ -243,4 +243,22 @@ const page = require('./serve.js');
   assert.match(page.CONTEXT_NOTE, /agent keeps whatever is already in its own context\. Stop or restart the agent first\./);
 }
 
+// Every control, format, separator and unusual-space character is made visible.
+{
+  const samples = ['\u0890', '\u08e2', '\u{110bd}', '\u{13430}', '\u{1bca0}', '\u{1d173}', '\u{e0001}',
+    '\u00a0', '\u2003', '\u3000', '\u202f', '\u2028', '\u2029', '\u200b', '\u0007', '\u115f', '\u3164'];
+  for (const c of samples) {
+    const shown = page.neutralise('a' + c + 'b');
+    assert.match(shown, /^a\\(x|u)[0-9a-f{]+}?b$/, JSON.stringify(c) + ' -> ' + shown);
+  }
+  assert.equal(page.neutralise('x\u00a0y'), 'x\\xa0y');
+  assert.equal(page.neutralise('plain text'), 'plain text');
+}
+
+// Clearing a block carries the same warning as ending a session.
+{
+  assert.match(page.CLEAR_NOTE, /agent keeps whatever is already in its own context\. Stop or restart the agent first\./);
+  assert.match(page.CLEAR_NOTE, /^Clear this block\? It may act again, but the agent still holds whatever came with the refused token\. /);
+}
+
 console.log('serve.test.cjs: ok');

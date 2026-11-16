@@ -47,11 +47,12 @@
   }
 
   // Agent-supplied text, made safe to read: control characters, bidi
-  // overrides and invisible characters (format characters, the soft
-  // hyphen, Hangul fillers, tag characters) are shown as escapes (\x1b,
+  // overrides and invisible characters (every control, format, line and
+  // paragraph separator character, Hangul fillers, and no-break and other
+  // unusual spaces) are shown as escapes (\x1b,
   // \u202e, \u{e0041}), so nothing can reorder, hide or restyle what the
   // operator reads. The page only ever sets it as textContent.
-  var INVISIBLE = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u00ad\u0600-\u0605\u061c\u06dd\u070f\u115f-\u1160\u180e\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufeff\uffa0\ufff9-\ufffb\u{e0000}-\u{e007f}]/gu;
+  var INVISIBLE = /(?![\t\n\r])[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000\u115f\u1160\u3164\uffa0]/gu;
 
   function neutralise(text) {
     return String(text === undefined || text === null ? '' : text).replace(INVISIBLE, function (c) {
@@ -100,6 +101,7 @@
 
   var CONTEXT_NOTE = 'Ending a session makes the gateway forget what it read and closes its connections; ' +
     'the agent keeps whatever is already in its own context. Stop or restart the agent first.';
+  var CLEAR_NOTE = 'Clear this block? It may act again, but the agent still holds whatever came with the refused token. ' + CONTEXT_NOTE;
 
   // The confirmation keys the page would render for `state`: an Approve for
   // each pending decision the operator can approve, an Activate for each
@@ -213,6 +215,7 @@
   var api = {
     GONE: GONE,
     CONTEXT_NOTE: CONTEXT_NOTE,
+    CLEAR_NOTE: CLEAR_NOTE,
     approvalSummary: approvalSummary,
     argumentValue: argumentValue,
     callLines: callLines,
@@ -427,6 +430,9 @@
     (gateway.problems || []).forEach(function (line) {
       problems.appendChild(el('p', line, 'warn'));
     });
+    if (gateway.degraded) {
+      problems.appendChild(el('p', 'Degraded: the gateway cannot write its blocked-sessions file, so it refuses every call from every agent until a write succeeds. Fix its state directory.', 'warn'));
+    }
     var cap = capNotice(state);
     if (cap) problems.appendChild(el('p', cap, 'warn'));
     blockedEntries(state).forEach(function (b) {
@@ -436,7 +442,7 @@
       if (!b.clearable) {
         item.appendChild(el('p', 'End its session below to clear it.', 'muted'));
       } else if (confirming === key) {
-        confirmStep(item, key, 'Clear this block? It may act again.', 'Clear now', function () {
+        confirmStep(item, key, CLEAR_NOTE, 'Clear now', function () {
           act('/v1/operator/end-session', { session: b.id }, 'Cleared the block on ' + b.id + '.');
         });
       } else {
