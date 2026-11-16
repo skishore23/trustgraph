@@ -135,6 +135,11 @@ or [llms.txt](llms.txt). Protect the policy file with code review.
 
 ## Use it in your system
 
+> **Status.** The policy CLI and `trustgraph serve` have been through security
+> review. `trustgraph gateway` and the Python integrations are new: two review
+> rounds found and fixed real holes, and a third is in progress. Try them, but
+> do not put them in front of real data yet.
+
 ### `trustgraph gateway`: agents cannot skip it while it alone holds the credentials
 
 Put the gateway between your agents and the MCP servers they use. It holds
