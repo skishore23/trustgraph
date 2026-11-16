@@ -282,6 +282,15 @@ impl Engine {
         self.outputs.get(&key).map(String::as_str)
     }
 
+    /// The step that recorded the output artifact `id`, when it is one.
+    /// Read-only; a linear scan.
+    pub fn output_step(&self, id: &str) -> Option<&str> {
+        self.outputs
+            .iter()
+            .find(|(_, artifact)| artifact.as_str() == id)
+            .map(|((_, step, _, _), _)| step.as_str())
+    }
+
     /// True when a proposal with this id (policy digest) is stored.
     pub fn has_proposal(&self, id: &str) -> bool {
         self.proposals.iter().any(|p| p.id == id)

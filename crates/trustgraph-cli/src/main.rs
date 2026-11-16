@@ -47,6 +47,9 @@ enum GatewayCommand {
         /// This agent's token file, from the gateway's state directory.
         #[arg(long)]
         token_file: PathBuf,
+        /// Allow a plain http:// URL to a host that is not loopback (the token travels in clear).
+        #[arg(long)]
+        allow_insecure: bool,
     },
     /// Validate a gateway config against a policy and say what it does.
     Check {
@@ -122,13 +125,18 @@ async fn main() {
             trustgraph_cli::serve::main(options, port).await
         }
         Command::Gateway {
-            command: Some(GatewayCommand::Stdio { url, token_file }),
+            command:
+                Some(GatewayCommand::Stdio {
+                    url,
+                    token_file,
+                    allow_insecure,
+                }),
             ..
-        } => gateway::bridge::run(&url, &token_file).await,
+        } => gateway::bridge::run(&url, &token_file, allow_insecure).await,
         Command::Gateway {
             command: Some(GatewayCommand::Check { config, policy }),
             ..
-        } => gateway::check(&config, &policy),
+        } => gateway::check(&config, &policy).await,
         Command::Gateway {
             command: None,
             config,

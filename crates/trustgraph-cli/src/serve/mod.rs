@@ -358,10 +358,40 @@ pub(crate) trait GatewayView: Send + Sync {
     fn mode(&self) -> &'static str;
     /// Problems of the gateway config against `policy`, as lines.
     fn problems(&self, policy: &Policy) -> Vec<String>;
-    /// Live MCP connections in `connection` mode: `(session, agent, started_at)`.
-    fn connections(&self) -> Vec<(String, String, u64)>;
-    /// Close the MCP connection of `session`; false when there is none.
+    /// Every live MCP connection, in both modes.
+    fn connections(&self) -> Vec<ConnectionView>;
+    /// Agents holding the most open connections allowed.
+    fn at_cap(&self) -> Vec<String>;
+    /// Close every MCP connection of `session` and forget that it may not
+    /// act; false when it had no connection.
     fn close(&self, session: &str) -> bool;
+    /// Close one MCP connection by its id; false when there is none.
+    fn close_connection(&self, connection: &str) -> bool;
+    /// What the operator sees of a call held for approval as `decision`:
+    /// the tool and its forwarded arguments, from memory. `None` when the
+    /// gateway no longer has it (it restarted, or dropped it).
+    fn held_call(&self, decision: &str) -> Option<Value>;
+}
+
+/// One live MCP connection to the gateway, as the operator page shows it.
+pub(crate) struct ConnectionView {
+    /// An id for the operator page; not the MCP session id.
+    pub connection: String,
+    pub agent: String,
+    pub session: String,
+    pub started_at: u64,
+    pub last_active: u64,
+}
+
+/// Why a call the gateway held cannot be approved after a restart.
+const CALL_NOT_HELD: &str = "the gateway no longer has this call's arguments (it restarted, or dropped the call), so you cannot see what you would approve; the agent must retry the call before it can be approved";
+
+/// The tool of a pending decision when the gateway recorded its output.
+fn gateway_tool(engine: &Engine, artifact: &str) -> Option<String> {
+    engine
+        .output_step(artifact)?
+        .strip_prefix("gateway:")
+        .map(str::to_string)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -574,6 +604,12 @@ struct ProposalRequest {
 #[serde(deny_unknown_fields)]
 struct SessionRequest {
     session: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConnectionRequest {
+    connection: String,
 }
 
 impl<J: ServeJournal> Server<J> {
@@ -1033,6 +1069,48 @@ impl<J: ServeJournal> Server<J> {
     }
 
     pub fn check(&self, agent: &str, request: CheckRequest) -> ApiResult {
+        let mut rt = self.lock()?;
+        self.check_in(&mut rt, agent, request)
+    }
+
+    /// `check` for one gateway call: when the allow comes from a live
+    /// approval, that approval is revoked (journaled) under the same lock,
+    /// so it releases exactly one call. `consumed` says whether it did.
+    pub(crate) fn check_once(&self, agent: &str, request: CheckRequest) -> ApiResult {
+        let mut rt = self.lock()?;
+        let mut value = self.check_in(&mut rt, agent, request)?;
+        if value["verdict"] != "allow" {
+            return Ok(value);
+        }
+        let decision = value["decision"].as_str().unwrap_or_default().to_string();
+        let now = self.now(&rt);
+        let Some(approval) = rt
+            .engine()
+            .live_approvals(now)
+            .into_iter()
+            .find(|a| a.decision == decision)
+        else {
+            value["consumed"] = json!(false);
+            return Ok(value);
+        };
+        let event = Event::Revoke {
+            decision,
+            reviewer: approval.reviewer,
+        };
+        match self.handle(&mut rt, event)? {
+            Reply::Revoked { .. } => {
+                value["consumed"] = json!(true);
+                Ok(value)
+            }
+            _ => Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "approval_not_consumed",
+                "the approval could not be used up, so the call was not forwarded",
+            )),
+        }
+    }
+
+    fn check_in(&self, rt: &mut Runtime<J>, agent: &str, request: CheckRequest) -> ApiResult {
         let event = Event::Check {
             agent: agent.into(),
             artifact: request.artifact,
@@ -1043,14 +1121,13 @@ impl<J: ServeJournal> Server<J> {
         let Event::Check { artifact, .. } = &event else {
             return Err(ApiError::internal("unexpected event"));
         };
-        let mut rt = self.lock()?;
         let engine = rt.engine();
         let policy = engine
             .policy()
             .ok_or_else(|| ApiError::internal("no active policy"))?;
         Self::visible_sources(engine, policy, agent, artifact)?;
-        self.agent_quota(&rt, agent, false)?;
-        let reply = self.agent_handle(&mut rt, agent, event)?;
+        self.agent_quota(rt, agent, false)?;
+        let reply = self.agent_handle(rt, agent, event)?;
         reply_value(reply)
     }
 
@@ -1134,6 +1211,15 @@ impl<J: ServeJournal> Server<J> {
                 let sources: BTreeSet<String> = p.sources.iter().cloned().collect();
                 let reads =
                     policy.is_some_and(|policy| readers(policy, &sources).contains(operator));
+                // A call the gateway holds: what it would forward, from memory.
+                let call = self.gateway.get().and_then(|g| {
+                    let tool = gateway_tool(engine, &p.artifact)?;
+                    Some(
+                        g.held_call(&p.decision)
+                            .unwrap_or_else(|| json!({"tool": tool, "held": false})),
+                    )
+                });
+                let unseen = call.as_ref().is_some_and(|c| c["held"] != true);
                 // The engine's own rule; the page only hides what would fail.
                 let blocked = if !reviewers.contains(operator) {
                     Some("you are not a reviewer for this action")
@@ -1141,10 +1227,13 @@ impl<J: ServeJournal> Server<J> {
                     Some("you may not read this output, so you cannot approve it")
                 } else if &p.agent == operator {
                     Some("an agent cannot approve its own request")
+                } else if unseen {
+                    Some(CALL_NOT_HELD)
                 } else {
                     None
                 };
                 json!({
+                    "gateway": call,
                     "decision": p.decision,
                     "agent": p.agent,
                     "action": p.action,
@@ -1204,20 +1293,39 @@ impl<J: ServeJournal> Server<J> {
                     (s.session, row)
                 })
                 .collect();
-            for (session, agent, started_at) in g.connections() {
-                sessions.entry(session.clone()).or_insert_with(|| {
-                    json!({
-                        "session": session,
-                        "agent": agent,
-                        "started_at": started_at,
-                        "sources": [],
-                    })
-                });
+            let connections = g.connections();
+            for c in &connections {
+                // A connection-mode session exists before it reads anything.
+                if c.session.starts_with("conn:") {
+                    sessions.entry(c.session.clone()).or_insert_with(|| {
+                        json!({
+                            "session": c.session,
+                            "agent": c.agent,
+                            "started_at": c.started_at,
+                            "sources": [],
+                        })
+                    });
+                }
             }
+            let connections: Vec<Value> = connections
+                .iter()
+                .map(|c| {
+                    json!({
+                        "connection": c.connection,
+                        "agent": c.agent,
+                        "session": c.session,
+                        "started_at": c.started_at,
+                        "last_active": c.last_active,
+                    })
+                })
+                .collect();
             json!({
                 "mode": g.mode(),
                 "problems": policy.map(|p| g.problems(p)).unwrap_or_default(),
                 "sessions": sessions.into_values().collect::<Vec<_>>(),
+                "connections": connections,
+                "max_connections_per_agent": gateway::MAX_CONNECTIONS_PER_AGENT,
+                "at_cap": g.at_cap(),
             })
         });
         Ok(json!({
@@ -1245,9 +1353,47 @@ impl<J: ServeJournal> Server<J> {
             ));
         }
         let mut rt = self.lock()?;
+        // A call the gateway holds is approved only while the operator can
+        // see what it would forward.
+        if let Some(g) = self.gateway.get() {
+            let now = self.now(&rt);
+            let unseen = rt
+                .engine()
+                .pending_decisions(now)
+                .iter()
+                .find(|p| p.decision == decision)
+                .is_some_and(|p| {
+                    gateway_tool(rt.engine(), &p.artifact).is_some()
+                        && g.held_call(&decision).is_none()
+                });
+            if unseen {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    "call_not_held",
+                    CALL_NOT_HELD,
+                ));
+            }
+        }
         let reviewer = self.settings.operator.clone();
         let reply = self.handle(&mut rt, Event::Approve { decision, reviewer })?;
         reply_value(reply)
+    }
+
+    /// Close one gateway MCP connection; the session it served is kept.
+    fn end_connection(&self, connection: String) -> ApiResult {
+        if self
+            .gateway
+            .get()
+            .is_some_and(|g| g.close_connection(&connection))
+        {
+            Ok(json!({"connection": connection, "ended": true}))
+        } else {
+            Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "unknown_connection",
+                "no open gateway connection with that id",
+            ))
+        }
     }
 
     fn revoke(&self, decision: String) -> ApiResult {
@@ -1257,8 +1403,9 @@ impl<J: ServeJournal> Server<J> {
         reply_value(reply)
     }
 
-    /// End a gateway session: forget what it carries and, in `connection`
-    /// mode, close its MCP connection. Only the operator can.
+    /// End a gateway session: forget what it carries and close every MCP
+    /// connection it has (in `agent` mode, all of that agent's), so the
+    /// client must initialise again. Only the operator can.
     fn end_session(&self, session: String) -> ApiResult {
         let mut rt = self.lock()?;
         let carried = rt.engine().session(&session).is_some();
@@ -1623,6 +1770,20 @@ async fn operator_end_session<J: ServeJournal>(State(s): Shared<J>, request: Req
     )
 }
 
+async fn operator_end_connection<J: ServeJournal>(
+    State(s): Shared<J>,
+    request: Request,
+) -> Response {
+    respond(
+        async {
+            s.require_operator(request.headers())?;
+            let body: ConnectionRequest = read_json(request).await?;
+            blocking(&s, move |s| s.end_connection(body.connection)).await
+        }
+        .await,
+    )
+}
+
 async fn operator_propose<J: ServeJournal>(State(s): Shared<J>, request: Request) -> Response {
     respond(
         async {
@@ -1678,6 +1839,10 @@ fn router_with<J: ServeJournal>(server: Arc<Server<J>>, extra: Router<Arc<Server
         .route("/v1/operator/activate", post(operator_activate::<J>))
         .route("/v1/operator/propose", post(operator_propose::<J>))
         .route("/v1/operator/end-session", post(operator_end_session::<J>))
+        .route(
+            "/v1/operator/end-connection",
+            post(operator_end_connection::<J>),
+        )
         .merge(mcp::router(server.clone()))
         .merge(extra)
         .fallback(not_found)

@@ -1,10 +1,12 @@
 # trustgraph gateway
 
 `trustgraph gateway` sits between agents and the MCP servers they use. It
-holds those servers' credentials, so agents can reach them only through it.
-It records what each agent reads, and it checks every action against what
-was read before it forwards the call. An agent cannot skip it, because the
-gateway is its only route to the upstream servers.
+holds those servers' credentials, records what each agent reads, and checks
+every action against what was read before it forwards the call. An agent
+cannot skip it as long as two things hold: the gateway alone holds the
+upstream credentials, and the agent has no other route to the upstream
+servers. If an agent has the credentials, or can reach a server some other
+way, the gateway does not see what it does there.
 
 The gateway is [`trustgraph serve`](serve.md) plus one MCP endpoint,
 `/gateway/mcp`. It is the same process, with the same state directory, agent
@@ -19,29 +21,30 @@ repository root:
 
 ```sh
 cargo build -p trustgraph-cli --bins --examples
-SLACK_BOT_TOKEN=demo-secret target/debug/trustgraph gateway \
-  --policy examples/policies/handoff.policy.yaml --operator nina \
+SLACK_BOT_TOKEN=demo-slack-token-0001 target/debug/trustgraph gateway \
+  --policy examples/gateway/gateway.policy.yaml --operator nina \
   --config examples/gateway/gateway.yaml --state ~/tg-gateway
 ```
 
 ```text
+upstream `slack`: fake_upstream: starting with credential [redacted]
+trustgraph gateway: upstream `slack`: connected, 12 tools
+trustgraph gateway: upstream `drive`: connected, 12 tools
 TrustGraph gateway: http://127.0.0.1:8787
 MCP endpoint: http://127.0.0.1:8787/gateway/mcp
 Operator sign-in (single use): /Users/you/tg-gateway/operator.html
 Agent tokens: /Users/you/tg-gateway/tokens
-Policy in force: revision 1 (from the policy file), digest d004fcf413c1
+Policy in force: revision 1 (from the policy file), digest a95856e0f71a
 Operator: nina
 warning: the policy file is inside the Git repository /Users/you/TrustGraph; agents working there can edit it. Changes to it never apply without the operator.
 Sessions: connection; tools exposed: 4
-upstream `slack`: fake_upstream: starting with credential [redacted]
-trustgraph gateway: upstream `drive`: connected, 7 tools
-trustgraph gateway: upstream `slack`: connected, 7 tools
 ```
 
 The fake `slack` server logs its own credential on purpose; the gateway
 replaces every credential value in what it prints. In another terminal, two
 agents use the gateway. The researcher reads the salary file and hands off.
-The planner receives the hand-off, reads the roadmap and tries to post:
+The planner receives the hand-off, reads the roadmap and tries to post, then
+tries to slip an extra argument past the check:
 
 ```sh
 target/debug/examples/gateway_demo --tokens ~/tg-gateway/tokens
@@ -53,32 +56,42 @@ researcher trustgraph__handoff: a hand-off token
 planner trustgraph__receive: {"carries":["salaries"],"received":true}
 planner drive__read_file Product/roadmap.md: Q3: ship the new billing page
 planner slack__post_message #engineering: error: TrustGraph gateway: `post_to_engineering` was not forwarded: denied: `salaries` is readable by hr only; engineering (ravi, sam) is not included (denied)
+planner slack__post_message #engineering, plus Channel #all-company: error: TrustGraph gateway: `Channel` is not an argument the gateway forwards for this tool (it forwards: channel, text); the call was not forwarded (invalid_arguments)
 ```
 
-The `post_message` call never reached the chat server.
+Neither `post_message` call reached the chat server.
 
-Check a config against a policy before you start the gateway:
+Check a config against a policy before you start the gateway. When the
+variables an upstream needs are set, `gateway check` also connects to it
+and compares the arguments the config forwards with the ones the upstream
+tool takes:
 
 ```sh
-trustgraph gateway check --config examples/gateway/gateway.yaml --policy examples/policies/handoff.policy.yaml
+SLACK_BOT_TOKEN=demo-slack-token-0001 trustgraph gateway check \
+  --config examples/gateway/gateway.yaml --policy examples/gateway/gateway.policy.yaml
 ```
 
 ```text
-Sessions: connection (each MCP connection is one session; it assumes the host opens a new connection per task and the agent cannot reconnect at will).
+Sessions: connection (each MCP connection is one session; it assumes the host opens a new connection per task with a fresh agent context, and that the agent cannot reconnect at will: a client that reconnects by itself starts with an empty session. Use `session: agent` when the host cannot guarantee that).
 Upstreams: drive (runs target/debug/examples/fake_upstream), slack (runs target/debug/examples/fake_upstream).
 Agents see 4 tools; every other upstream tool is invisible and uncallable:
   drive__read_file reads a source; its result is recorded before it is returned:
     when `path` matches `HR/Compensation/**`: `salaries` (usable by planner, researcher)
     when `path` matches `Product/**`: `roadmap` (usable by planner)
     when `path` matches `Public/**`: `benchmarks` (usable by planner, researcher)
-    otherwise: `salaries` (usable by planner, researcher)
-  slack__post_message is an action, checked against everything the session read before it is forwarded:
-    when `channel` matches `#engineering`: `post_to_engineering` with `text` as the output (reaches ravi, sam)
+    otherwise: `unmatched` (usable by planner)
+    forwards only the arguments: path; a call with any other is refused
+  slack__post_message is an action, checked against everything the session read before it is forwarded; the output checked is every forwarded argument:
+    when `channel` matches `#engineering`: `post_to_engineering`, content `text` (reaches ravi, sam)
     otherwise: blocked, never forwarded
     a call from a session that has read nothing is refused (nothing_read)
+    forwards only the arguments: channel, text; a call with any other is refused
+    upstream arguments NOT forwardable: blocks, thread
   trustgraph__handoff and trustgraph__receive pass what a session carries to another agent's session
-warning: not set here, and required where the gateway runs: SLACK_BOT_TOKEN
 ```
+
+`gateway check` runs each stdio upstream it can to ask for its tools. Run
+it where you would run the gateway.
 
 ## Connecting agents
 
@@ -100,7 +113,9 @@ knows an agent only by its token.
 
 For an MCP client that can only launch a command, `trustgraph gateway stdio`
 relays between its stdin and stdout and the gateway. It adds nothing but
-transport:
+transport. It refuses a token file that its group or other users can read,
+and a plain `http://` URL to a host that is not loopback unless you pass
+`--allow-insecure` (the token would travel in clear):
 
 ```json
 {
@@ -121,12 +136,13 @@ The gateway offers MCP protocol versions 2025-11-25, 2025-06-18 and
 
 `gateway.yaml` is strict. An unknown key is an error, and every problem is
 reported at once, with its path. The gateway does not start with a config
-that has a problem, or with one that names a source or action the active
-policy does not have.
+that has a problem, with one that names a source or action the active
+policy does not have, or with one whose arguments a reachable upstream does
+not take.
 
 ```yaml
 version: 1
-session: connection            # connection (default) or agent
+session: agent                 # agent or connection (the default); see Sessions
 max_result_bytes: 1048576      # largest upstream tool result (default 1 MiB)
 timeout_seconds: 30            # every upstream call (default 30)
 upstreams:
@@ -138,87 +154,153 @@ upstreams:
     env: { SLACK_BOT_TOKEN: "${env:SLACK_BOT_TOKEN}" }
 tools:
   drive.read_file:
-    reads:
+    reads:                      # forwards only `path`, the argument the rules name
       - when: { path: "HR/Compensation/**" }
         source: salaries
       - when: { path: "Product/**" }
         source: roadmap
-    otherwise: unclassified     # required: the source of a call that matches no rule
+    otherwise: unmatched        # required: a source at least as restrictive as every rule's
   slack.post_message:
+    arguments: [channel, text]  # required for acts: a call with any other argument is refused
     acts:
       - when: { channel: "#engineering" }
         action: post_to_engineering
-        content: text           # the argument that is the output (default: all arguments)
+        content: text           # shown to the operator; the check covers every argument
     otherwise: block            # the only value: an unmatched call is never forwarded
   drive.search:
     passthrough: true
+    arguments: [query]
 ```
 
 - **Upstreams.** An upstream has a `url` (streamable HTTP) or a `command`
   (a program and its arguments, run with stdio), not both. Names are
   lowercase letters, digits, `-` and single `_`; `trustgraph` is reserved.
+  A URL may not hold a user name or password; put credentials in `headers`.
+  The gateway and `gateway check` warn about a plain `http://` URL to a host
+  that is not loopback: its credentials and every call travel in clear.
 - **Secrets.** `${env:NAME}` is the only interpolation, and only in `headers`
-  and `env` values. A variable that is not set stops the gateway from
-  starting. The gateway never prints, logs, returns or journals a resolved
-  value. An upstream result that contains one is withheld. A stdio upstream
-  gets only the variables in its `env`, plus `PATH` and `HOME`. Its stderr is
-  printed with every secret value replaced by `[redacted]`.
+  and `env` values. A variable that is not set, or whose value is shorter
+  than 12 characters, stops the gateway from starting: every such value is
+  treated as a secret and redacted by its text, which is meaningless for a
+  short one. The gateway never prints, logs, returns or journals a resolved
+  value. An upstream result that contains one, as is or JSON-escaped, is
+  withheld. A stdio upstream gets the variables in its `env`, a minimal
+  `PATH` (the program's own directory, `/usr/bin` and `/bin`) and a private,
+  empty `HOME` directory (mode 0700, removed when the connection ends); it
+  never gets the gateway's `HOME` or the rest of its environment. That is
+  not isolation: see [Threat model](#threat-model). Its stderr is printed
+  with every secret value replaced by `[redacted]`.
 - **Tools.** Only the tools listed under `tools:` exist for agents. They are
   named `upstream.tool` in the config, and agents see them as
   `upstream__tool`. Every other tool on an upstream is invisible and
   uncallable. There is no switch that exposes unlisted tools.
+- **arguments.** The only argument names a call to the tool may carry. A
+  call with any other argument, with two argument names equal ignoring case,
+  or with arguments that are not a JSON object is refused with
+  `invalid_arguments`, which names the argument; it is never forwarded, and
+  nothing is silently dropped. `arguments` is required on an `acts` tool.
+  On a `reads` or passthrough tool it defaults to the argument names its
+  `when` rules use, and a list adds to them. Every listed argument must be
+  one the upstream tool takes (`inputSchema.properties`) when the upstream
+  publishes a schema; the gateway checks this at start, on every call and
+  in `gateway check`, which also prints the upstream arguments that are not
+  forwardable.
 - **reads.** The tool's results are a policy source. The first rule whose
-  `when` matches gives the source; otherwise `otherwise` does.
+  `when` matches gives the source; otherwise `otherwise` does. `otherwise`
+  must be at least as restrictive as every rule's source: the people who may
+  read it, and the agents that may use it, must each be among those of every
+  source the rules name. A config that breaks this is an error at start and
+  in `gateway check`; if a policy activation breaks it later, the tool is
+  closed (`tool_misconfigured`) until it is fixed.
 - **acts.** The tool is a policy action. The first rule whose `when` matches
-  gives the action and the content argument. A call that matches no rule is
-  blocked. `allow_without_reads: true` lets a call from a session that has
-  read nothing through unchecked (see below).
+  gives the action. A call that matches no rule is blocked. `content` names
+  the argument the operator sees as the content; it is only a label. The
+  output that is checked is always every forwarded argument (see
+  [What a call does](#what-a-call-does)). `allow_without_reads: true` lets a
+  call from a session that has read nothing through unchecked; it needs
+  `session: agent`, because in connection mode a new connection would be a
+  way to shed what was read.
 - **passthrough.** The tool is forwarded untouched. Its results are still
   content an agent reads, of unknown origin. If the policy defines a source
   named `unclassified`, they are registered as that source. Otherwise the
   tool needs `untracked: true`, which forwards its results with no tracking.
 
+The gateway and `gateway check` warn about a rule no call can reach, because
+an earlier rule of the same tool matches every call it would.
+
 ### How `when` matches
 
-A `when` rule names arguments and a glob for each. All must match. A glob is
-case-sensitive: `**` matches anything, `*` anything except `/`, `?` one
-character except `/`, and every other character is itself.
+A `when` rule names arguments and a glob for each, as `argument: glob` or
+`argument: {glob: …, type: path|text}`. All must match. A glob is
+case-sensitive. `*` matches any run of characters and `?` one character,
+but neither matches `/`, `,`, `;`, whitespace, `<`, `>`, `"` or a control
+character; `**` is `*` that also matches `/`. Every other character is
+itself. So `*@corp.com` does not match `x@evil.com, y@corp.com`.
 
-Matching fails closed. An argument does not match if it is missing, if it is
-not a string, if it is longer than 4,096 bytes, if it contains a control
-character (NUL included), or if it has a `..` path segment (split on `/` and
-`\`). Such a call falls to `otherwise`. The upstream may normalise a path
-the gateway saw as `Product/../HR/salaries.csv` into one no rule meant. This
-is why `otherwise` must be restrictive: for a reads tool, name the most
-restricted source the tool can return; for an acts tool it is always
-`block`.
+An argument value matches when it is a string that matches, or a non-empty
+list whose every element is a string that matches. An object, a number, or
+a list with anything else in it never matches.
+
+Matching fails closed. A value does not match if it is longer than 4,096
+bytes, if it contains a control character (NUL included), or if it has a
+`..` segment (split on `/` and `\`). An argument of `type: path` (the
+default in `reads` rules; `text` is the default in `acts` rules) also does
+not match if it contains `%`, `~`, `\` or a character that is not ASCII, if
+it starts with `/` or `./`, or if it has an empty segment (`//`) or a `.`
+segment. Such a call falls to `otherwise`. The upstream may decode,
+expand or normalise a path the gateway saw as `Product/%2e%2e/HR/x` into one
+no rule meant.
+
+Classification trusts the upstream's own naming. A link, alias, symlink or
+id on the upstream can make `Product/roadmap.md` return other content. That
+is why `otherwise` must be the most restrictive source, and why a `reads`
+rule should name only paths whose content you know.
 
 ## What a call does
 
-- **A read** (a `reads` tool, or a tracked passthrough). The gateway resolves
-  the source. If the policy does not list this agent for that source, the
-  call is refused and the upstream is not called. The refusal is the same
-  `tool_not_available` error as for a tool that does not exist. The gateway
-  then forwards the call, hashes the result, registers it as the source and
-  adds it to the agent's session. Only then is the result returned. If it
-  cannot be recorded, the result is withheld (`not_recorded`).
-- **An action** (an `acts` tool). The gateway takes the content argument and
-  records it as an output of everything the session carries. Then it checks
-  the action. It forwards the call only on **allow**. On **deny** the agent
-  gets a tool error with the reason. On **needs approval** the error names
-  the decision; the request appears on the operator page, and once a
-  reviewer approves it the agent may retry the same call. The same content
-  from the same session is the same output, so the approval applies.
+- **A read** (a `reads` tool, or a tracked passthrough). The gateway checks
+  the arguments and resolves the source. If the policy does not list this
+  agent for that source, the call is refused and the upstream is not called.
+  The refusal is the same `tool_not_available` error as for a tool that does
+  not exist. The gateway then forwards the call, hashes the result,
+  registers it as the source and adds it to the agent's session. Only then is
+  the result returned. If it cannot be recorded, the result is withheld
+  (`not_recorded`).
+- **An action** (an `acts` tool). What is checked is exactly what is
+  forwarded: the gateway takes the canonical JSON of every argument the call
+  carries (keys sorted, no whitespace) and records it as an output of
+  everything the session carries. Then it checks the action. It forwards
+  the call only on **allow**. On **deny** the agent gets a tool error with
+  the reason. On **needs approval** the error names the decision, and the
+  request appears on the operator page.
+- **An approval releases one call.** Once a reviewer approves, the agent
+  retries exactly the same call; the gateway forwards it and uses the
+  approval up (a journaled revoke), so the same call again needs a new
+  approval. A call with any argument changed is a different output and a
+  new decision. Two retries at once release one call.
 - **Nothing read.** An action from a session that has read nothing is refused
-  with `nothing_read`. With `allow_without_reads: true` on the tool, it is
-  forwarded without a check, because the runtime cannot record an output
-  that comes from nothing. The gateway prints a line for each such call, and
-  `gateway check` lists the tool as "not checked when nothing was read".
+  with `nothing_read`. With `allow_without_reads: true` on the tool (agent
+  mode only), it is forwarded without a check, because the runtime cannot
+  record an output that comes from nothing. The gateway prints a line for
+  each such call, and `gateway check` lists the tool as "not checked when
+  nothing was read".
 - **Untracked passthrough.** Forwarded and returned as is.
 
-A tool's result is returned as the upstream sent it. Upstream tool
-descriptions are shown to agents with control characters removed and at most
-1,024 characters. They come from the upstream, so treat them as untrusted.
+For a call the gateway holds for approval, the operator page shows the tool,
+the action, the recipients and every forwarded argument, each value cut at
+2,000 characters with a "truncated — N more characters" marker, and the
+SHA-256 of the full canonical arguments. Argument text is shown as text,
+with control, bidirectional and invisible characters shown as escapes. The
+arguments are kept in memory only, never in the journal. After a restart
+the gateway no longer has them: the page says the agent must retry the call,
+and offers no Approve for it (the server refuses one too) until it does.
+
+A tool's result is returned as the upstream sent it. All text an upstream
+provides is untrusted: tool descriptions, titles, input schemas and results.
+Descriptions and every `description` and `title` inside an input schema are
+shown to agents with control characters removed and at most 1,024
+characters each. A tool whose input schema is larger than 64 KiB is not
+offered and refuses calls; the gateway does not start with one.
 
 ## Sessions
 
@@ -226,25 +308,48 @@ A session is what one agent has read, or received in a hand-off, through the
 gateway. Reads accumulate for the session's lifetime and attach to every
 later action. No tool or request lets an agent reset its session.
 
+- **`session: agent`**. One session per agent token, for the gateway's
+  lifetime. This is the strictest mode: it survives reconnects and restarts,
+  because the gateway rebuilds it from the journal. Only the operator can
+  end it, which is how such a session is reset.
 - **`session: connection`** (the default). Each MCP session (the
   `Mcp-Session-Id` of the streamable HTTP transport) is one gateway session,
   bound to the agent that opened it. It ends when the client closes the
   connection, when the operator ends it, or when the gateway restarts. It
   does not end because it is idle. This mode assumes that the host starts a
-  new connection for each task, and that the agent cannot reconnect at will.
-  An agent that can open a new connection starts a new, empty session.
-  An agent may hold at most 64 open connections.
-- **`session: agent`**. One session per agent token, for the gateway's
-  lifetime. This is the strictest mode: it survives reconnects and restarts,
-  because the gateway rebuilds it from the journal. Only the operator can
-  end it, which is how such a session is reset.
+  new connection, with a fresh agent context, for each task, and that the
+  agent cannot reconnect at will. An agent that can open a new connection
+  starts a new, empty session, and so does a client that reconnects by
+  itself: a session the operator ended, and every connection after a
+  restart, answers 404, and MCP clients such as rmcp then initialise again
+  without telling the agent. Use `session: agent` when the host cannot
+  guarantee a fresh agent context per connection.
+
+In both modes an MCP session id belongs to the agent whose token opened it:
+another agent's token can neither use it nor close it (404).
 
 The operator page has a **Sessions** section: each live session with its
 agent, start time and the sources it carries, and an **End session** button
-that asks first. Ending a session forgets what it carries; the agent's next
-call starts an empty one. If a policy activation removes a source or action
-that `gateway.yaml` names, the page lists the problem, and the affected tool
+that asks first. Ending a session forgets what it carries and closes every
+open connection of it (in agent mode, all of that agent's connections), so
+the client must initialise again and starts an empty session. The agent
+keeps whatever is already in its own context, so stop or restart the agent
+first; the page says so next to the button. If a policy activation removes
+a source or action that `gateway.yaml` names, or makes an `otherwise` less
+restrictive than a rule, the page lists the problem, and the affected tool
 answers `tool_misconfigured` until it is fixed.
+
+### Open connections
+
+An agent may hold at most 64 open connections to the gateway. In connection
+mode connections never idle out, because idling out would shed what they
+read; at the cap a new connection is refused (HTTP 429), and no connection
+is ever closed to make room. A client that leaks connections therefore
+reaches the cap. The operator page lists every open connection with its
+agent, session, start and last activity, and an **End connection** button
+(the session it serves keeps what it read), and it names each agent at the
+cap. In agent mode an idle connection may close: the session is the
+agent's, and is kept.
 
 ## Hand-offs
 
@@ -253,8 +358,12 @@ Every agent sees two more tools:
 - `trustgraph__handoff` returns an opaque token for what this session
   carries.
 - `trustgraph__receive {token}` adds a token's contents to this session. It
-  is refused (`not_cleared`) if this agent is not cleared for a source the
-  token carries; nothing is added then.
+  is refused if the token is expired, forged or edited, if its issuer is no
+  longer an agent of the policy (`invalid_handoff`), or if this agent is not
+  cleared for a source the token carries (`not_cleared`). Nothing is added
+  then, and the receiving session may no longer act: every later action is
+  refused with `session_blocked` until the operator ends the session.
+  Refusing a hand-off never leaves the receiver freer than accepting it.
 
 The gateway makes and checks tokens with an HMAC key kept 0600 in
 `<state>/gateway.secret`. A token names the agent that issued it and the
@@ -266,32 +375,43 @@ less than it should carry.
 ## Failures
 
 The gateway fails closed and keeps serving. An upstream that cannot be
-reached, a call that takes longer than `timeout_seconds`, a result larger
-than `max_result_bytes`, a result the gateway cannot use, an upstream error,
+reached, a call that takes longer than `timeout_seconds`, an upstream error,
 and an engine or journal error each become a short tool error for that call.
-The error names the upstream, never the transport detail. After a journal
-failure the whole server answers `restart_required`, as `serve` does. The
-gateway connects to an upstream on first use and again after it fails.
+A result larger than `max_result_bytes`, a malformed result and a result
+that holds a credential all get the same `upstream_result_withheld` error,
+so the error says nothing about a credential. The error names the upstream,
+never the transport detail. After a journal failure the whole server
+answers `restart_required`, as `serve` does. The gateway connects to an
+upstream on first use and again after it fails.
+
+A timed-out action may already have happened on the upstream: the gateway
+stopped waiting, not the upstream. A retry sends it again, and an approved
+call that timed out has used its approval.
 
 Gateway calls count against each agent's rate limit and journal and artifact
 budgets, as HTTP API calls do; see [Limits and quotas](serve.md#limits-and-quotas).
 
 ## What it covers and what it does not
 
-Covered: tool calls through `/gateway/mcp` to the listed tools, and the
-gateway's two hand-off tools.
+Covered: tool calls through `/gateway/mcp` to the listed tools, with only
+their listed arguments, and the gateway's two hand-off tools.
 
 Not covered:
 
-- MCP resources, prompts, sampling and elicitation are not exposed. Only
-  tools are.
+- Classification is by the request's arguments, not by the content an
+  upstream returns. A read is the source its rule names, whatever comes back.
 - The result of an action tool (for example "posted, id 123") is returned
-  untracked.
-- An upstream tool's own side effects beyond its result (a file it writes, a
+  untracked. Links inside any result are not followed or tracked, and an
+  upstream tool's side effects beyond its result (a file it writes, a
   request it makes) are not tracked.
-- In `connection` mode, an agent that can open new connections can start
-  fresh sessions; use `agent` mode where it can.
-- Tools that ask for input mid-call or that run as tasks are refused.
+- A dropped hand-off token cannot be detected.
+- MCP resources, prompts, sampling and elicitation are not exposed. Only
+  tools are. Tools that ask for input mid-call or that run as tasks are
+  refused.
+- In `connection` mode, an agent or client that can open new connections
+  starts fresh sessions; use `agent` mode where it can.
+- Ending a session does not clear what the agent already holds in its own
+  context.
 
 ## Threat model
 
@@ -299,16 +419,26 @@ Everything in the [serve threat model](serve.md#threat-model) applies. In
 addition:
 
 - **The gateway holds upstream credentials.** Protect its environment, its
-  config and its state directory. Any process that can read the gateway's
-  environment, or run as its OS user, can use the upstreams directly.
+  config and its state directory. Secrets supplied through the environment
+  are readable by any process running as the same OS user, and that
+  includes a stdio upstream the gateway launches: it runs as the gateway's
+  user, so it can read the gateway's environment (for example through
+  `/proc` on Linux) and the state directory, with its agent tokens and the
+  operator sign-in file. The private `HOME` and minimal `PATH` keep an
+  honest server from picking them up by accident; they do not contain a
+  hostile one. Run the gateway as its own OS user, keep the state directory
+  unreadable to others, and run untrusted stdio servers (anything fetched
+  with `npx` or `uvx`) as a different user or in a sandbox, or reach them
+  over HTTP instead.
 - **Agents must have no other route to the upstreams.** The gateway can be
   skipped by any agent that holds the upstream's credentials or can reach it
   some other way. Give the credentials only to the gateway.
-- **Upstream text is untrusted.** Tool descriptions and results come from the
-  upstream servers. The gateway removes control characters from
-  descriptions and withholds a result that contains a credential, but it does
-  not judge what the upstream says.
+- **Upstream text is untrusted.** Tool descriptions, titles, schemas and
+  results come from the upstream servers. The gateway removes control
+  characters from descriptions and schema text and withholds a result that
+  contains a credential, but it does not judge what the upstream says.
 - **What a tool reads is what the config says.** A `reads` rule that names
-  the wrong source, or an `otherwise` that is not restrictive, lets content
-  through under a weaker label. Review `gateway.yaml` like the policy, and
-  read the `gateway check` summary.
+  the wrong source lets content through under a weaker label, and the
+  upstream decides what a path or id really returns. Review `gateway.yaml`
+  like the policy, make `otherwise` the most restrictive source, and read
+  the `gateway check` summary.

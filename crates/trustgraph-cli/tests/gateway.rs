@@ -33,8 +33,10 @@ sources:
   roadmap: { readers: [hr, engineering, leadership], agents: [planner] }
   benchmarks: { readers: [hr, engineering, leadership], agents: [researcher, planner, scout] }
   unclassified: { readers: [hr], agents: [researcher, planner, scout] }
+  unmatched: { readers: [hr], agents: [planner] }
 actions:
   post_to_engineering: { agents: [planner, scout], audience: [engineering] }
+  email_staff: { agents: [planner], audience: [engineering] }
   brief_leadership:
     agents: [planner]
     audience: [leadership]
@@ -117,9 +119,15 @@ tools:
         source: roadmap
       - when: {{ path: "Public/*" }}
         source: benchmarks
-    otherwise: salaries
+    otherwise: unmatched
+  drive.slow_read:
+    reads:
+      - when: {{ path: "Product/**" }}
+        source: roadmap
+    otherwise: unmatched
   drive.search:
     passthrough: true
+    arguments: [query]
   drive.slow:
     passthrough: true
     untracked: true
@@ -127,6 +135,7 @@ tools:
     passthrough: true
     untracked: true
   slack.post_message:
+    arguments: [channel, text, thread]
     acts:
       - when: {{ channel: "#engineering" }}
         action: post_to_engineering
@@ -134,17 +143,35 @@ tools:
       - when: {{ channel: "#leadership" }}
         action: brief_leadership
         content: text
+  slack.send_email:
+    arguments: [to, subject, body]
+    acts:
+      - when: {{ to: "*@corp.com" }}
+        action: email_staff
+        content: body
   slack.env_names:
+    passthrough: true
+    untracked: true
+  slack.env_home:
+    passthrough: true
+    untracked: true
+  slack.leak:
+    passthrough: true
+    untracked: true
+  drive.huge_schema:
     passthrough: true
     untracked: true
   gone.read_file:
     passthrough: true
     untracked: true
+    arguments: [path]
 "##,
         fake = fake_upstream().display(),
         log = slack_log.display(),
     )
 }
+
+const HUGE_SCHEMA_TOOL: &str = "  drive.huge_schema:\n    passthrough: true\n    untracked: true\n";
 
 fn env(name: &str) -> Option<String> {
     match name {
@@ -494,15 +521,15 @@ async fn allow_without_reads_forwards_unchecked() {
     let state = dir.path().join("state");
     let h = launch_with(
         dir.path(),
-        "connection",
+        "agent",
         move |port| {
             let runtime = Runtime::open(MemoryJournal::new(), POLICY, 0).unwrap();
             Server::new(runtime, settings(port, &state, Limits::default())).unwrap()
         },
         |text| {
             text.replace(
-                "  slack.env_names:",
-                "    allow_without_reads: true\n  slack.env_names:",
+                "  slack.send_email:",
+                "    allow_without_reads: true\n  slack.send_email:",
             )
         },
     )
@@ -541,8 +568,12 @@ async fn an_uncleared_read_and_an_unknown_tool_look_the_same_and_reach_nothing()
         "drive__read_file",
         "drive__search",
         "drive__slow",
+        "drive__slow_read",
+        "slack__env_home",
         "slack__env_names",
+        "slack__leak",
         "slack__post_message",
+        "slack__send_email",
     ];
     let mut listed_sorted = listed.clone();
     listed_sorted.sort();
@@ -593,7 +624,7 @@ async fn when_rules_cannot_be_bypassed() {
     let dir = tempfile::tempdir().unwrap();
     let h = memory(dir.path(), "connection").await;
     let operator = h.login().await;
-    // Each of these must fall to `otherwise` (salaries), never to roadmap.
+    // Each of these must fall to `otherwise` (unmatched), never to roadmap.
     let attempts = [
         json!("Product/../HR/Compensation/salaries.csv"),
         json!("Product\\..\\HR\\Compensation\\salaries.csv"),
@@ -601,7 +632,8 @@ async fn when_rules_cannot_be_bypassed() {
         json!("PRODUCT/roadmap.md"),
         json!("Product/road\u{0}map.md"),
         json!("Product/\nroadmap.md"),
-        json!(["Product/roadmap.md"]),
+        json!(["Product/roadmap.md", "HR/Compensation/salaries.csv"]),
+        json!([]),
         json!(5),
         json!({"path": "Product/roadmap.md"}),
     ];
@@ -617,7 +649,7 @@ async fn when_rules_cannot_be_bypassed() {
             .map(|(_, _, sources)| sources)
             .collect();
         assert!(
-            carried.iter().all(|s| s == &vec!["salaries".to_string()]),
+            carried.iter().all(|s| s == &vec!["unmatched".to_string()]),
             "{path}: {carried:?}"
         );
         planner.client.cancel().await.unwrap();
@@ -717,7 +749,7 @@ async fn upstream_failures_fail_closed_and_the_gateway_keeps_serving() {
     let slow = h.call(&planner, "drive__slow", json!({})).await;
     assert_eq!(error_code(&slow), "upstream_timeout");
     let big = h.call(&planner, "drive__big", json!({})).await;
-    assert_eq!(error_code(&big), "upstream_result_too_large");
+    assert_eq!(error_code(&big), "upstream_result_withheld");
     let gone = h
         .call(&planner, "gone__read_file", json!({"path": "x"}))
         .await;
@@ -932,9 +964,11 @@ async fn agent_sessions_survive_reconnects_and_restarts_until_the_operator_ends_
         .await;
     assert_eq!(status, 200, "{body}");
     assert!(h.sessions(&operator).await.is_empty());
-    ok(&h.read(&third, "Product/roadmap.md").await);
+    // Ending it closed the connection: the client initialises again.
+    let fourth = h.connect("planner").await;
+    ok(&h.read(&fourth, "Product/roadmap.md").await);
     assert_eq!(
-        ok(&h.post(&third, "#engineering", "roadmap").await),
+        ok(&h.post(&fourth, "#engineering", "roadmap").await),
         "posted to #engineering"
     );
     let (status, _) = h
@@ -1111,9 +1145,11 @@ async fn upstream_credentials_never_reach_agents_logs_or_the_journal() {
     let drive = drive(dir.path()).await;
     let slack_log = dir.path().join("slack.log");
     let config_path = dir.path().join("gateway.yaml");
+    // The real binary refuses to start when an upstream tool's schema is
+    // over the cap, so leave that tool out here.
     std::fs::write(
         &config_path,
-        config_text(&drive.url, &slack_log, "connection"),
+        config_text(&drive.url, &slack_log, "connection").replace(HUGE_SCHEMA_TOOL, ""),
     )
     .unwrap();
     let policy_path = dir.path().join("policy.yaml");
@@ -1341,6 +1377,7 @@ tools:
         source: secrets
     otherwise: salaries
   drive.post:
+    arguments: [text]
     acts:
       - action: shout
   drive.search: { passthrough: true }
@@ -1394,6 +1431,102 @@ fn globs_and_matching_fail_closed() {
         config::safe_for_matching(&json!("Product/..roadmap")),
         Some("Product/..roadmap")
     );
+    // `*`, `?` and `**` never cross list, header or markup separators.
+    for (pattern, text) in [
+        ("*@corp.com", "x@evil.com, y@corp.com"),
+        ("*@corp.com", "x@evil.com;y@corp.com"),
+        ("*@corp.com", "x@evil.com y@corp.com"),
+        ("*@corp.com", "x@evil.com\ty@corp.com"),
+        ("*@corp.com", "\"x@evil.com\"y@corp.com"),
+        ("*@corp.com", "<x@evil.com>y@corp.com"),
+        ("**@corp.com", "a/x@evil.com,y@corp.com"),
+        ("#eng?", "#eng,"),
+    ] {
+        assert!(!config::glob(pattern, text), "{pattern} {text}");
+    }
+    assert!(config::glob("**@corp.com", "a/b@corp.com"));
+    for odd in [
+        "%2e%2e/x",
+        "~/x",
+        "a\\b",
+        "/abs",
+        "./x",
+        "a//b",
+        "a/./b",
+        "a/",
+        "r\u{f6}admap",
+    ] {
+        assert!(
+            config::safe_path_for_matching(&json!(odd)).is_none(),
+            "{odd}"
+        );
+        assert!(config::safe_for_matching(&json!(odd)).is_some(), "{odd}");
+    }
+    assert_eq!(
+        config::safe_path_for_matching(&json!("Product/roadmap.md")),
+        Some("Product/roadmap.md")
+    );
+}
+
+#[test]
+fn when_types_arguments_and_shadowed_rules() {
+    let text = "version: 1
+session: agent
+upstreams:
+  drive: { url: \"https://drive.example.com/mcp\" }
+tools:
+  drive.read_file:
+    arguments: [revision]
+    reads:
+      - when: { path: \"Product/**\" }
+        source: roadmap
+      - when: { path: \"Product/**\", revision: \"1\" }
+        source: benchmarks
+    otherwise: unmatched
+  drive.post:
+    arguments: [to, body]
+    acts:
+      - when: { to: { glob: \"/srv/*\", type: path } }
+        action: post_to_engineering
+        content: body
+";
+    let config = config::parse(text).unwrap();
+    let read = &config.tools["drive__read_file"];
+    assert_eq!(
+        read.arguments
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["path", "revision"],
+        "the rules' arguments plus the listed ones"
+    );
+    let config::Kind::Acts { rules, .. } = &config.tools["drive__post"].kind else {
+        panic!()
+    };
+    assert!(rules[0].when[0].path);
+    let warnings = config::warnings(&config);
+    assert_eq!(warnings.len(), 1, "{warnings:#?}");
+    assert_eq!(warnings[0].path, "tools.drive.read_file.reads[1]");
+    // A path-typed argument with a leading `/` never matches.
+    let args = json!({"to": "/srv/x", "body": "b"});
+    assert!(!config::when_matches(
+        &rules[0].when,
+        args.as_object().unwrap()
+    ));
+    // Two names equal ignoring case, and an unknown `when` key, are errors.
+    let bad = text
+        .replace("arguments: [to, body]", "arguments: [to, body, To]")
+        .replace("type: path", "type: path, kind: x");
+    let problems = config::parse(&bad).unwrap_err();
+    let paths: Vec<&str> = problems.iter().map(|p| p.path.as_str()).collect();
+    assert!(
+        paths.contains(&"tools.drive.post.arguments[2]"),
+        "{problems:#?}"
+    );
+    assert!(
+        paths.contains(&"tools.drive.post.acts[0].when.to.kind"),
+        "{problems:#?}"
+    );
 }
 
 #[test]
@@ -1408,8 +1541,8 @@ fn gateway_check_prints_a_plain_summary() {
             "agent",
         )
         .replace(
-            "  slack.env_names:",
-            "    allow_without_reads: true\n  slack.env_names:",
+            "  slack.send_email:",
+            "    allow_without_reads: true\n  slack.send_email:",
         ),
     )
     .unwrap();
@@ -1452,4 +1585,770 @@ fn gateway_check_prints_a_plain_summary() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(output.status.code(), Some(1));
     assert!(stdout.contains("3 problem(s)"), "{stdout}");
+}
+
+#[test]
+fn gateway_check_compares_arguments_with_what_the_upstream_publishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("gateway.yaml");
+    let policy_path = dir.path().join("policy.yaml");
+    std::fs::write(&policy_path, POLICY).unwrap();
+    let text = config_text(
+        "http://drive.example.com/mcp",
+        Path::new("/dev/null"),
+        "agent",
+    );
+    let run = |text: &str| {
+        std::fs::write(&config_path, text).unwrap();
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_trustgraph"))
+            .args(["gateway", "check", "--config"])
+            .arg(&config_path)
+            .arg("--policy")
+            .arg(&policy_path)
+            .env_remove("DRIVE_TOKEN")
+            .env("SLACK_TOKEN", SLACK_SECRET)
+            .output()
+            .unwrap();
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).to_string(),
+        )
+    };
+    let (code, stdout) = run(&text);
+    assert_eq!(code, Some(0), "{stdout}");
+    for expected in [
+        "forwards only the arguments: channel, text, thread; a call with any other is refused",
+        "upstream arguments NOT forwardable: blocks",
+        "upstream arguments NOT forwardable: bcc",
+        "note: upstream `drive` was not contacted",
+        "warning: upstreams.drive.url: plain http:// to a host that is not loopback",
+    ] {
+        assert!(stdout.contains(expected), "{expected:?} not in:\n{stdout}");
+    }
+    // An allow-listed argument the upstream tool does not take is an error.
+    let (code, stdout) = run(&text.replace(
+        "arguments: [to, subject, body]",
+        "arguments: [to, subject, body, cc]",
+    ));
+    assert_eq!(code, Some(1), "{stdout}");
+    assert!(
+        stdout.contains(
+            "tools.slack.send_email.arguments: `cc` is not an argument the upstream tool takes"
+        ),
+        "{stdout}"
+    );
+}
+
+// ----- security review regressions -----
+
+fn decision_of(result: &Value) -> String {
+    result["structuredContent"]["error"]["decision"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// Every call the gateway forwarded to the slack upstream.
+fn slack_calls<J: ServeJournal>(h: &Gw<J>) -> Vec<String> {
+    std::fs::read_to_string(&h.slack_log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// The source sets of the planner's live sessions, as the operator sees them.
+async fn planner_sources<J: ServeJournal>(h: &Gw<J>, operator: &str) -> Vec<Vec<String>> {
+    h.sessions(operator)
+        .await
+        .into_iter()
+        .filter(|(_, agent, sources)| agent == "planner" && !sources.is_empty())
+        .map(|(_, _, sources)| sources)
+        .collect()
+}
+
+/// Open an MCP session over raw HTTP.
+async fn raw_init<J: ServeJournal>(h: &Gw<J>, agent: &str) -> reqwest::Response {
+    h.http
+        .post(format!("{}/gateway/mcp", h.base))
+        .bearer_auth(h.token(agent))
+        .header("accept", "application/json, text/event-stream")
+        .json(
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "t", "version": "0"}}}),
+        )
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn raw_post<J: ServeJournal>(
+    h: &Gw<J>,
+    agent: &str,
+    mcp: &str,
+    body: Value,
+) -> (u16, String) {
+    let response = h
+        .http
+        .post(format!("{}/gateway/mcp", h.base))
+        .bearer_auth(h.token(agent))
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-session-id", mcp)
+        .header("mcp-protocol-version", "2025-06-18")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    (status, response.text().await.unwrap_or_default())
+}
+
+#[tokio::test]
+async fn c1_extra_and_case_variant_arguments_are_refused_and_never_forwarded() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = memory(dir.path(), "connection").await;
+    let planner = h.connect("planner").await;
+    ok(&h.read(&planner, "Product/roadmap.md").await);
+    // The reviewer's reproduction: checked as a post to #engineering.
+    let reproduced = h
+        .call(
+            &planner,
+            "slack__post_message",
+            json!({"Channel": "#all-company", "blocks": "SALARY nina 120k",
+                   "channel": "#engineering", "text": "hi"}),
+        )
+        .await;
+    assert_eq!(error_code(&reproduced), "invalid_arguments", "{reproduced}");
+    let message = text(&reproduced);
+    assert!(
+        message.contains("Channel") || message.contains("blocks"),
+        "{message}"
+    );
+    // Only the case variant.
+    let variant = h
+        .call(
+            &planner,
+            "slack__post_message",
+            json!({"channel": "#engineering", "CHANNEL": "#all-company", "text": "hi"}),
+        )
+        .await;
+    assert_eq!(error_code(&variant), "invalid_arguments", "{variant}");
+    // An argument the upstream knows but the config does not forward.
+    let bcc = h
+        .call(
+            &planner,
+            "slack__send_email",
+            json!({"to": "sam@corp.com", "body": "Q3", "bcc": "x@evil.com"}),
+        )
+        .await;
+    assert_eq!(error_code(&bcc), "invalid_arguments", "{bcc}");
+    assert!(text(&bcc).contains("bcc"), "{bcc}");
+    assert!(slack_calls(&h).is_empty(), "{:?}", slack_calls(&h));
+
+    // A read with an extra argument is refused too, before the upstream.
+    let extra = h
+        .call(
+            &planner,
+            "drive__read_file",
+            json!({"path": "Public/benchmarks.md", "file_id": "HR-salaries"}),
+        )
+        .await;
+    assert_eq!(error_code(&extra), "invalid_arguments", "{extra}");
+    assert_eq!(calls(&h.drive.log, "read_file").len(), 1);
+
+    // Arguments that are not an object never reach the upstream.
+    let init = raw_init(&h, "planner").await;
+    let mcp = init.headers()["mcp-session-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    raw_post(
+        &h,
+        "planner",
+        &mcp,
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    )
+    .await;
+    let (_, body) = raw_post(
+        &h,
+        "planner",
+        &mcp,
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+               "params": {"name": "slack__post_message", "arguments": ["#engineering", "hi"]}}),
+    )
+    .await;
+    assert!(!body.contains("posted"), "{body}");
+    assert!(slack_calls(&h).is_empty());
+}
+
+#[tokio::test]
+async fn c1_recipient_globs_do_not_cross_separators_and_arrays_must_all_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = memory(dir.path(), "connection").await;
+    let planner = h.connect("planner").await;
+    ok(&h.read(&planner, "Product/roadmap.md").await);
+    for to in [
+        json!("x@evil.com, y@corp.com"),
+        json!("x@evil.com;y@corp.com"),
+        json!("x@evil.com y@corp.com"),
+        json!("<x@evil.com>y@corp.com"),
+        json!(["a@corp.com", "b@evil.com"]),
+        json!([]),
+        json!([1]),
+        json!({"to": "a@corp.com"}),
+    ] {
+        let sent = h
+            .call(
+                &planner,
+                "slack__send_email",
+                json!({"to": to, "body": "Q3"}),
+            )
+            .await;
+        assert_eq!(error_code(&sent), "blocked", "{to}: {sent}");
+    }
+    assert!(slack_calls(&h).is_empty(), "{:?}", slack_calls(&h));
+    let sent = h
+        .call(
+            &planner,
+            "slack__send_email",
+            json!({"to": ["a@corp.com", "b@corp.com"], "body": "Q3"}),
+        )
+        .await;
+    assert_eq!(ok(&sent), "sent");
+}
+
+#[tokio::test]
+async fn c1_odd_and_encoded_paths_fall_to_otherwise() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = memory(dir.path(), "connection").await;
+    let operator = h.login().await;
+    for path in [
+        "Product/%2e%2e/HR/Compensation/salaries.csv",
+        "Product/..%2FHR/salaries.csv",
+        "/Product/roadmap.md",
+        "./Product/roadmap.md",
+        "Product//roadmap.md",
+        "Product/./roadmap.md",
+        "Product/~/roadmap.md",
+        "Product/r\u{f6}admap.md",
+        "Product/roadmap.md\u{202e}",
+    ] {
+        let planner = h.connect("planner").await;
+        h.read(&planner, path).await;
+        let carried = planner_sources(&h, &operator).await;
+        assert!(
+            carried.iter().all(|s| s == &vec!["unmatched".to_string()]),
+            "{path}: {carried:?}"
+        );
+        planner.client.cancel().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn c2_an_approval_releases_exactly_one_identical_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = memory(dir.path(), "connection").await;
+    let planner = h.connect("planner").await;
+    ok(&h.read(&planner, "Product/roadmap.md").await);
+    let args = json!({"channel": "#leadership", "text": "Q3 roadmap summary"});
+    let held = h.call(&planner, "slack__post_message", args.clone()).await;
+    assert_eq!(error_code(&held), "needs_approval");
+    let decision = decision_of(&held);
+
+    let operator = h.login().await;
+    let (status, body) = h
+        .op_post(
+            "/v1/operator/approve",
+            &operator,
+            json!({"decision": decision}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    // A retry with any argument changed is a different call: a new decision.
+    let changed = h
+        .call(
+            &planner,
+            "slack__post_message",
+            json!({"channel": "#leadership", "text": "Q3 roadmap summary", "thread": "1"}),
+        )
+        .await;
+    assert_eq!(error_code(&changed), "needs_approval", "{changed}");
+    assert_ne!(decision_of(&changed), decision);
+    assert!(slack_calls(&h).is_empty());
+
+    // The identical retry is forwarded once.
+    let retry = h.call(&planner, "slack__post_message", args.clone()).await;
+    assert_eq!(ok(&retry), "posted to #leadership");
+    assert_eq!(slack_calls(&h).len(), 1);
+    // The approval is used up: the same call again is held again.
+    let again = h.call(&planner, "slack__post_message", args.clone()).await;
+    assert_eq!(error_code(&again), "needs_approval", "{again}");
+    assert_eq!(slack_calls(&h).len(), 1);
+    let state = h.op_state(&operator).await;
+    assert!(
+        state["approvals"].as_array().unwrap().is_empty(),
+        "{}",
+        state["approvals"]
+    );
+}
+
+fn canonical_sha(arguments: &Value) -> String {
+    use sha2::Digest;
+    let text = serde_json::to_string(arguments).unwrap();
+    sha2::Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+#[tokio::test]
+async fn c2_the_operator_sees_the_arguments_of_a_held_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = memory(dir.path(), "connection").await;
+    let planner = h.connect("planner").await;
+    ok(&h.read(&planner, "Product/roadmap.md").await);
+    let long = format!("Q3 <b>plan</b>\u{1b}[2J{}", "x".repeat(2500));
+    let args = json!({"channel": "#leadership", "text": long});
+    let held = h.call(&planner, "slack__post_message", args.clone()).await;
+    assert_eq!(error_code(&held), "needs_approval");
+    let operator = h.login().await;
+    let state = h.op_state(&operator).await;
+    let pending = &state["pending"][0];
+    let call = &pending["gateway"];
+    assert_eq!(call["tool"], "slack__post_message", "{pending}");
+    assert_eq!(call["held"], true, "{pending}");
+    assert_eq!(pending["can_approve"], true);
+    assert_eq!(call["sha256"], canonical_sha(&args));
+    let arguments = call["arguments"].as_array().unwrap();
+    assert_eq!(arguments[0]["name"], "channel");
+    assert_eq!(arguments[0]["value"], "#leadership");
+    assert_eq!(arguments[1]["name"], "text");
+    let shown = arguments[1]["value"].as_str().unwrap();
+    assert_eq!(shown.chars().count(), 2000);
+    assert!(long.starts_with(shown));
+    assert_eq!(
+        arguments[1]["more"].as_u64().unwrap() as usize,
+        long.chars().count() - 2000
+    );
+}
+
+#[tokio::test]
+async fn c2_after_a_restart_a_held_call_must_be_retried_before_it_can_be_approved() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = on_disk(dir.path(), "agent").await;
+    let planner = h.connect("planner").await;
+    ok(&h.read(&planner, "Product/roadmap.md").await);
+    let args = json!({"channel": "#leadership", "text": "Q3 plan, held in memory only"});
+    let held = h.call(&planner, "slack__post_message", args.clone()).await;
+    let decision = decision_of(&held);
+    // The arguments are kept in memory only, never in the journal.
+    assert!(!all_files(&h.state).contains("held in memory only"));
+    planner.client.cancel().await.unwrap();
+    let h = restart(h, dir.path(), "agent").await;
+    let operator = h.login().await;
+    let state = h.op_state(&operator).await;
+    let pending = &state["pending"][0];
+    assert_eq!(pending["decision"], decision.as_str());
+    assert_eq!(pending["can_approve"], false, "{pending}");
+    assert_eq!(pending["gateway"]["held"], false, "{pending}");
+    assert!(
+        pending["cannot_approve"].as_str().unwrap().contains("retr"),
+        "{pending}"
+    );
+    let (status, _) = h
+        .op_post(
+            "/v1/operator/approve",
+            &operator,
+            json!({"decision": decision}),
+        )
+        .await;
+    assert_ne!(status, 200, "approving a call nobody can see is refused");
+    // The agent retries; now it can be approved, and the retry after that goes.
+    let planner = h.connect("planner").await;
+    let again = h.call(&planner, "slack__post_message", args.clone()).await;
+    assert_eq!(decision_of(&again), decision);
+    let state = h.op_state(&operator).await;
+    assert_eq!(state["pending"][0]["can_approve"], true);
+    let (status, body) = h
+        .op_post(
+            "/v1/operator/approve",
+            &operator,
+            json!({"decision": decision}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        ok(&h.call(&planner, "slack__post_message", args).await),
+        "posted to #leadership"
+    );
+}
+
+#[tokio::test]
+async fn ending_an_agent_session_closes_its_live_connections() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = memory(dir.path(), "agent").await;
+    let init = raw_init(&h, "planner").await;
+    let mcp = init.headers()["mcp-session-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    raw_post(
+        &h,
+        "planner",
+        &mcp,
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    )
+    .await;
+    let read = |id: u64| {
+        json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {
+            "name": "drive__read_file", "arguments": {"path": "HR/Compensation/salaries.csv"}}})
+    };
+    let (status, body) = raw_post(&h, "planner", &mcp, read(2)).await;
+    assert_eq!(status, 200);
+    assert!(body.contains("120k"), "{body}");
+    let operator = h.login().await;
+    let (status, body) = h
+        .op_post(
+            "/v1/operator/end-session",
+            &operator,
+            json!({"session": "agent:planner"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    // The same connection can no longer call tools: it must initialise again.
+    let (status, body) = raw_post(&h, "planner", &mcp, read(3)).await;
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(calls(&h.drive.log, "read_file").len(), 1);
+}
+
+#[tokio::test]
+async fn in_agent_mode_an_mcp_session_belongs_to_the_agent_that_opened_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = memory(dir.path(), "agent").await;
+    let init = raw_init(&h, "planner").await;
+    assert_eq!(init.status().as_u16(), 200);
+    let mcp = init.headers()["mcp-session-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let (status, _) = raw_post(
+        &h,
+        "scout",
+        &mcp,
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+    )
+    .await;
+    assert_eq!(status, 404);
+    let deleted = h
+        .http
+        .delete(format!("{}/gateway/mcp", h.base))
+        .bearer_auth(h.token("scout"))
+        .header("mcp-session-id", &mcp)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status().as_u16(), 404);
+    let (status, _) = raw_post(
+        &h,
+        "planner",
+        &mcp,
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    )
+    .await;
+    assert!(status < 300, "{status}");
+}
+
+#[tokio::test]
+async fn the_operator_page_lists_open_connections_and_the_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = memory(dir.path(), "agent").await;
+    let operator = h.login().await;
+    let planner = h.connect("planner").await;
+    ok(&h.read(&planner, "Product/roadmap.md").await);
+    let state = h.op_state(&operator).await;
+    let connections = state["gateway"]["connections"].as_array().unwrap().clone();
+    assert_eq!(connections.len(), 1, "{}", state["gateway"]);
+    assert_eq!(connections[0]["agent"], "planner");
+    assert!(connections[0]["last_active"].as_u64().is_some());
+    for _ in 1..gateway::MAX_CONNECTIONS_PER_AGENT {
+        assert_eq!(raw_init(&h, "planner").await.status().as_u16(), 200);
+    }
+    let refused = raw_init(&h, "planner").await;
+    assert_eq!(refused.status().as_u16(), 429);
+    assert!(refused.text().await.unwrap().contains("operator page"));
+    let state = h.op_state(&operator).await;
+    assert_eq!(state["gateway"]["at_cap"], json!(["planner"]));
+    // End one connection: a new one is accepted again.
+    let id = connections[0]["connection"].as_str().unwrap().to_string();
+    let (status, body) = h
+        .op_post(
+            "/v1/operator/end-connection",
+            &operator,
+            json!({"connection": id}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(raw_init(&h, "planner").await.status().as_u16(), 200);
+}
+
+#[tokio::test]
+async fn a_stdio_upstream_gets_a_private_home_and_a_minimal_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = memory(dir.path(), "connection").await;
+    let planner = h.connect("planner").await;
+    let out = ok(&h.call(&planner, "slack__env_home", json!({})).await);
+    let (home, path) = out.split_once('\n').unwrap();
+    assert_ne!(Some(home.to_string()), std::env::var("HOME").ok());
+    assert_ne!(Some(path.to_string()), std::env::var("PATH").ok());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(home).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        assert_eq!(std::fs::read_dir(home).unwrap().count(), 0, "empty");
+    }
+}
+
+#[tokio::test]
+async fn upstream_results_with_a_credential_or_over_the_cap_look_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = memory(dir.path(), "connection").await;
+    let planner = h.connect("planner").await;
+    let leak = h.call(&planner, "slack__leak", json!({})).await;
+    let big = h.call(&planner, "drive__big", json!({})).await;
+    assert_eq!(error_code(&leak), "upstream_result_withheld");
+    assert_eq!(error_code(&big), "upstream_result_withheld");
+    assert!(!leak.to_string().contains(SLACK_SECRET));
+}
+
+#[tokio::test]
+async fn upstream_schema_text_is_cleaned_and_a_huge_schema_closes_its_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = memory(dir.path(), "connection").await;
+    let planner = h.connect("planner").await;
+    let tools = planner.client.peer().list_all_tools().await.unwrap();
+    assert!(!tools.iter().any(|t| t.name == "drive__huge_schema"));
+    let post = tools
+        .iter()
+        .find(|t| t.name == "slack__post_message")
+        .unwrap();
+    let schema = serde_json::to_string(&*post.input_schema).unwrap();
+    assert!(
+        !schema.contains("\\u001b") && !schema.contains("\\u0007"),
+        "{schema}"
+    );
+    let huge = h.call(&planner, "drive__huge_schema", json!({})).await;
+    assert!(huge["isError"] == true, "{huge}");
+}
+
+#[tokio::test]
+async fn a_refused_hand_off_leaves_the_receiver_unable_to_act() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = memory(dir.path(), "connection").await;
+    let planner = h.connect("planner").await;
+    ok(&h.read(&planner, "Product/roadmap.md").await);
+    let refused = h
+        .call(
+            &planner,
+            gateway::RECEIVE_TOOL,
+            json!({"token": "tgh1.00.00"}),
+        )
+        .await;
+    assert_eq!(error_code(&refused), "invalid_handoff");
+    let post = h.post(&planner, "#engineering", "roadmap").await;
+    assert_eq!(error_code(&post), "session_blocked", "{post}");
+    assert!(slack_calls(&h).is_empty());
+}
+
+#[tokio::test]
+async fn a_connection_ended_mid_call_leaves_no_session_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = memory(dir.path(), "connection").await;
+    let operator = h.login().await;
+    let planner = Arc::new(h.connect("planner").await);
+    ok(&h.read(&planner, "Product/roadmap.md").await);
+    let session = h.sessions(&operator).await[0].0.clone();
+    let p2 = planner.clone();
+    let call = tokio::spawn(async move {
+        let _ = p2
+            .client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("drive__slow_read").with_arguments(
+                    json!({"path": "Product/roadmap.md"})
+                        .as_object()
+                        .cloned()
+                        .unwrap(),
+                ),
+            )
+            .await;
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let (status, body) = h
+        .op_post(
+            "/v1/operator/end-session",
+            &operator,
+            json!({"session": session}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let _ = tokio::time::timeout(Duration::from_secs(3), call).await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let left = h.sessions(&operator).await;
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[test]
+fn config_refuses_what_the_review_found() {
+    let text = "version: 1
+session: connection
+upstreams:
+  drive: { url: \"https://user:pw@drive.example.com/mcp\" }
+  slack: { command: [x] }
+tools:
+  slack.post:
+    acts:
+      - when: { channel: \"#eng\" }
+        action: post_to_engineering
+    allow_without_reads: true
+";
+    let problems = config::parse(text).unwrap_err();
+    let paths: Vec<&str> = problems.iter().map(|p| p.path.as_str()).collect();
+    for expected in [
+        "upstreams.drive.url",
+        "tools.slack.post.arguments",
+        "tools.slack.post.allow_without_reads",
+    ] {
+        assert!(
+            paths.contains(&expected),
+            "{expected} missing from {problems:#?}"
+        );
+    }
+}
+
+#[test]
+fn otherwise_must_be_at_least_as_restrictive_as_every_rule() {
+    let text = "version: 1
+upstreams:
+  drive: { url: \"http://127.0.0.1:1/mcp\" }
+tools:
+  drive.read_file:
+    reads:
+      - when: { path: \"Product/**\" }
+        source: roadmap
+    otherwise: salaries
+";
+    let config = config::parse(text).unwrap();
+    let policy = trustgraph_policy::parse(POLICY).policy.unwrap();
+    let problems = config::check_against(&config, &policy);
+    assert_eq!(problems.len(), 1, "{problems:#?}");
+    assert_eq!(problems[0].path, "tools.drive.read_file.otherwise");
+    assert!(
+        problems[0].message.contains("researcher"),
+        "{}",
+        problems[0]
+    );
+}
+
+#[tokio::test]
+async fn a_short_secret_is_refused_at_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let drive = drive(dir.path()).await;
+    let config = config::parse(&config_text(
+        &drive.url,
+        &dir.path().join("s.log"),
+        "connection",
+    ))
+    .unwrap();
+    let state = dir.path().join("state");
+    let runtime = Runtime::open(MemoryJournal::new(), POLICY, 0).unwrap();
+    let server = Server::new(runtime, settings(1, &state, Limits::default())).unwrap();
+    let short = |name: &str| match name {
+        "SLACK_TOKEN" => Some("short".to_string()),
+        other => env(other),
+    };
+    let problems = gateway::attach(server, config, &short).err().unwrap();
+    assert!(
+        problems.iter().any(|p| p.contains("SLACK_TOKEN")),
+        "{problems:?}"
+    );
+}
+
+#[test]
+fn the_bridge_refuses_a_readable_token_file_and_a_cleartext_remote_url() {
+    let dir = tempfile::tempdir().unwrap();
+    let token = dir.path().join("planner.token");
+    std::fs::write(&token, "a".repeat(64)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_trustgraph"))
+            .args([
+                "gateway",
+                "stdio",
+                "--url",
+                "http://127.0.0.1:9/gateway/mcp",
+                "--token-file",
+            ])
+            .arg(&token)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("readable"));
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_trustgraph"))
+        .args([
+            "gateway",
+            "stdio",
+            "--url",
+            "http://gateway.example.com/gateway/mcp",
+            "--token-file",
+        ])
+        .arg(&token)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--allow-insecure"));
+}
+
+#[tokio::test]
+async fn c2_concurrent_identical_retries_release_one_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = memory(dir.path(), "agent").await;
+    let planner = h.connect("planner").await;
+    ok(&h.read(&planner, "Product/roadmap.md").await);
+    let args = json!({"channel": "#leadership", "text": "Q3 plan"});
+    let held = h.call(&planner, "slack__post_message", args.clone()).await;
+    let operator = h.login().await;
+    let (status, _) = h
+        .op_post(
+            "/v1/operator/approve",
+            &operator,
+            json!({"decision": decision_of(&held)}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    // Four connections of the same agent session race the same call.
+    let (a, b, c, d) = (
+        h.connect("planner").await,
+        h.connect("planner").await,
+        h.connect("planner").await,
+        h.connect("planner").await,
+    );
+    let results = tokio::join!(
+        h.call(&a, "slack__post_message", args.clone()),
+        h.call(&b, "slack__post_message", args.clone()),
+        h.call(&c, "slack__post_message", args.clone()),
+        h.call(&d, "slack__post_message", args.clone()),
+    );
+    let results = [results.0, results.1, results.2, results.3];
+    let forwarded = results.iter().filter(|r| r["isError"] != true).count();
+    assert_eq!(forwarded, 1, "{results:?}");
+    assert_eq!(slack_calls(&h).len(), 1);
 }

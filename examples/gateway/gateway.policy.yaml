@@ -1,0 +1,60 @@
+# The hand-off policy (examples/policies/handoff.policy.yaml) plus one
+# source for the gateway: `unmatched`, what a read that matches no rule of
+# gateway.yaml counts as. It is the most restrictive source the drive tool
+# can return (HR readers only, the planner only), as `otherwise` must be.
+version: 1
+
+groups:
+  hr: [nina]
+  engineering: [sam, ravi]
+  leadership: [maya]
+
+agents: [researcher, planner]
+
+sources:
+  salaries:           # compensation: HR only
+    readers: [hr]
+    agents: [researcher, planner]
+  roadmap:            # product plans: HR, engineering and leadership
+    readers: [hr, engineering, leadership]
+    agents: [planner]
+  benchmarks:         # public industry data
+    readers: [hr, engineering, leadership]
+    agents: [researcher, planner]
+  unmatched:          # a drive path no rule names: treated as the most restricted
+    readers: [hr]
+    agents: [planner]
+
+actions:
+  post_to_engineering:
+    agents: [planner]
+    audience: [engineering]
+  brief_hr:
+    agents: [planner]
+    audience: [hr]
+  brief_leadership:   # leadership sees plans only after HR signs off
+    agents: [planner]
+    audience: [leadership]
+    approval: { reviewers: [hr], valid_for: 1h }
+
+tests:
+  - name: a summary built on salary notes never reaches engineering
+    output_from: [salaries, roadmap]
+    agent: planner
+    action: post_to_engineering
+    expect: deny
+  - name: a roadmap summary can go to engineering
+    output_from: [roadmap]
+    agent: planner
+    action: post_to_engineering
+    expect: allow
+  - name: anything from an unmatched path stays with HR
+    output_from: [unmatched]
+    agent: planner
+    action: post_to_engineering
+    expect: deny
+  - name: leadership gets the roadmap after HR approves
+    output_from: [roadmap, benchmarks]
+    agent: planner
+    action: brief_leadership
+    expect: needs_approval

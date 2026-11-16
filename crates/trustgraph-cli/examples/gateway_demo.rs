@@ -133,6 +133,15 @@ async fn main() {
         "#engineering",
     )
     .await;
+    // An argument the config does not list is refused, never forwarded.
+    call(
+        &planner,
+        "planner",
+        "slack__post_message",
+        json!({"channel": "#engineering", "text": "hi", "Channel": "#all-company"}),
+        "#engineering, plus Channel #all-company",
+    )
+    .await;
     let _ = researcher.cancel().await;
     let _ = planner.cancel().await;
 }

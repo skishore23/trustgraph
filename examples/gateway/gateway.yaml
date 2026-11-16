@@ -14,7 +14,7 @@ upstreams:
   #   headers: { Authorization: "Bearer ${env:DRIVE_TOKEN}" }
 
 tools:
-  drive.read_file:
+  drive.read_file:                         # forwards only `path`, the argument its rules name
     reads:
       - when: { path: "HR/Compensation/**" }
         source: salaries
@@ -22,10 +22,11 @@ tools:
         source: roadmap
       - when: { path: "Public/**" }
         source: benchmarks
-    otherwise: salaries                    # restrictive: an unmatched path counts as salaries
+    otherwise: unmatched                   # the most restrictive source: an unmatched path counts as it
   slack.post_message:
+    arguments: [channel, text]             # required: a call with any other argument is refused
     acts:
       - when: { channel: "#engineering" }
         action: post_to_engineering
-        content: text
+        content: text                      # shown to the operator; the check covers every argument
     otherwise: block

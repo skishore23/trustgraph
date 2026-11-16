@@ -105,4 +105,73 @@ const page = require('./serve.js');
   );
 }
 
+// Agent-supplied text is shown as escapes: no control, bidi or invisible
+// character reaches the page as itself.
+{
+  assert.equal(page.neutralise('a\u001b[2Jb'), 'a\\x1b[2Jb');
+  assert.equal(page.neutralise('pay\u202eboj.exe'), 'pay\\u202eboj.exe');
+  assert.equal(page.neutralise('zero\u200bwidth\u2066'), 'zero\\u200bwidth\\u2066');
+  assert.equal(page.neutralise('\u0000\u007f\u0085'), '\\x00\\x7f\\x85');
+  assert.equal(page.neutralise('<b>bold</b>\nline\ttab'), '<b>bold</b>\nline\ttab', 'markup stays text; newline and tab kept');
+  assert.equal(page.neutralise(undefined), '');
+}
+
+// A call the gateway holds shows its tool, action, recipients, every
+// forwarded argument (cut with a marker) and the hash of the full arguments.
+{
+  const p = {
+    agent: 'planner',
+    action: 'brief_leadership',
+    recipients: ['maya'],
+    sources: ['roadmap'],
+    decision: 'd'.repeat(64),
+    gateway: {
+      tool: 'slack__post_message',
+      held: true,
+      sha256: 'ab'.repeat(32),
+      arguments: [
+        { name: 'channel', value: '#leadership', more: 0 },
+        { name: 'text', value: 'Q3\u202e plan', more: 500 },
+      ],
+    },
+  };
+  const lines = page.callLines(p);
+  assert.deepEqual(lines.map(l => l.text), [
+    'gateway call: slack__post_message → brief_leadership → maya',
+    'forwarded arguments, exactly:',
+    'channel:',
+    '#leadership',
+    'text:',
+    'Q3\\u202e plan\n… truncated — 500 more characters',
+    'SHA-256 of the full arguments: ' + 'ab'.repeat(32),
+  ]);
+  assert.equal(lines[3].cls, 'value');
+  assert.match(page.approvalSummary(p), /as one call of slack__post_message with arguments abababababab…/);
+
+  // After a restart the gateway no longer has it: the page says to retry.
+  const gone = Object.assign({}, p, { gateway: { tool: 'slack__post_message', held: false }, can_approve: false });
+  const goneLines = page.callLines(gone);
+  assert.match(goneLines[1].text, /must retry it before it can be approved/);
+  assert.deepEqual(page.confirmableKeys({ pending: [gone], proposals: [] }), [], 'no Approve for it');
+  assert.deepEqual(page.callLines({ action: 'x' }), [], 'not a gateway call');
+}
+
+// Open connections can be ended; an agent at the cap is named.
+{
+  const state = {
+    pending: [],
+    proposals: [],
+    gateway: {
+      mode: 'agent', problems: [], sessions: [],
+      connections: [{ connection: 'c-1', agent: 'planner', session: 'agent:planner', started_at: 1, last_active: 2 }],
+      at_cap: ['planner'],
+      max_connections_per_agent: 64,
+    },
+  };
+  assert.deepEqual(page.confirmableKeys(state), ['close:c-1']);
+  assert.match(page.capNotice(state), /^planner holds the most open connections allowed \(64\); new connections are refused/);
+  assert.equal(page.capNotice({ gateway: { at_cap: [] } }), '');
+  assert.match(page.CONTEXT_NOTE, /agent keeps whatever is already in its own context\. Stop or restart the agent first\./);
+}
+
 console.log('serve.test.cjs: ok');
