@@ -26,9 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 use trustgraph_core::digest;
-use trustgraph_engine::{
-    Engine, Event, Fault, JournalError, MemoryJournal, OpenError, Reply, Runtime,
-};
+use trustgraph_engine::{Engine, Event, JournalError, MemoryJournal, OpenError, Reply, Runtime};
 use trustgraph_policy::{Diagnostic, Policy, Severity, Verdict, parse};
 
 use generate::{Names, Rng, UNKNOWN_ARTIFACT, sha};
@@ -101,17 +99,47 @@ pub const COVERAGE: [&str; 18] = [
     "crash_without_resend",
 ];
 
+/// The engine fault a run injects. Without the `fault-injection` feature
+/// there is only "no fault", and the engine has no fault code at all.
+#[cfg(feature = "fault-injection")]
+type EngineFault = trustgraph_engine::Fault;
+#[cfg(not(feature = "fault-injection"))]
+#[derive(Debug, Clone, Copy)]
+struct EngineFault;
+
+#[cfg(feature = "fault-injection")]
+const NO_FAULT: EngineFault = trustgraph_engine::Fault::None;
+#[cfg(not(feature = "fault-injection"))]
+const NO_FAULT: EngineFault = EngineFault;
+
+fn open_runtime(
+    journal: MemoryJournal,
+    policy_yaml: &str,
+    at: u64,
+    fault: EngineFault,
+) -> Result<Runtime<MemoryJournal>, OpenError> {
+    #[cfg(feature = "fault-injection")]
+    return Runtime::open_with_fault(journal, policy_yaml, at, fault);
+    #[cfg(not(feature = "fault-injection"))]
+    {
+        let EngineFault = fault;
+        Runtime::open(journal, policy_yaml, at)
+    }
+}
+
 pub fn run(policy_yaml: &str, seed: u64, steps: u32) -> Result<Run, Vec<Diagnostic>> {
-    simulate(policy_yaml, seed, steps, Fault::None, false)
+    simulate(policy_yaml, seed, steps, NO_FAULT, false)
 }
 
 /// `run` against a deliberately broken engine, to prove the invariants bite.
+/// Only with the non-default `fault-injection` feature.
+#[cfg(feature = "fault-injection")]
 #[doc(hidden)]
 pub fn run_with_fault(
     policy_yaml: &str,
     seed: u64,
     steps: u32,
-    fault: Fault,
+    fault: trustgraph_engine::Fault,
 ) -> Result<Run, Vec<Diagnostic>> {
     simulate(policy_yaml, seed, steps, fault, false)
 }
@@ -119,7 +147,7 @@ pub fn run_with_fault(
 /// `run` with only agent-callable events and no crashes or operator.
 #[doc(hidden)]
 pub fn run_agents_only(policy_yaml: &str, seed: u64, steps: u32) -> Result<Run, Vec<Diagnostic>> {
-    simulate(policy_yaml, seed, steps, Fault::None, true)
+    simulate(policy_yaml, seed, steps, NO_FAULT, true)
 }
 
 pub fn campaign(
@@ -235,21 +263,19 @@ fn simulate(
     policy_yaml: &str,
     seed: u64,
     steps: u32,
-    fault: Fault,
+    fault: EngineFault,
     agents_only: bool,
 ) -> Result<Run, Vec<Diagnostic>> {
     let runtime =
-        Runtime::open_with_fault(MemoryJournal::new(), policy_yaml, 0, fault).map_err(|error| {
-            match error {
-                OpenError::InvalidPolicy(diagnostics) => diagnostics,
-                other => vec![Diagnostic {
-                    severity: Severity::Error,
-                    path: String::new(),
-                    code: "open_failed",
-                    message: other.to_string(),
-                    suggestion: None,
-                }],
-            }
+        open_runtime(MemoryJournal::new(), policy_yaml, 0, fault).map_err(|error| match error {
+            OpenError::InvalidPolicy(diagnostics) => diagnostics,
+            other => vec![Diagnostic {
+                severity: Severity::Error,
+                path: String::new(),
+                code: "open_failed",
+                message: other.to_string(),
+                suggestion: None,
+            }],
         })?;
     // `open` validated the text, so this only fails if parse and open disagree.
     let parsed = parse(policy_yaml);
@@ -325,7 +351,7 @@ struct Sim {
     runtime: Option<Runtime<MemoryJournal>>,
     /// The policy text the runtime was started with; every reopen uses it.
     genesis: String,
-    fault: Fault,
+    fault: EngineFault,
     agents_only: bool,
     rng: Rng,
     names: Names,
@@ -796,7 +822,7 @@ impl Sim {
     /// `digest`. False when the runtime could not reopen.
     fn reopen(&mut self, journal: MemoryJournal, digest: &str) -> bool {
         self.out.crashes += 1;
-        match Runtime::open_with_fault(journal, &self.genesis, self.now, self.fault) {
+        match open_runtime(journal, &self.genesis, self.now, self.fault) {
             Ok(runtime) => {
                 let reopened = runtime.engine().state_digest();
                 self.runtime = Some(runtime);

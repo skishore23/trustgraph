@@ -1293,3 +1293,9 @@ fn shape_rejection_leaves_the_clock_alone() {
         .is_ok()
     );
 }
+
+/// The engine's own tests build with the feature (self dev-dependency).
+#[test]
+fn fault_injection_constant_is_on_in_engine_tests() {
+    const { assert!(trustgraph_engine::FAULT_INJECTION) };
+}

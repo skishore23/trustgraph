@@ -22,12 +22,20 @@
 //!
 //! Errors: when [`Runtime::handle`] or [`Journal::append`] returns `Err`, the
 //! outcome is unknown. Drop the `Runtime` and [`Runtime::open`] it again.
+//!
+//! Journal compatibility: until a journal format version is introduced
+//! (part 2), a journal is only guaranteed to replay on the engine version
+//! that wrote it.
 
 mod engine;
 mod event;
 mod journal;
 mod rules;
 mod runtime;
+
+/// True when this build has the `fault-injection` feature, i.e. deliberate
+/// engine bugs are compiled in. Production builds must have it false.
+pub const FAULT_INJECTION: bool = cfg!(feature = "fault-injection");
 
 pub use engine::Engine;
 #[cfg(feature = "fault-injection")]

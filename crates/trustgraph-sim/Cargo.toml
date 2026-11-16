@@ -6,10 +6,17 @@ rust-version.workspace = true
 publish.workspace = true
 [lints]
 workspace = true
+[features]
+# `run_with_fault`: runs against a deliberately broken engine. Never enable in
+# a production build.
+fault-injection = ["trustgraph-engine/fault-injection"]
 [dependencies]
 trustgraph-core = { path = "../trustgraph-core" }
 trustgraph-runtime = { path = "../trustgraph-runtime" }
 trustgraph-policy = { path = "../trustgraph-policy" }
-trustgraph-engine = { path = "../trustgraph-engine", features = ["fault-injection"] }
+trustgraph-engine = { path = "../trustgraph-engine" }
 serde.workspace = true
 serde_json.workspace = true
+[dev-dependencies]
+# The crate's own tests prove the invariants catch the injected faults.
+trustgraph-sim = { path = ".", features = ["fault-injection"] }

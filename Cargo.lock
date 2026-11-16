@@ -2130,6 +2130,7 @@ dependencies = [
  "trustgraph-engine",
  "trustgraph-policy",
  "trustgraph-runtime",
+ "trustgraph-sim",
 ]
 
 [[package]]
