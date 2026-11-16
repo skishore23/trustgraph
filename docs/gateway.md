@@ -230,26 +230,74 @@ an earlier rule of the same tool matches every call it would.
 
 ### How `when` matches
 
-A `when` rule names arguments and a glob for each, as `argument: glob` or
-`argument: {glob: …, type: path|text}`. All must match. A glob is
-case-sensitive. `*` matches any run of characters and `?` one character,
-but neither matches `/`, `,`, `;`, whitespace, `<`, `>`, `"` or a control
-character; `**` is `*` that also matches `/`. Every other character is
-itself. So `*@corp.com` does not match `x@evil.com, y@corp.com`.
+**The policy audience is only as true as the `when` rule that maps a call
+to an action.** The policy says `post_to_engineering` reaches engineering;
+the gateway believes that only because a rule says a call with `channel:
+"#engineering"` is `post_to_engineering`. A rule loose enough to match a
+value that reaches someone else sends the output to people the policy never
+checked. Match recipient arguments exactly, or with `type: email`.
+
+A `when` rule names arguments and a pattern for each, as `argument:
+pattern` or `argument: {pattern: …, type: …}`. All must match. The types:
+
+| `type` | matches | default for |
+|---|---|---|
+| `exact` | the value equals the pattern byte for byte; no wildcards | `acts` rules |
+| `email` | a strict email address: `name@domain` (that address; the domain ignoring case) or `*@domain` (any valid local part at exactly that domain) | — |
+| `glob` | a glob (below) | — |
+| `path` | a glob over a path; odd path forms never match (below) | `reads` rules |
+
+On an `acts` rule, a pattern that contains `*` or `?` without an explicit
+`type: glob`, `email` or `path` is a config error, so a wildcard on a
+recipient is always a choice you made:
+
+```yaml
+  slack.send_email:
+    arguments: [to, subject, body]
+    acts:
+      - when: { to: { pattern: "*@corp.com", type: email } }   # not `to: "*@corp.com"`
+        action: email_staff
+        content: body
+```
+
+`type: email` accepts only ASCII, exactly one `@`, a local part of letters,
+digits and `._+-` with no leading, trailing or doubled dot, and a domain of
+dot-separated labels of letters, digits and `-`. Anything a mail parser
+could read as another address never matches: comments
+(`x@evil.com(@corp.com`), a second `@` (`x@evil.com@corp.com`), `%` and `!`
+routes, quoted local parts, encoded words (`=?utf-8?q?…?=@corp.com`),
+address literals, and subdomains (`*@corp.com` does not match
+`x@mail.corp.com`).
+
+A glob is case-sensitive. `*` matches any run of characters and `?` one
+character, but neither matches `/`, `,`, `;`, whitespace, `<`, `>`, `"` or a
+control character; `**` is `*` that also matches `/`. Every other character
+is itself. A glob is weak for a recipient: `*@corp.com` matches
+`x@evil.com@corp.com`, which a mail server may deliver to `evil.com`. The
+gateway and `gateway check` warn about every `type: glob` on an `acts` rule.
 
 An argument value matches when it is a string that matches, or a non-empty
 list whose every element is a string that matches. An object, a number, or
 a list with anything else in it never matches.
 
-Matching fails closed. A value does not match if it is longer than 4,096
-bytes, if it contains a control character (NUL included), or if it has a
-`..` segment (split on `/` and `\`). An argument of `type: path` (the
-default in `reads` rules; `text` is the default in `acts` rules) also does
-not match if it contains `%`, `~`, `\` or a character that is not ASCII, if
-it starts with `/` or `./`, or if it has an empty segment (`//`) or a `.`
-segment. Such a call falls to `otherwise`. The upstream may decode,
-expand or normalise a path the gateway saw as `Product/%2e%2e/HR/x` into one
-no rule meant.
+Matching fails closed, for every type. A value does not match if it is
+longer than 4,096 bytes, if it has a `..` segment (split on `/` and `\`), or
+if it contains a control, format or separator character (Unicode categories
+Cc, Cf, Zl and Zp: NUL, zero-width spaces and joiners, bidirectional
+controls, the soft hyphen and the like), a Hangul filler (U+115F, U+1160,
+U+3164, U+FFA0) or a tag character (U+E0000 to U+E007F). A pattern that
+holds one is a config error. An argument of `type: path` also does not
+match if it contains `%`, `~`, `\` or a character that is not ASCII, if it
+starts with `/` or `./`, or if it has an empty segment (`//`) or a `.`
+segment. Such a call falls to `otherwise`. The upstream may decode, expand
+or normalise a path the gateway saw as `Product/%2e%2e/HR/x` into one no
+rule meant.
+
+The gateway and `gateway check` also warn about an `acts` rule with no
+`when` (every call to the tool is that action, whatever its arguments), and
+name each allow-listed argument of an `acts` tool that no `when` constrains:
+it is part of the checked output and shown to the approver, but it can hold
+anything, so it must not be one that chooses who the call reaches.
 
 Classification trusts the upstream's own naming. A link, alias, symlink or
 id on the upstream can make `Product/roadmap.md` return other content. That

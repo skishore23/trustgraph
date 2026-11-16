@@ -1344,9 +1344,10 @@ pub async fn main(options: super::Options, config_path: PathBuf, port: u16) -> i
 }
 
 /// `trustgraph gateway check`: validate `gateway.yaml` against a policy and
-/// say in plain English what it does. Upstreams whose variables are set
-/// here are contacted to check argument names. Returns the exit code.
-pub async fn check(config_path: &Path, policy_path: &Path) -> i32 {
+/// say in plain English what it does. Unless `offline`, upstreams whose
+/// variables are set here are contacted (stdio ones are run) to check
+/// argument names. Returns the exit code.
+pub async fn check(config_path: &Path, policy_path: &Path, offline: bool) -> i32 {
     let config = match load_config(config_path) {
         Ok(c) => c,
         Err(problems) => {
@@ -1379,7 +1380,22 @@ pub async fn check(config_path: &Path, policy_path: &Path) -> i32 {
         .iter()
         .map(ToString::to_string)
         .collect();
-    let (published, contact) = contact_upstreams(&config).await;
+    let (published, contact) = if offline {
+        let contact = Contact {
+            notes: vec![
+                "note: --offline: no upstream was contacted and no stdio command was run, so the checks against what upstreams publish (tool names, argument names, schema size) were skipped".into(),
+            ],
+            missing: config::env_names(&config)
+                .into_iter()
+                .filter(|n| std::env::var_os(n).is_none())
+                .collect(),
+            ..Contact::default()
+        };
+        let published = config.upstreams.keys().map(|n| (n.clone(), None)).collect();
+        (published, contact)
+    } else {
+        contact_upstreams(&config).await
+    };
     for tool in config.tools.values() {
         if let Some(Some(tools)) = published.get(&tool.upstream) {
             let found = tools.iter().find(|t| t.name == tool.name);
@@ -1487,11 +1503,25 @@ fn people(names: &BTreeSet<String>) -> String {
 
 fn when_text(when: &[config::Matcher]) -> String {
     if when.is_empty() {
-        "always".into()
+        "always (every call, whatever its arguments)".into()
     } else {
         let parts: Vec<String> = when
             .iter()
-            .map(|m| format!("`{}` matches `{}`", m.argument, m.glob))
+            .map(|m| match m.kind {
+                config::MatchType::Exact => format!("`{}` is exactly `{}`", m.argument, m.pattern),
+                config::MatchType::Email if m.pattern.starts_with("*@") => format!(
+                    "`{}` is a plain email address at exactly `{}`",
+                    m.argument,
+                    &m.pattern[2..]
+                ),
+                config::MatchType::Email => {
+                    format!("`{}` is the email address `{}`", m.argument, m.pattern)
+                }
+                config::MatchType::Glob => {
+                    format!("`{}` matches the glob `{}`", m.argument, m.pattern)
+                }
+                config::MatchType::Path => format!("`{}` matches `{}`", m.argument, m.pattern),
+            })
             .collect();
         format!("when {}", parts.join(" and "))
     }
