@@ -2007,7 +2007,6 @@ dependencies = [
  "trustgraph-policy",
  "trustgraph-runtime",
  "trustgraph-sim",
- "uuid",
 ]
 
 [[package]]
