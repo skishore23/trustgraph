@@ -159,25 +159,25 @@ tests:
 
 <section aria-labelledby="problem-title">
 <h2 id="problem-title">The problem</h2>
-<p>Permission systems decide what an agent may read. They lose track once it writes something new, and again each time another agent builds on that.</p>
+<p>Permission systems decide what an agent may read. They lose track once it writes something new. In May 2025, <a href="https://invariantlabs.ai/blog/mcp-github-vulnerability">Invariant Labs showed</a> what that costs.</p>
 <ol class="grid three">
   <li class="cell">
-    <svg class="spot" viewBox="0 0 120 64" role="img" aria-label="An agent reads a restricted document"><path class="ink" d="M14 14h28v36H14zM20 24h16M20 31h16M20 38h10M42 32h34M70 27l6 5-6 5"/><rect class="accent" x="80" y="25" width="14" height="14"/></svg>
-    <b>An agent reads something restricted.</b>
-    <p>A research agent opens the salary file. It is allowed to.</p>
+    <svg class="spot" viewBox="0 0 120 64" role="img" aria-label="An agent reads private code"><path class="ink" d="M14 14h28v36H14zM20 24h16M20 31h16M20 38h10M42 32h34M70 27l6 5-6 5"/><rect class="accent" x="80" y="25" width="14" height="14"/></svg>
+    <b>An agent reads something private.</b>
+    <p>A coding agent reads a user's private repositories. It is allowed to.</p>
   </li>
   <li class="cell">
-    <svg class="spot" viewBox="0 0 120 64" role="img" aria-label="The first agent writes notes; a second agent builds on them"><rect class="accent" x="2" y="25" width="14" height="14"/><path class="ink" d="M16 32h14M26 28l4 4-4 4M32 14h24v36H32zM56 32h20M72 28l4 4-4 4"/><path class="ink dash" d="M37 23h14M37 30h14M37 37h10"/><rect class="accent" x="80" y="25" width="14" height="14"/></svg>
-    <b>It writes notes. Another agent builds on them.</b>
-    <p>A planner, which never opened the salary file, combines the notes with the roadmap.</p>
+    <svg class="spot" viewBox="0 0 120 64" role="img" aria-label="A crafted issue leads the agent to write what it found into something new"><rect class="accent" x="2" y="25" width="14" height="14"/><path class="ink" d="M16 32h14M26 28l4 4-4 4M32 14h24v36H32zM56 32h20M72 28l4 4-4 4"/><path class="ink dash" d="M37 23h14M37 30h14M37 37h10"/><rect class="accent" x="80" y="25" width="14" height="14"/></svg>
+    <b>A crafted issue tells it to write.</b>
+    <p>It reads an issue on a public repository and writes what it found into a pull request.</p>
   </li>
   <li class="cell">
-    <svg class="spot" viewBox="0 0 120 64" role="img" aria-label="Two steps later the summary is posted to a channel"><path class="ink" d="M10 14h26v36H10zM16 24h14M16 31h14M16 38h9M80 14h30v36H80zM89 26h12M89 38h12M92 22l-2 20M100 22l-2 20"/><path class="deny" d="M36 32h38M68 27l6 5-6 5"/></svg>
-    <b>Two steps later, the secret is in a channel.</b>
-    <p>The summary goes to #engineering. It never mentions salaries, and nothing along the way looked wrong.</p>
+    <svg class="spot" viewBox="0 0 120 64" role="img" aria-label="The pull request is published on a public repository"><path class="ink" d="M10 14h26v36H10zM16 24h14M16 31h14M16 38h9M80 14h30v36H80zM89 26h12M89 38h12M92 22l-2 20M100 22l-2 20"/><path class="deny" d="M36 32h38M68 27l6 5-6 5"/></svg>
+    <b>The private code is now public.</b>
+    <p>The pull request opens on the public repository. Every step was allowed; nothing checked that the second came from the first.</p>
   </li>
 </ol>
-<p>TrustGraph follows the salary file through both steps and says no.</p>
+<p>Taking access away does not fix it: the agent needs the private code. The playground above shows the missing rule, with two agents handing off.</p>
 </section>
 
 <section id="simulator" aria-labelledby="sim-title">
@@ -265,19 +265,22 @@ allowed         = everyone the action reaches ⊆ readers(output)</pre>
 <div class="split">
 <div class="split-text">
 <h2 id="use-title">Use it</h2>
-<p>TrustGraph ships as a CLI and Rust crates.</p>
+<p>Put <code>trustgraph gateway</code> between your agents and their MCP servers. It records what each agent reads and checks every action before forwarding it; a person approves held calls and sees exactly what they approve. Agents cannot skip it, provided the gateway alone holds the servers' credentials and agents have no other route to them. <a href="https://github.com/skishore23/trustgraph/blob/main/docs/gateway.md">Gateway guide</a></p>
 
-<p>To let agents ask before they act, run <code>trustgraph serve --policy trustgraph.policy.yaml --operator leo</code>: a local HTTP and MCP service. <a href="https://github.com/skishore23/trustgraph/blob/main/docs/serve.md">Serve guide</a></p>
+<p><code>trustgraph serve</code> is the decision service over HTTP and MCP, for stacks that report reads and ask before acting themselves. <a href="https://github.com/skishore23/trustgraph/blob/main/docs/serve.md">Serve guide</a></p>
+
+<p>The CLI writes, tests and simulates policies. <a href="https://github.com/skishore23/trustgraph/blob/main/docs/integrations.md">Python integrations</a> are in the repository, but their session handling is being rebuilt after security review: do not rely on them yet.</p>
 </div>
 <div class="split-side">
 <pre>cargo install --locked --git https://github.com/skishore23/trustgraph trustgraph-cli
 
-trustgraph policy init --path trustgraph.policy.yaml
+trustgraph gateway --policy trustgraph.policy.yaml --operator leo --config gateway.yaml
+trustgraph serve --policy trustgraph.policy.yaml --operator leo
+
+trustgraph policy init
 trustgraph policy check trustgraph.policy.yaml
 trustgraph policy test trustgraph.policy.yaml
-trustgraph policy simulate trustgraph.policy.yaml --seed 0
-trustgraph policy explain trustgraph.policy.yaml
-trustgraph policy diff old.policy.yaml trustgraph.policy.yaml</pre>
+trustgraph policy simulate trustgraph.policy.yaml --seed 0</pre>
 </div>
 </div>
 </section>
@@ -286,10 +289,10 @@ trustgraph policy diff old.policy.yaml trustgraph.policy.yaml</pre>
 <section aria-labelledby="limits-title">
 <h2 id="limits-title">Limits</h2>
 <ul>
-  <li>It only knows the inputs your system reports.</li>
-  <li>It decides; it does not act. Ask right before acting, and act only on <span class="mono">allow</span>.</li>
+  <li>It only knows what it is told the agent read. The gateway records reads through its configured tools; reads by any other route are invisible.</li>
+  <li>Except through the gateway, it decides and does not act: ask right before acting, and act only on <span class="mono">allow</span>.</li>
   <li>One sensitive input restricts the whole output.</li>
-  <li>Groups are lists of names in the file, not a directory.</li>
+  <li>Groups are lists in the file, not a directory.</li>
 </ul>
 </section>
 
@@ -305,6 +308,8 @@ trustgraph policy diff old.policy.yaml trustgraph.policy.yaml</pre>
     <a href="https://github.com/skishore23/trustgraph">GitHub</a> ·
     <a href="https://github.com/skishore23/trustgraph/blob/main/docs/agents/writing-policies.md">Agent guide</a> ·
     <a href="https://github.com/skishore23/trustgraph/tree/main/examples/policies">Example policies</a> ·
+    <a href="https://github.com/skishore23/trustgraph/blob/main/docs/gateway.md">Gateway</a> ·
+    <a href="https://github.com/skishore23/trustgraph/blob/main/docs/serve.md">Serve</a> ·
     <a href="https://github.com/skishore23/trustgraph/blob/main/docs/verification.md">Verification</a>
   </div>
 </footer>
