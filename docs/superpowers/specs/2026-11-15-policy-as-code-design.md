@@ -355,7 +355,8 @@ that disagrees.
    proposals at 32 per origin (agent-proposed, operator-proposed).
 7. **Proofs.** The Kani-checked kernels are
    `trustgraph_core::decision::{gate, approval_live}` plus the existing
-   reader-set kernels. Results are pending the first CI run.
+   reader-set kernels. All ten harnesses passed in CI on 2026-11-15 (see
+   `docs/verification.md`).
 
 ## Left to the builder
 
